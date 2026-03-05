@@ -173,6 +173,13 @@ public struct ANEKernel: ~Copyable {
         }
     }
 
+    /// Last reported on-chip execution time from `_ANEPerformanceStats` (nanoseconds).
+    ///
+    /// Returns `0` when perf stats are disabled (default) or unsupported on this host.
+    public func lastHWExecutionTimeNS() -> UInt64 {
+        ane_interop_last_hw_execution_time_ns(handle)
+    }
+
     /// Access input IOSurface (retained; safe to hold independently of kernel lifetime).
     public func inputSurface(at index: Int) throws(ANEError) -> IOSurfaceRef {
         let checkedIndex = try Self.checkedSurfaceIndex(index)

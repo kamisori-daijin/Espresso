@@ -124,7 +124,9 @@ enum ResultsFormatter {
         coreMLResults: [(label: String, result: BenchmarkResult)]?,
         coreMLLoadTimeMs: Double?,
         flopsPerPass: Double,
-        nLayers: Int
+        nLayers: Int,
+        thermalBefore: String? = nil,
+        thermalAfter: String? = nil
     ) -> String {
         var out = ""
         let chip = chipName()
@@ -166,6 +168,11 @@ enum ResultsFormatter {
             }
         }
 
+        if let before = thermalBefore, let after = thermalAfter {
+            out += "=== POWER & THERMAL ===\n"
+            out += "Thermal state: \(before) -> \(after)\n\n"
+        }
+
         return out
     }
 
@@ -205,31 +212,35 @@ enum ResultsFormatter {
 
     static func writeInferenceKernelProfileCSV(profile: InferenceKernelProfile, to path: String) throws {
         let posix = Locale(identifier: "en_US_POSIX")
-        var out = "layer,iteration,attn_write_us,attn_eval_us,attn_read_us,gap_attn_to_ffn_us,ffn_write_us,ffn_copy_us,ffn_eval_us,ffn_read_us\n"
+        var out = "layer,iteration,attn_write_us,attn_eval_us,attn_hw_ns,attn_read_us,gap_attn_to_ffn_us,ffn_write_us,ffn_copy_us,ffn_eval_us,ffn_hw_ns,ffn_read_us\n"
 
         for (layerIdx, layer) in profile.layers.enumerated() {
             let n = layer.attnWriteUS.count
             precondition(layer.attnEvalUS.count == n)
+            precondition(layer.attnHwNS.count == n)
             precondition(layer.attnReadUS.count == n)
             precondition(layer.ffnWriteUS.count == n)
             precondition(layer.ffnCopyUS.count == n)
             precondition(layer.ffnEvalUS.count == n)
+            precondition(layer.ffnHwNS.count == n)
             precondition(layer.ffnReadUS.count == n)
             precondition(layer.gapAttnToFfnUS.count == n)
 
             for i in 0..<n {
                 out += String(
-                    format: "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    format: "%d,%d,%.3f,%.3f,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%.3f\n",
                     locale: posix,
                     layerIdx,
                     i,
                     layer.attnWriteUS[i],
                     layer.attnEvalUS[i],
+                    layer.attnHwNS[i],
                     layer.attnReadUS[i],
                     layer.gapAttnToFfnUS[i],
                     layer.ffnWriteUS[i],
                     layer.ffnCopyUS[i],
                     layer.ffnEvalUS[i],
+                    layer.ffnHwNS[i],
                     layer.ffnReadUS[i]
                 )
             }

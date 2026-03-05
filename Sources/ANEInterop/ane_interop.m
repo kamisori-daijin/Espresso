@@ -6,19 +6,28 @@
 #import <objc/runtime.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 
 #include "ane_interop.h"
 
 struct ANEHandle {
     void *model;               // CFBridgingRetain'd _ANEInMemoryModel
+    void *client;              // CFBridgingRetain'd _ANEClient (optional)
+    void *clientModel;         // CFBridgingRetain'd _ANEModel (optional)
     IOSurfaceRef *ioInputs;
     IOSurfaceRef *ioOutputs;
     void *request;             // CFBridgingRetain'd _ANERequest
+    void *perfStats;           // CFBridgingRetain'd _ANEPerformanceStats (optional)
+    bool perfStatsRequested;
+    unsigned int perfStatsMask;
+    void *evalOptions;         // CFBridgingRetain'd NSDictionary (optional)
+    bool realtimeLoaded;
     void *tmpDir;              // CFBridgingRetain'd NSString
     int nInputs, nOutputs;
     size_t *inputBytes;
     size_t *outputBytes;
     bool liveHandleCounted;
+    uint64_t lastHwExecutionTimeNS;
 };
 
 static Class g_ANEDesc = nil, g_ANEInMem = nil, g_ANEReq = nil, g_ANEIO = nil;
@@ -35,6 +44,68 @@ static bool ane_interop_trace_enabled(void) {
         cached = (getenv("ANE_INTEROP_TRACE") != NULL) ? 1 : 0;
     }
     return cached == 1;
+}
+
+static bool ane_interop_perf_stats_enabled(void) {
+    // Do not cache: tests and benchmarks may toggle this env var at runtime.
+    const char *v = getenv("ANE_PERF_STATS");
+    return (v && v[0] == '1');
+}
+
+static unsigned int ane_interop_perf_stats_anef_mask(void) {
+    // _ANEPerformanceStats.driverMaskForANEFMask: appears to only accept a subset of bits.
+    // On M3 Max, any bits outside {0x1,0x2,0x4,0x8} cause it to return 0 (disabling stats).
+    // Default to 0xF (enable all supported perf-stats features) and allow override for probing.
+    const char *v = getenv("ANE_PERF_STATS_MASK");
+    if (!v || v[0] == '\0') return 0xFu;
+    char *end = NULL;
+    unsigned long parsed = strtoul(v, &end, 0);
+    if (end == v) return 0xFu;
+    return (unsigned int)parsed;
+}
+
+static bool ane_interop_env_flag(const char *key) {
+    const char *v = getenv(key);
+    return (v && v[0] == '1');
+}
+
+static long ane_interop_env_long(const char *key, long defaultValue) {
+    const char *v = getenv(key);
+    if (!v || v[0] == '\0') return defaultValue;
+    char *end = NULL;
+    long parsed = strtol(v, &end, 0);
+    if (end == v) return defaultValue;
+    return parsed;
+}
+
+typedef enum : int {
+    ANE_COMPILE_CACHE_AUTO = 0,
+    ANE_COMPILE_CACHE_PREFER_CACHED = 1,
+    ANE_COMPILE_CACHE_FORCE_COLD = 2,
+} ANECompileCachePolicy;
+
+static ANECompileCachePolicy ane_interop_compile_cache_policy(void) {
+    const char *v = getenv("ANE_COMPILE_CACHE_POLICY");
+    if (!v || v[0] == '\0') return ANE_COMPILE_CACHE_AUTO;
+    if (strcmp(v, "preferCached") == 0 || strcmp(v, "prefer_cached") == 0) return ANE_COMPILE_CACHE_PREFER_CACHED;
+    if (strcmp(v, "forceCold") == 0 || strcmp(v, "force_cold") == 0) return ANE_COMPILE_CACHE_FORCE_COLD;
+    return ANE_COMPILE_CACHE_AUTO;
+}
+
+typedef enum : int {
+    ANE_EVAL_INMEM = 0,
+    ANE_EVAL_CLIENT = 1,
+    ANE_EVAL_CLIENT_DIRECT = 2,
+    ANE_EVAL_REALTIME = 3,
+} ANEEvalPath;
+
+static ANEEvalPath ane_interop_eval_path(void) {
+    const char *v = getenv("ANE_EVAL_PATH");
+    if (!v || v[0] == '\0') return ANE_EVAL_INMEM;
+    if (strcmp(v, "client") == 0) return ANE_EVAL_CLIENT;
+    if (strcmp(v, "clientDirect") == 0 || strcmp(v, "client_direct") == 0) return ANE_EVAL_CLIENT_DIRECT;
+    if (strcmp(v, "realtime") == 0 || strcmp(v, "realTime") == 0) return ANE_EVAL_REALTIME;
+    return ANE_EVAL_INMEM;
 }
 
 static void ane_interop_set_compile_error(int value) {
@@ -182,6 +253,106 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
             return NULL;
         }
 
+        const bool wantPerfStats = ane_interop_perf_stats_enabled();
+        id perfStats = nil;
+        if (wantPerfStats) {
+            Class perfClass = NSClassFromString(@"_ANEPerformanceStats");
+            SEL makeSel = @selector(statsWithRequestPerformanceBuffer:statsBufferSize:);
+            if (perfClass && [perfClass respondsToSelector:makeSel]) {
+                void *buf = NULL;
+                unsigned int bufSize = 0;
+                perfStats = ((id(*)(Class,SEL,void **, unsigned int *))objc_msgSend)(
+                    perfClass, makeSel, &buf, &bufSize);
+                if (ane_interop_trace_enabled()) {
+                    fprintf(stderr, "ANE perfStats factory: %s (buf=%p bufSize=%u)\n", perfStats ? "OK" : "nil", buf, bufSize);
+                }
+            } else if (ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE perfStats: class/method unavailable\n");
+            }
+        }
+
+        ANECompileCachePolicy cachePolicy = ane_interop_compile_cache_policy();
+        BOOL compiledExists = NO;
+        if ([mdl respondsToSelector:@selector(compiledModelExists)]) {
+            compiledExists = ((BOOL(*)(id,SEL))objc_msgSend)(mdl, @selector(compiledModelExists));
+        }
+        if (cachePolicy == ANE_COMPILE_CACHE_FORCE_COLD && [mdl respondsToSelector:@selector(purgeCompiledModel)]) {
+            ((void(*)(id,SEL))objc_msgSend)(mdl, @selector(purgeCompiledModel));
+            compiledExists = NO;
+        }
+
+        unsigned int perfMask = 0;
+        NSMutableDictionary *baseOptions = nil;
+        if (wantPerfStats || ane_interop_env_flag("ANE_DISABLE_POWER_SAVING") ||
+            ane_interop_env_flag("ANE_KEEP_MODEL_WIRED") || ane_interop_env_flag("ANE_ENABLE_LATE_LATCH") ||
+            ane_interop_env_flag("ANE_SKIP_PREPARE") || ane_interop_env_flag("ANE_ENABLE_FW_TO_FW_SIGNAL") ||
+            ane_interop_env_flag("ANE_DISABLE_IO_FENCES") || getenv("ANE_MEMORY_POOL_ID") != NULL) {
+            baseOptions = [NSMutableDictionary dictionary];
+        }
+
+        if (baseOptions && ane_interop_env_flag("ANE_DISABLE_POWER_SAVING")) {
+            baseOptions[@"kANEFEnablePowerSavingKey"] = @NO;
+        }
+        if (baseOptions && ane_interop_env_flag("ANE_KEEP_MODEL_WIRED")) {
+            baseOptions[@"kANEFKeepModelMemoryWiredKey"] = @YES;
+        }
+        if (baseOptions && ane_interop_env_flag("ANE_ENABLE_LATE_LATCH")) {
+            baseOptions[@"kANEFEnableLateLatchKey"] = @YES;
+        }
+        if (baseOptions && ane_interop_env_flag("ANE_SKIP_PREPARE")) {
+            baseOptions[@"kANEFSkipPreparePhaseKey"] = @YES;
+        }
+        if (baseOptions && ane_interop_env_flag("ANE_ENABLE_FW_TO_FW_SIGNAL")) {
+            baseOptions[@"kANEFEnableFWToFWSignal"] = @YES;
+        }
+        if (baseOptions && ane_interop_env_flag("ANE_DISABLE_IO_FENCES")) {
+            baseOptions[@"kANEFDisableIOFencesUseSharedEventsKey"] = @YES;
+        }
+        if (baseOptions && getenv("ANE_MEMORY_POOL_ID") != NULL) {
+            long mp = ane_interop_env_long("ANE_MEMORY_POOL_ID", -1);
+            if (mp >= 0) {
+                baseOptions[@"kANEFMemoryPoolIDKey"] = @(mp);
+            }
+        }
+
+        if (wantPerfStats && [mdl respondsToSelector:@selector(setPerfStatsMask:)]) {
+            // Enable perf stats collection (required for hwExecutionTime to populate).
+            //
+            // NOTE: driverMaskForANEFMask: returns 0 if any unsupported bits are set, so we
+            // must be careful to only request supported ANEF bits.
+            perfMask = ane_interop_perf_stats_anef_mask();
+            Class perfClass = NSClassFromString(@"_ANEPerformanceStats");
+            SEL driverSel = @selector(driverMaskForANEFMask:);
+            if (perfClass && [perfClass respondsToSelector:driverSel]) {
+                perfMask = ((unsigned int(*)(Class,SEL,unsigned int))objc_msgSend)(perfClass, driverSel, perfMask);
+            }
+            if (ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE perfStatsMask: 0x%08X\n", perfMask);
+            }
+            ((void(*)(id,SEL,unsigned int))objc_msgSend)(mdl, @selector(setPerfStatsMask:), perfMask);
+
+            // Attempt to also enable stats via driver option keys (best-effort; ignored if unknown).
+            if (!baseOptions) {
+                baseOptions = [NSMutableDictionary dictionary];
+            }
+            baseOptions[@"kANEFPerformanceStatsMask"] = @(perfMask);
+            baseOptions[@"kANEFModelLoadPerformanceStats"] = @YES;
+        }
+
+        NSDictionary *finalOptions = baseOptions ? [baseOptions copy] : @{};
+        if (ane_interop_env_flag("ANE_USE_COMPILER_OPTIONS") &&
+            [mdl respondsToSelector:@selector(compilerOptionsWithOptions:isCompiledModelCached:)]) {
+            id computed = ((id(*)(id,SEL,id,BOOL))objc_msgSend)(
+                mdl, @selector(compilerOptionsWithOptions:isCompiledModelCached:), finalOptions, compiledExists);
+            if ([computed isKindOfClass:[NSDictionary class]]) {
+                finalOptions = (NSDictionary *)computed;
+            }
+        }
+        if (ane_interop_trace_enabled()) {
+            fprintf(stderr, "ANE compile cachePolicy=%d compiledExists=%d options=%lu\n",
+                    cachePolicy, (int)compiledExists, (unsigned long)[finalOptions count]);
+        }
+
         id hx = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
         if (![hx isKindOfClass:[NSString class]]) {
             ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
@@ -245,19 +416,92 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
         }
 
         NSError *e = nil;
-        if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
-            fprintf(stderr, "ANE compile failed: %s\n", e ? [[e description] UTF8String] : "no error");
-            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-            ane_interop_remove_tmpdir(td);
-            return NULL;
+        if (!(cachePolicy == ANE_COMPILE_CACHE_PREFER_CACHED && compiledExists)) {
+            if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                    mdl, @selector(compileWithQoS:options:error:), 21, finalOptions, &e)) {
+                // Retry without options (some host builds reject unknown keys).
+                if ([finalOptions count] > 0) {
+                    if (ane_interop_trace_enabled()) {
+                        fprintf(stderr, "ANE compile retrying without options...\n");
+                    }
+                    e = nil;
+                    if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                            mdl, @selector(compileWithQoS:options:error:), 21, @{}, &e)) {
+                        finalOptions = @{};
+                    } else {
+                        fprintf(stderr, "ANE compile failed: %s\n", e ? [[e description] UTF8String] : "no error");
+                        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                        ane_interop_remove_tmpdir(td);
+                        return NULL;
+                    }
+                } else {
+                    fprintf(stderr, "ANE compile failed: %s\n", e ? [[e description] UTF8String] : "no error");
+                    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                    ane_interop_remove_tmpdir(td);
+                    return NULL;
+                }
+            }
         }
         if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
-                mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
-            fprintf(stderr, "ANE load failed: %s\n", e ? [[e description] UTF8String] : "no error");
-            ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
-            ane_interop_remove_tmpdir(td);
-            return NULL;
+                mdl, @selector(loadWithQoS:options:error:), 21, finalOptions, &e)) {
+            // Retry without options (keep behavior symmetric with compile).
+            if ([finalOptions count] > 0) {
+                if (ane_interop_trace_enabled()) {
+                    fprintf(stderr, "ANE load retrying without options...\n");
+                }
+                e = nil;
+                if (((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
+                        mdl, @selector(loadWithQoS:options:error:), 21, @{}, &e)) {
+                    finalOptions = @{};
+                } else {
+                    fprintf(stderr, "ANE load failed: %s\n", e ? [[e description] UTF8String] : "no error");
+                    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                    ane_interop_remove_tmpdir(td);
+                    return NULL;
+                }
+            } else {
+                fprintf(stderr, "ANE load failed: %s\n", e ? [[e description] UTF8String] : "no error");
+                ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                ane_interop_remove_tmpdir(td);
+                return NULL;
+            }
+        }
+
+        long qd = ane_interop_env_long("ANE_QUEUE_DEPTH", -1);
+        if (qd >= 0 && [mdl respondsToSelector:@selector(setQueueDepth:)]) {
+            if (qd > 127) qd = 127;
+            ((void(*)(id,SEL,char))objc_msgSend)(mdl, @selector(setQueueDepth:), (char)qd);
+            if (ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE queueDepth set to %ld\n", qd);
+            }
+        }
+
+        id client = nil;
+        id clientModel = nil;
+        if ([mdl respondsToSelector:@selector(sharedConnection)]) {
+            client = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(sharedConnection));
+        }
+        if ([mdl respondsToSelector:@selector(model)]) {
+            clientModel = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(model));
+        }
+
+        const bool wantsRealtime = (ane_interop_eval_path() == ANE_EVAL_REALTIME);
+        BOOL realtimeLoaded = NO;
+        if (wantsRealtime && client && clientModel) {
+            NSError *rtErr = nil;
+            if ([client respondsToSelector:@selector(beginRealTimeTask)]) {
+                ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(beginRealTimeTask));
+            }
+            if ([client respondsToSelector:@selector(loadRealTimeModel:options:qos:error:)]) {
+                realtimeLoaded = ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+                    client, @selector(loadRealTimeModel:options:qos:error:), clientModel, finalOptions, 21, &rtErr);
+            }
+            if (!realtimeLoaded && ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE realtime load failed: %s\n", rtErr ? [[rtErr description] UTF8String] : "no error");
+            }
+            if (!realtimeLoaded && [client respondsToSelector:@selector(endRealTimeTask)]) {
+                ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(endRealTimeTask));
+            }
         }
 
         ANEHandle *h = (ANEHandle *)calloc(1, sizeof(ANEHandle));
@@ -269,9 +513,17 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
             return NULL;
         }
         h->model = (void *)CFBridgingRetain(mdl);
+        h->client = client ? (void *)CFBridgingRetain(client) : NULL;
+        h->clientModel = clientModel ? (void *)CFBridgingRetain(clientModel) : NULL;
+        h->perfStats = perfStats ? (void *)CFBridgingRetain(perfStats) : NULL;
+        h->perfStatsRequested = wantPerfStats;
+        h->perfStatsMask = perfMask;
+        h->evalOptions = (void *)CFBridgingRetain(finalOptions);
+        h->realtimeLoaded = realtimeLoaded ? true : false;
         h->tmpDir = (void *)CFBridgingRetain(td);
         h->nInputs = nInputs;
         h->nOutputs = nOutputs;
+        h->lastHwExecutionTimeNS = 0;
 
         if (nInputs > 0) {
             size_t inputMetaBytes = 0;
@@ -355,9 +607,17 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
             [oIdx addObject:@(i)];
         }
 
-        id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
-            g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:),
-            wIns, iIdx, wOuts, oIdx, nil, nil, @0);
+        id req = nil;
+        if (perfStats) {
+            req = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:),
+                wIns, iIdx, wOuts, oIdx, perfStats, @0);
+        } else {
+            // If perfStats factory is unavailable but perfStatsMask is set, the driver may attach perfStatsArray.
+            req = ((id(*)(Class,SEL,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:procedureIndex:),
+                wIns, iIdx, wOuts, oIdx, @0);
+        }
         if (!req) {
             fprintf(stderr, "ANE compile failed: _ANERequest returned nil\n");
             ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
@@ -382,10 +642,64 @@ bool ane_interop_eval(ANEHandle *handle) {
     id mdl = (__bridge id)handle->model;
     id req = (__bridge id)handle->request;
     NSError *e = nil;
-    BOOL ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
-        mdl, @selector(evaluateWithQoS:options:request:error:), 21, @{}, req, &e);
+    NSDictionary *options = handle->evalOptions ? (__bridge NSDictionary *)handle->evalOptions : @{};
+
+    BOOL ok = NO;
+    ANEEvalPath evalPath = ane_interop_eval_path();
+    if (evalPath == ANE_EVAL_REALTIME && !handle->realtimeLoaded) {
+        // Real-time path may be unavailable on public builds; fall back to standard in-memory eval.
+        evalPath = ANE_EVAL_INMEM;
+    }
+    const bool shouldTryClient = (evalPath != ANE_EVAL_INMEM) || handle->perfStatsRequested;
+    if (shouldTryClient && handle->client && handle->clientModel) {
+        id client = (__bridge id)handle->client;
+        id modelObj = (__bridge id)handle->clientModel;
+        if (evalPath == ANE_EVAL_REALTIME && handle->realtimeLoaded &&
+            [client respondsToSelector:@selector(evaluateRealTimeWithModel:options:request:error:)]) {
+            ok = ((BOOL(*)(id,SEL,id,id,id,NSError**))objc_msgSend)(
+                client, @selector(evaluateRealTimeWithModel:options:request:error:), modelObj, options, req, &e);
+        } else {
+            SEL sel = @selector(evaluateWithModel:options:request:qos:error:);
+            if (evalPath == ANE_EVAL_CLIENT_DIRECT || handle->perfStatsRequested) {
+                SEL directSel = @selector(doEvaluateDirectWithModel:options:request:qos:error:);
+                if ([client respondsToSelector:directSel]) {
+                    sel = directSel;
+                }
+            }
+            ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                client, sel, modelObj, options, req, 21, &e);
+        }
+        if (!ok && ane_interop_trace_enabled()) {
+            fprintf(stderr, "ANE client eval failed (will fallback): %s\n", e ? [[e description] UTF8String] : "no error");
+        }
+    }
+    if (!ok) {
+        e = nil;
+        ok = ((BOOL(*)(id,SEL,unsigned int,id,id,NSError**))objc_msgSend)(
+            mdl, @selector(evaluateWithQoS:options:request:error:), 21, options, req, &e);
+    }
     if (!ok) {
         fprintf(stderr, "ANE eval failed: %s\n", e ? [[e description] UTF8String] : "no error");
+        handle->lastHwExecutionTimeNS = 0;
+    } else if (handle->perfStatsRequested) {
+        id ps = nil;
+        // Some drivers appear to replace/attach perf stats on the request after eval.
+        if ([req respondsToSelector:@selector(perfStats)]) {
+            ps = ((id(*)(id,SEL))objc_msgSend)(req, @selector(perfStats));
+        }
+        if (!ps && [req respondsToSelector:@selector(perfStatsArray)]) {
+            id arr = ((id(*)(id,SEL))objc_msgSend)(req, @selector(perfStatsArray));
+            if ([arr isKindOfClass:[NSArray class]] && [arr count] > 0) {
+                ps = [arr objectAtIndex:0];
+            }
+        }
+        if (!ps) {
+            ps = handle->perfStats ? (__bridge id)handle->perfStats : nil;
+        }
+        handle->lastHwExecutionTimeNS = ps ? ((uint64_t(*)(id,SEL))objc_msgSend)(ps, @selector(hwExecutionTime)) : 0;
+        if (ane_interop_trace_enabled()) {
+            fprintf(stderr, "ANE hwExecutionTime: %llu ns\n", (unsigned long long)handle->lastHwExecutionTimeNS);
+        }
     }
     return ok;
 }
@@ -418,6 +732,22 @@ IOSurfaceRef ane_interop_copy_output(ANEHandle *handle, int index) {
 
 void ane_interop_free(ANEHandle *handle) {
     if (!handle) return;
+
+    if (handle->realtimeLoaded && handle->client && handle->clientModel) {
+        id client = (__bridge id)handle->client;
+        id modelObj = (__bridge id)handle->clientModel;
+        id options = handle->evalOptions ? (__bridge id)handle->evalOptions : @{};
+        NSError *rtErr = nil;
+        if ([client respondsToSelector:@selector(unloadRealTimeModel:options:qos:error:)]) {
+            ((BOOL(*)(id,SEL,id,id,unsigned int,NSError**))objc_msgSend)(
+                client, @selector(unloadRealTimeModel:options:qos:error:), modelObj, options, 21, &rtErr);
+        }
+        if ([client respondsToSelector:@selector(endRealTimeTask)]) {
+            ((BOOL(*)(id,SEL))objc_msgSend)(client, @selector(endRealTimeTask));
+        }
+        handle->realtimeLoaded = false;
+    }
+
     if (handle->model) {
         id mdl = (__bridge id)handle->model;
         NSError *e = nil;
@@ -440,7 +770,11 @@ void ane_interop_free(ANEHandle *handle) {
     }
 
     if (handle->model) CFRelease(handle->model);
+    if (handle->client) CFRelease(handle->client);
+    if (handle->clientModel) CFRelease(handle->clientModel);
     if (handle->request) CFRelease(handle->request);
+    if (handle->perfStats) CFRelease(handle->perfStats);
+    if (handle->evalOptions) CFRelease(handle->evalOptions);
     if (handle->tmpDir) CFRelease(handle->tmpDir);
 
     free(handle->ioInputs);
@@ -471,4 +805,14 @@ void ane_interop_set_force_eval_failure(bool value) {
 
 int ane_interop_live_handle_count(void) {
     return __sync_fetch_and_add(&g_live_handle_count, 0);
+}
+
+uint64_t ane_interop_last_hw_execution_time_ns(ANEHandle *handle) {
+    if (!handle) return 0;
+    return handle->lastHwExecutionTimeNS;
+}
+
+bool ane_interop_has_perf_stats(ANEHandle *handle) {
+    if (!handle) return false;
+    return handle->perfStatsRequested && handle->perfStats != NULL;
 }

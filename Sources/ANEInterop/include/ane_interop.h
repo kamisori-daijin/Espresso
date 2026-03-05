@@ -39,6 +39,8 @@ void ane_interop_set_compile_count(int value);
 int ane_interop_last_compile_error(void);
 void ane_interop_set_force_eval_failure(bool value);
 int ane_interop_live_handle_count(void);
+uint64_t ane_interop_last_hw_execution_time_ns(ANEHandle *handle);
+bool ane_interop_has_perf_stats(ANEHandle *handle);
 
 void ane_interop_cvt_f32_to_f16(void *dst, const float *src, int count);
 void ane_interop_cvt_f16_to_f32(float *dst, const void *src, int count);

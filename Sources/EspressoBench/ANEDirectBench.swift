@@ -131,18 +131,24 @@ enum ANEDirectBench {
 
         let signposter = OSSignposter(subsystem: "com.espresso.bench", category: .pointsOfInterest)
 
+        var rng: SplitMix64? = nil
+        if let seed = benchSeed() {
+            rng = SplitMix64(seed: seed)
+            printStderr("  RNG seed: \(seed)")
+        }
+
         // 1. Create random weights
         let layers = LayerStorage<LayerWeights>(count: nLayers) { _ in
             let w = LayerWeights()
-            randomFill(w.Wq); randomFill(w.Wk); randomFill(w.Wv); randomFill(w.Wo)
-            randomFill(w.W1); randomFill(w.W2); randomFill(w.W3)
+            randomFill(w.Wq, rng: &rng); randomFill(w.Wk, rng: &rng); randomFill(w.Wv, rng: &rng); randomFill(w.Wo, rng: &rng)
+            randomFill(w.W1, rng: &rng); randomFill(w.W2, rng: &rng); randomFill(w.W3, rng: &rng)
             onesFill(w.rmsAtt); onesFill(w.rmsFfn)
             return w
         }
 
         // 2. Create random input
         let xCur = TensorBuffer(count: ModelConfig.dim * ModelConfig.seqLen, zeroed: false)
-        randomFill(xCur, range: -0.1...0.1)
+        randomFill(xCur, range: -0.1...0.1, rng: &rng)
 
         // 3. Compile inference kernels (2 per layer, not 5)
         printStderr("Compiling \(nLayers * 2) inference ANE kernels...")
@@ -297,9 +303,18 @@ enum ANEDirectBench {
     // MARK: - Helpers
 
     private static func randomFill(_ buffer: borrowing TensorBuffer, range: ClosedRange<Float> = -0.1...0.1) {
+        var none: SplitMix64? = nil
+        randomFill(buffer, range: range, rng: &none)
+    }
+
+    private static func randomFill(_ buffer: borrowing TensorBuffer, range: ClosedRange<Float> = -0.1...0.1, rng: inout SplitMix64?) {
         buffer.withUnsafeMutablePointer { ptr in
             for i in 0..<buffer.count {
-                ptr[i] = Float.random(in: range)
+                if rng != nil {
+                    ptr[i] = rng!.nextFloat(in: range)
+                } else {
+                    ptr[i] = Float.random(in: range)
+                }
             }
         }
     }
@@ -309,6 +324,40 @@ enum ANEDirectBench {
             for i in 0..<buffer.count {
                 ptr[i] = 1.0
             }
+        }
+    }
+
+    private static func benchSeed() -> UInt64? {
+        guard let s = ProcessInfo.processInfo.environment["ESPRESSO_BENCH_SEED"], !s.isEmpty else {
+            return nil
+        }
+        if s.hasPrefix("0x") || s.hasPrefix("0X") {
+            return UInt64(s.dropFirst(2), radix: 16)
+        }
+        return UInt64(s)
+    }
+
+    private struct SplitMix64 {
+        private var state: UInt64
+
+        init(seed: UInt64) {
+            self.state = seed
+        }
+
+        mutating func next() -> UInt64 {
+            state &+= 0x9E3779B97F4A7C15
+            var z = state
+            z = (z ^ (z >> 30)) &* 0xBF58476D1CE4E5B9
+            z = (z ^ (z >> 27)) &* 0x94D049BB133111EB
+            return z ^ (z >> 31)
+        }
+
+        mutating func nextFloat(in range: ClosedRange<Float>) -> Float {
+            // 53-bit precision fraction in [0,1).
+            let u = Double(next() >> 11) * (1.0 / 9007199254740992.0)  // 2^53
+            let lo = Double(range.lowerBound)
+            let hi = Double(range.upperBound)
+            return Float(lo + (hi - lo) * u)
         }
     }
 }

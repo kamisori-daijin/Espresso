@@ -2,6 +2,7 @@ import Foundation
 import ANETypes
 import ANERuntime
 import Espresso
+import Darwin
 
 // MARK: - CLI Argument Parsing
 
@@ -17,6 +18,9 @@ struct BenchmarkOptions {
     var outputDir: String? = nil
     var coreMLModelPath: String = "benchmarks/models/transformer_layer.mlpackage"
     var nLayers: Int = 1
+    var dumpANE: Bool = false
+    var dumpANEFilter: String? = nil
+    var perfStats: Bool = false
 
     static func parse(_ args: [String]) -> BenchmarkOptions {
         var opts = BenchmarkOptions()
@@ -71,6 +75,17 @@ struct BenchmarkOptions {
                     exit(1)
                 }
                 opts.nLayers = v
+            case "--dump-ane":
+                opts.dumpANE = true
+            case "--dump-ane-filter":
+                i += 1
+                guard i < args.count else {
+                    printStderr("--dump-ane-filter requires a string argument")
+                    exit(1)
+                }
+                opts.dumpANEFilter = args[i]
+            case "--perf-stats":
+                opts.perfStats = true
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -102,6 +117,9 @@ struct BenchmarkOptions {
           --output DIR       Output directory for results
           --model PATH       Path to Core ML .mlpackage
           --layers N         Number of transformer layers (default: 1)
+          --dump-ane         Dump ObjC runtime methods/properties for private ANE classes
+          --dump-ane-filter S  Only show methods/properties containing substring S
+          --perf-stats       Enable `_ANEPerformanceStats` collection for direct ANE eval (sets ANE_PERF_STATS=1)
           -h, --help         Show this help
         """)
     }
@@ -110,6 +128,30 @@ struct BenchmarkOptions {
 // MARK: - Main
 
 let opts = BenchmarkOptions.parse(CommandLine.arguments)
+
+if opts.dumpANE {
+    _ = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW)
+    let classes = [
+        "_ANEInMemoryModelDescriptor",
+        "_ANEInMemoryModel",
+        "_ANERequest",
+        "_ANEIOSurfaceObject",
+        "_ANEPerformanceStats",
+        "_ANEPerformanceCounters",
+        "_ANEClient",
+        "_ANEVirtualClient",
+        "_ANEChainingRequest",
+    ]
+    for c in classes {
+        print(ANEIntrospector.dump(className: c, filter: opts.dumpANEFilter))
+    }
+    exit(0)
+}
+
+if opts.perfStats {
+    setenv("ANE_PERF_STATS", "1", 1)
+}
+
 let runner = BenchmarkRunner(warmup: opts.warmup, iterations: opts.iterations)
 
 let flopsPerPass = FLOPCalculator.forwardPassFLOPs() * Double(opts.nLayers)
@@ -125,6 +167,8 @@ let handoff: ForwardPass.InferenceInterKernelHandoff = opts.inferenceFP16Handoff
 
 if opts.inferenceOnly {
     // --- Inference-only flow (skips training compile budget) ---
+    let thermalBefore = ThermalMonitor.currentState()
+
     let inferenceResult: ANEDirectBench.Result
     do {
         inferenceResult = try ANEDirectBench.runInference(
@@ -150,6 +194,8 @@ if opts.inferenceOnly {
         }
     }
 
+    let thermalAfter = ThermalMonitor.currentState()
+
     let report = ResultsFormatter.formatInferenceOnlyReport(
         inferenceResult: inferenceResult.benchmarkResult,
         inferenceTimingBreakdown: inferenceResult.avgTimingBreakdown,
@@ -157,7 +203,9 @@ if opts.inferenceOnly {
         coreMLResults: coreMLResult?.results,
         coreMLLoadTimeMs: coreMLResult?.modelLoadTimeMs,
         flopsPerPass: flopsPerPass,
-        nLayers: opts.nLayers
+        nLayers: opts.nLayers,
+        thermalBefore: thermalBefore,
+        thermalAfter: thermalAfter
     )
     print(report)
 

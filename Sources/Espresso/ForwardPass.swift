@@ -283,6 +283,7 @@ public enum ForwardPass {
             let attnEvalDelta = RuntimeClock.now() - t0
             timings.tAne += RuntimeClock.ms(attnEvalDelta)
             let attnEvalUS = RuntimeClock.us(attnEvalDelta)
+            let attnHwNS = kernels[L].fwdAttn.lastHWExecutionTimeNS()
             let attnEvalEndTick = RuntimeClock.now()
 
             // Read only dim channels (the fused residual result).
@@ -355,6 +356,7 @@ public enum ForwardPass {
             let ffnEvalDelta = RuntimeClock.now() - t0
             timings.tAne += RuntimeClock.ms(ffnEvalDelta)
             let ffnEvalUS = RuntimeClock.us(ffnEvalDelta)
+            let ffnHwNS = kernels[L].fwdFFN.lastHWExecutionTimeNS()
 
             // Read only dim channels (the fused residual result).
             let ffnOut: IOSurfaceRef
@@ -382,10 +384,12 @@ public enum ForwardPass {
                 layerIndex: L,
                 attnWriteUS: attnWriteUS,
                 attnEvalUS: attnEvalUS,
+                attnHwNS: attnHwNS,
                 attnReadUS: attnReadUS,
                 ffnWriteUS: ffnWriteUS,
                 ffnCopyUS: ffnCopyUS,
                 ffnEvalUS: ffnEvalUS,
+                ffnHwNS: ffnHwNS,
                 ffnReadUS: ffnReadUS,
                 gapAttnToFfnUS: gapUS
             )

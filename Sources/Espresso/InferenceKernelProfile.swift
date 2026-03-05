@@ -7,6 +7,8 @@ public struct InferenceKernelProfile: Sendable {
     public struct LayerSamples: Sendable {
         public var attnWriteUS: [Double] = []
         public var attnEvalUS: [Double] = []
+        /// Driver-reported on-chip execution time for attn eval (ns), or 0 if unavailable.
+        public var attnHwNS: [UInt64] = []
         public var attnReadUS: [Double] = []
 
         /// Either a CPU round-trip write (fp32->fp16) or 0 if not performed.
@@ -15,6 +17,8 @@ public struct InferenceKernelProfile: Sendable {
         public var ffnCopyUS: [Double] = []
 
         public var ffnEvalUS: [Double] = []
+        /// Driver-reported on-chip execution time for FFN eval (ns), or 0 if unavailable.
+        public var ffnHwNS: [UInt64] = []
         public var ffnReadUS: [Double] = []
 
         /// Host-visible time between `attn.eval` return and `ffn.eval` call entry.
@@ -30,10 +34,12 @@ public struct InferenceKernelProfile: Sendable {
             for i in layers.indices {
                 layers[i].attnWriteUS.reserveCapacity(reservedSamplesPerLayer)
                 layers[i].attnEvalUS.reserveCapacity(reservedSamplesPerLayer)
+                layers[i].attnHwNS.reserveCapacity(reservedSamplesPerLayer)
                 layers[i].attnReadUS.reserveCapacity(reservedSamplesPerLayer)
                 layers[i].ffnWriteUS.reserveCapacity(reservedSamplesPerLayer)
                 layers[i].ffnCopyUS.reserveCapacity(reservedSamplesPerLayer)
                 layers[i].ffnEvalUS.reserveCapacity(reservedSamplesPerLayer)
+                layers[i].ffnHwNS.reserveCapacity(reservedSamplesPerLayer)
                 layers[i].ffnReadUS.reserveCapacity(reservedSamplesPerLayer)
                 layers[i].gapAttnToFfnUS.reserveCapacity(reservedSamplesPerLayer)
             }
@@ -44,20 +50,24 @@ public struct InferenceKernelProfile: Sendable {
         layerIndex: Int,
         attnWriteUS: Double,
         attnEvalUS: Double,
+        attnHwNS: UInt64,
         attnReadUS: Double,
         ffnWriteUS: Double,
         ffnCopyUS: Double,
         ffnEvalUS: Double,
+        ffnHwNS: UInt64,
         ffnReadUS: Double,
         gapAttnToFfnUS: Double
     ) {
         precondition(layerIndex >= 0 && layerIndex < layers.count)
         layers[layerIndex].attnWriteUS.append(attnWriteUS)
         layers[layerIndex].attnEvalUS.append(attnEvalUS)
+        layers[layerIndex].attnHwNS.append(attnHwNS)
         layers[layerIndex].attnReadUS.append(attnReadUS)
         layers[layerIndex].ffnWriteUS.append(ffnWriteUS)
         layers[layerIndex].ffnCopyUS.append(ffnCopyUS)
         layers[layerIndex].ffnEvalUS.append(ffnEvalUS)
+        layers[layerIndex].ffnHwNS.append(ffnHwNS)
         layers[layerIndex].ffnReadUS.append(ffnReadUS)
         layers[layerIndex].gapAttnToFfnUS.append(gapAttnToFfnUS)
     }
@@ -75,10 +85,12 @@ public final class InferenceKernelProfiler: @unchecked Sendable {
         layerIndex: Int,
         attnWriteUS: Double,
         attnEvalUS: Double,
+        attnHwNS: UInt64,
         attnReadUS: Double,
         ffnWriteUS: Double,
         ffnCopyUS: Double,
         ffnEvalUS: Double,
+        ffnHwNS: UInt64,
         ffnReadUS: Double,
         gapAttnToFfnUS: Double
     ) {
@@ -86,10 +98,12 @@ public final class InferenceKernelProfiler: @unchecked Sendable {
             layerIndex: layerIndex,
             attnWriteUS: attnWriteUS,
             attnEvalUS: attnEvalUS,
+            attnHwNS: attnHwNS,
             attnReadUS: attnReadUS,
             ffnWriteUS: ffnWriteUS,
             ffnCopyUS: ffnCopyUS,
             ffnEvalUS: ffnEvalUS,
+            ffnHwNS: ffnHwNS,
             ffnReadUS: ffnReadUS,
             gapAttnToFfnUS: gapAttnToFfnUS
         )
