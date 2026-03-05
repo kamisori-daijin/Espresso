@@ -69,6 +69,10 @@ static bool ane_interop_env_flag(const char *key) {
     return (v && v[0] == '1');
 }
 
+static bool ane_interop_strict_options_enabled(void) {
+    return ane_interop_env_flag("ANE_STRICT_OPTIONS");
+}
+
 static long ane_interop_env_long(const char *key, long defaultValue) {
     const char *v = getenv(key);
     if (!v || v[0] == '\0') return defaultValue;
@@ -419,11 +423,19 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
         }
 
         NSError *e = nil;
+        const bool strictOptions = ane_interop_strict_options_enabled();
         if (!(cachePolicy == ANE_COMPILE_CACHE_PREFER_CACHED && compiledExists)) {
             if (!((BOOL(*)(id,SEL,unsigned int,id,NSError**))objc_msgSend)(
                     mdl, @selector(compileWithQoS:options:error:), 21, finalOptions, &e)) {
                 // Retry without options (some host builds reject unknown keys).
                 if ([finalOptions count] > 0) {
+                    if (strictOptions) {
+                        fprintf(stderr, "ANE compile failed with strict options (no fallback): %s\n",
+                                e ? [[e description] UTF8String] : "no error");
+                        ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                        ane_interop_remove_tmpdir(td);
+                        return NULL;
+                    }
                     if (ane_interop_trace_enabled()) {
                         fprintf(stderr, "ANE compile retrying without options...\n");
                     }
@@ -449,6 +461,13 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
                 mdl, @selector(loadWithQoS:options:error:), 21, finalOptions, &e)) {
             // Retry without options (keep behavior symmetric with compile).
             if ([finalOptions count] > 0) {
+                if (strictOptions) {
+                    fprintf(stderr, "ANE load failed with strict options (no fallback): %s\n",
+                            e ? [[e description] UTF8String] : "no error");
+                    ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
+                    ane_interop_remove_tmpdir(td);
+                    return NULL;
+                }
                 if (ane_interop_trace_enabled()) {
                     fprintf(stderr, "ANE load retrying without options...\n");
                 }

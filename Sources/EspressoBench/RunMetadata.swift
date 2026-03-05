@@ -1,10 +1,12 @@
 import Foundation
+import Espresso
 
 enum RunMetadata {
     static func base(mode: String, options: BenchmarkOptions) -> [String: Any] {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return [
+            "schema_version": 2,
             "timestamp": formatter.string(from: Date()),
             "mode": mode,
             "git_sha": gitSHA() ?? "unknown",
@@ -12,6 +14,9 @@ enum RunMetadata {
                 "chip": ResultsFormatter.chipName(),
                 "os": ProcessInfo.processInfo.operatingSystemVersionString,
             ],
+            "ane_effective_options": ANEOptionSnapshot
+                .fromEnvironment(ProcessInfo.processInfo.environment)
+                .asJSON(),
             "options": [
                 "warmup": options.warmup,
                 "iterations": options.iterations,

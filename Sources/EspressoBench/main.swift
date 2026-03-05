@@ -203,6 +203,12 @@ func benchmarkStats(_ result: BenchmarkResult) -> [String: Any] {
     ]
 }
 
+func artifactManifest(_ filenames: [String]) -> [[String: String]] {
+    Array(Set(filenames))
+        .sorted()
+        .map { ["path": $0] }
+}
+
 func inferenceProfileAverages(_ profile: InferenceKernelProfile) -> [[String: Any]] {
     profile.layers.indices.map { layerIdx in
         let mean = profile.averageLayerMetrics(layerIndex: layerIdx)
@@ -289,15 +295,18 @@ if opts.decode {
 
     do {
         try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+        var artifacts: [String] = []
         try ResultsFormatter.writeCSV(
             latencies: decodeResult.benchmarkResult.latencies,
             to: "\(outputDir)/ane_decode_token_latencies.csv"
         )
+        artifacts.append("ane_decode_token_latencies.csv")
         if let profile = decodeResult.decodeKernelProfile {
             try ResultsFormatter.writeDecodeKernelProfileCSV(
                 profile: profile,
                 to: "\(outputDir)/ane_decode_kernel_profile.csv"
             )
+            artifacts.append("ane_decode_kernel_profile.csv")
         }
         if let coreML = coreMLDecodeResult {
             for (label, result) in coreML.results {
@@ -310,9 +319,11 @@ if opts.decode {
                     latencies: result.latencies,
                     to: "\(outputDir)/\(filename)_token_latencies.csv"
                 )
+                artifacts.append("\(filename)_token_latencies.csv")
             }
         }
         try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
+        artifacts.append("summary.txt")
         var summaryJSON = RunMetadata.base(mode: "decode", options: opts)
         summaryJSON["ane_decode"] = [
             "compile_time_ms": decodeResult.compileTimeMs,
@@ -338,6 +349,9 @@ if opts.decode {
                 summaryJSON["speedup_vs_fastest_coreml_decode"] = fastest.median / decodeResult.benchmarkResult.median
             }
         }
+        let manifest = artifactManifest(artifacts + ["summary.json"])
+        summaryJSON["artifacts"] = manifest
+        summaryJSON["artifact_count"] = manifest.count
         try RunMetadata.writeJSON(summaryJSON, to: "\(outputDir)/summary.json")
         printStderr("\nResults saved to: \(outputDir)/")
     } catch {
@@ -408,16 +422,19 @@ if opts.inferenceOnly {
 
     do {
         try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+        var artifacts: [String] = []
 
         try ResultsFormatter.writeCSV(
             latencies: inferenceResult.benchmarkResult.latencies,
             to: "\(outputDir)/ane_inference_latencies.csv"
         )
+        artifacts.append("ane_inference_latencies.csv")
         if let profile = inferenceResult.kernelProfile {
             try ResultsFormatter.writeInferenceKernelProfileCSV(
                 profile: profile,
                 to: "\(outputDir)/ane_inference_kernel_profile.csv"
             )
+            artifacts.append("ane_inference_kernel_profile.csv")
         }
         if let coreML = coreMLResult {
             for (label, result) in coreML.results {
@@ -430,10 +447,12 @@ if opts.inferenceOnly {
                     latencies: result.latencies,
                     to: "\(outputDir)/\(filename)_latencies.csv"
                 )
+                artifacts.append("\(filename)_latencies.csv")
             }
         }
 
         try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
+        artifacts.append("summary.txt")
         var summaryJSON = RunMetadata.base(mode: "inference-only", options: opts)
         var inferenceEntry: [String: Any] = [
             "compile_time_ms": inferenceResult.compileTimeMs,
@@ -459,6 +478,9 @@ if opts.inferenceOnly {
                 },
             ]
         }
+        let manifest = artifactManifest(artifacts + ["summary.json"])
+        summaryJSON["artifacts"] = manifest
+        summaryJSON["artifact_count"] = manifest.count
         try RunMetadata.writeJSON(summaryJSON, to: "\(outputDir)/summary.json")
         printStderr("\nResults saved to: \(outputDir)/")
     } catch {
@@ -566,22 +588,26 @@ if let dir = opts.outputDir {
 
 do {
     try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+    var artifacts: [String] = []
 
     try ResultsFormatter.writeCSV(
         latencies: aneResult.benchmarkResult.latencies,
         to: "\(outputDir)/ane_direct_latencies.csv"
     )
+    artifacts.append("ane_direct_latencies.csv")
 
     if let inf = inferenceResult {
         try ResultsFormatter.writeCSV(
             latencies: inf.benchmarkResult.latencies,
             to: "\(outputDir)/ane_inference_latencies.csv"
         )
+        artifacts.append("ane_inference_latencies.csv")
         if let profile = inf.kernelProfile {
             try ResultsFormatter.writeInferenceKernelProfileCSV(
                 profile: profile,
                 to: "\(outputDir)/ane_inference_kernel_profile.csv"
             )
+            artifacts.append("ane_inference_kernel_profile.csv")
         }
     }
 
@@ -596,10 +622,12 @@ do {
                 latencies: result.latencies,
                 to: "\(outputDir)/\(filename)_latencies.csv"
             )
+            artifacts.append("\(filename)_latencies.csv")
         }
     }
 
     try report.write(toFile: "\(outputDir)/summary.txt", atomically: true, encoding: .utf8)
+    artifacts.append("summary.txt")
     var summaryJSON = RunMetadata.base(mode: "full", options: opts)
     summaryJSON["ane_direct"] = [
         "compile_time_ms": aneResult.compileTimeMs,
@@ -636,6 +664,9 @@ do {
             },
         ]
     }
+    let manifest = artifactManifest(artifacts + ["summary.json"])
+    summaryJSON["artifacts"] = manifest
+    summaryJSON["artifact_count"] = manifest.count
     try RunMetadata.writeJSON(summaryJSON, to: "\(outputDir)/summary.json")
     printStderr("\nResults saved to: \(outputDir)/")
 } catch {
