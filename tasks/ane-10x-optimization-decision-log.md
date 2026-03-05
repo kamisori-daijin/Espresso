@@ -54,6 +54,7 @@ Main benchmark commands used:
 | A12 | Compile cache policy reproducibility check (`auto` vs `preferCached`) | Improve compile stability and iteration time | `/tmp/decode_repro_ane10x_run1`, `/tmp/decode_repro_ane10x_run2` | Median latency stable (`0.648479` vs `0.648500` ms/token; delta `0.0032%`), compile time collapsed (`49.49s` → `52.7ms`) | **SHIP** (`preferCached`) |
 | A13 | Decode tile-sync optimization (boundary-only window sync + incremental lane cache updates + removed redundant lane-zero copies) | Full-window cache sync every token was dominating decode IO at `maxSeq > 32` | Commit `5c016ec`; `/tmp/decode_syncopt_before_max128_20260305`, `/tmp/decode_syncopt_after_max128_20260305`, `/tmp/decode_syncopt_before_max256_20260305`, `/tmp/decode_syncopt_after_max256_20260305` | Large, repeatable IO reduction and throughput gain for tiled decode contexts (`128/256`) while preserving hardware correctness tests | **SHIP** |
 | A14 | Decode runtime option sweep on top of A13 (`queue depth`, `eval path`, `power`, `wired`, `pool`, `late latch`, `fences`, `fw signal`) | Try to stack additional constant-factor wins after tile-sync optimization | `/tmp/decode_syncopt_opts_max128_20260305`, `/tmp/decode_syncopt_confirm_evalpath_max128_20260305` | One-shot sweep suggested `ANE_EVAL_PATH=clientDirect`, but 3x confirmation showed baseline parity/no stable gain (median baseline `~0.672–0.676`, candidate `~0.677–0.679`) | **ABANDON** (no reproducible gain) |
+| A15 | Prefill option combo re-check (`ANE_QUEUE_DEPTH=32` + `ANE_MEMORY_POOL_ID=1`) under sequential runs | Verify whether previous prefill gains hold under non-contented, reproducible setup | `/tmp/prefill_syncopt_baseline_seq_20260305`, `/tmp/prefill_syncopt_combo_qd32_pool1_seq_20260305` | Combo regressed vs baseline (median `1.927` vs `1.855` ms); no bottleneck improvement | **ABANDON** |
 
 ---
 
@@ -131,6 +132,19 @@ Inference: mixed-run thermal state materially affects ANE median on this host; t
 - Artifact: `/tmp/prefill_profile_bdb0bd7`
 - ANE median: `1.872 ms`
 - Core ML `.all` median: `1.541 ms`
+
+4) Sequential re-check (this pass):
+- Baseline (ANE only): `/tmp/prefill_syncopt_baseline_seq_20260305`
+  - mean `1.827`, median `1.855`, p95 `2.077`, p99 `2.184`
+- QueueDepth+Pool combo: `/tmp/prefill_syncopt_combo_qd32_pool1_seq_20260305`
+  - mean `1.903`, median `1.927`, p95 `2.109`, p99 `2.211`
+- Combo verdict: regression; do not ship.
+
+5) Fairness snapshot:
+- `/tmp/prefill_syncopt_coreml_20260305`
+  - ANE median `1.853 ms`
+  - Core ML medians: `.all 1.684`, `.cpuAndNeuralEngine 1.718`, `.cpuAndGPU 1.135`
+  - ANE remains slower than fastest Core ML baseline on this host/profile.
 
 Interpretation:
 - Prefill remains high-variance and can be slower than Core ML in longer/hotter runs.

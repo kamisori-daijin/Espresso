@@ -39,6 +39,10 @@ Goal: deliver maximum defensible ANE decode throughput and best-justified prefil
   - quick matrix: `/tmp/decode_syncopt_opts_max128_20260305`
   - confirmation repeats: `/tmp/decode_syncopt_confirm_evalpath_max128_20260305`
   - verdict: no reproducible gain over baseline; keep default eval path (`ABANDON`).
+- [x] Prefill high-ROI combo re-check (sequential, non-contended):
+  - baseline: `/tmp/prefill_syncopt_baseline_seq_20260305` median `1.855 ms`
+  - `ANE_QUEUE_DEPTH=32` + `ANE_MEMORY_POOL_ID=1`: `/tmp/prefill_syncopt_combo_qd32_pool1_seq_20260305` median `1.927 ms`
+  - verdict: regresses prefill; `ABANDON`.
 
 ## ANE 10x Tuning Program (2026-03-05)
 Goal: iterate aggressively until ANE direct is 10x faster than Core ML across compute-only + end-to-end benchmarks, or prove a hard floor via ANE `hwExecutionTime`.
