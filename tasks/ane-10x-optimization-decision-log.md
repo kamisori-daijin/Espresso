@@ -1,9 +1,9 @@
 # ANE 10x Optimization Decision Log
 
 Date: 2026-03-05  
-Repo/worktree: `/private/tmp/espresso-ane-10x-max`  
+Repo/worktree: `/private/tmp/espresso-mainworktree-clean`  
 Branch: `feat/ane-10x-max`  
-Latest commit at time of this document: `f69e711`
+Latest commit at time of this document: `5c016ec`
 
 ---
 
@@ -52,7 +52,7 @@ Main benchmark commands used:
 | A10 | Perf-stats object fallback experiments in interop | Try to recover `hwExecutionTime` data | Local experiments + tests (`ANEPerfStatsTests`) | Forcing placeholder perf-stats object caused runtime exceptions; reverted. Host still reports factory nil. | **ABANDON** (unsafe path) |
 | A11 | Decode eval path sweep (`inmem`, `client`, `clientDirect`, `realtime`) | Test whether failure depended on eval path rather than kernel contract | `/tmp/decode_evalpath_*.log` | All eval paths failed identically for unsupported decode-attn contract (`statusType=0x9`) | **ABANDON** (for this failure mode) |
 | A12 | Compile cache policy reproducibility check (`auto` vs `preferCached`) | Improve compile stability and iteration time | `/tmp/decode_repro_ane10x_run1`, `/tmp/decode_repro_ane10x_run2` | Median latency stable (`0.648479` vs `0.648500` ms/token; delta `0.0032%`), compile time collapsed (`49.49s` → `52.7ms`) | **SHIP** (`preferCached`) |
-| A13 | Decode tile-sync optimization (boundary-only window sync + incremental lane cache updates + removed redundant lane-zero copies) | Full-window cache sync every token was dominating decode IO at `maxSeq > 32` | Commit in this pass; `/tmp/decode_syncopt_before_max128_20260305`, `/tmp/decode_syncopt_after_max128_20260305`, `/tmp/decode_syncopt_before_max256_20260305`, `/tmp/decode_syncopt_after_max256_20260305` | Large, repeatable IO reduction and throughput gain for tiled decode contexts (`128/256`) while preserving hardware correctness tests | **SHIP** |
+| A13 | Decode tile-sync optimization (boundary-only window sync + incremental lane cache updates + removed redundant lane-zero copies) | Full-window cache sync every token was dominating decode IO at `maxSeq > 32` | Commit `5c016ec`; `/tmp/decode_syncopt_before_max128_20260305`, `/tmp/decode_syncopt_after_max128_20260305`, `/tmp/decode_syncopt_before_max256_20260305`, `/tmp/decode_syncopt_after_max256_20260305` | Large, repeatable IO reduction and throughput gain for tiled decode contexts (`128/256`) while preserving hardware correctness tests | **SHIP** |
 
 ---
 
