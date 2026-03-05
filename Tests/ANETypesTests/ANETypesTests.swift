@@ -518,6 +518,72 @@ final class ANETypesTests: XCTestCase {
         }
     }
 
+    func test_surface_write_fp16_spatial_slice_writes_one_lane() throws {
+        let channels = 6
+        let spatial = 4
+        let surface = makeSurface(bytes: channels * spatial * 2)
+
+        let zeros = Array(repeating: Float(0), count: channels * spatial)
+        zeros.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
+        }
+
+        let slice: [Float] = (0..<channels).map { Float($0) * 0.5 - 1.0 }
+        try slice.withUnsafeBufferPointer { src in
+            try SurfaceIO.writeFP16SpatialSlice(
+                to: surface,
+                channelOffset: 0,
+                spatialIndex: 2,
+                spatial: spatial,
+                data: src,
+                channels: channels
+            )
+        }
+
+        var out = Array(repeating: Float.nan, count: channels * spatial)
+        out.withUnsafeMutableBufferPointer { dst in
+            SurfaceIO.readFP16(from: surface, into: dst, channelOffset: 0, channels: channels, spatial: spatial)
+        }
+
+        for ch in 0..<channels {
+            for sp in 0..<spatial {
+                let idx = ch * spatial + sp
+                if sp == 2 {
+                    XCTAssertEqual(out[idx], slice[ch], accuracy: 1e-2)
+                } else {
+                    XCTAssertEqual(out[idx], 0, accuracy: 0)
+                }
+            }
+        }
+    }
+
+    func test_surface_read_fp16_spatial_slice_reads_one_lane() throws {
+        let channels = 5
+        let spatial = 3
+        let surface = makeSurface(bytes: channels * spatial * 2)
+
+        let input: [Float] = (0..<(channels * spatial)).map { Float($0) * 0.25 - 2.0 }
+        input.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: surface, data: src, channels: channels, spatial: spatial)
+        }
+
+        var lane = Array(repeating: Float.nan, count: channels)
+        try lane.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16SpatialSlice(
+                from: surface,
+                channelOffset: 0,
+                spatialIndex: 1,
+                spatial: spatial,
+                into: dst,
+                channels: channels
+            )
+        }
+
+        for ch in 0..<channels {
+            XCTAssertEqual(lane[ch], input[ch * spatial + 1], accuracy: 1e-2)
+        }
+    }
+
     func test_surface_copy_fp16_spatial_slice_with_channel_offsets() throws {
         let srcChannels = 10
         let srcSpatial = 2

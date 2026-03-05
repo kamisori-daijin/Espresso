@@ -55,6 +55,51 @@ Goal: deliver maximum defensible ANE decode throughput and best-justified prefil
 - [ ] D5: Investigate `_ANEChainingRequest` / `prepareChainingWithModel` as the next decode dispatch-reduction candidate instead of request-level surface rebinding
 - [ ] D6: Re-run decode tiling/contract expansion probes only after the best dispatch-reduction path is stable
 
+### Decode Boundary + Contract Follow-Ups (2026-03-06)
+- [x] Direct boundary spatial-slice ingress/egress (`attnIn` write + final `ffnOut` read) with new `SurfaceIO` helpers
+  Review:
+  - Added direct FP16 spatial-slice read/write primitives in `ANEInterop` / `SurfaceIO` and replaced the decode hot-path boundary `tokenScratch -> copy -> attnIn` and `ffnOut -> copy -> tokenScratch` hops with direct lane-0 boundary access.
+  - TDD first:
+    - `ANETypesTests/test_surface_write_fp16_spatial_slice_writes_one_lane`
+    - `ANETypesTests/test_surface_read_fp16_spatial_slice_reads_one_lane`
+  - Correctness verification:
+    - `swift test --filter 'ANETypesTests/test_surface_write_fp16_spatial_slice_writes_one_lane|ANETypesTests/test_surface_read_fp16_spatial_slice_reads_one_lane'`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter 'InferenceOptimizationTests/test_decode_kv_cache_updates_and_mask_progresses_on_hardware|InferenceOptimizationTests/test_decode_kv_mask_progresses_across_tile_boundaries_on_hardware'`
+    - full `swift test`
+  - Confirmation artifacts:
+    - baseline clean worktree: `/tmp/decode_boundary_before_max128_confirm_r1_20260306`, `/tmp/decode_boundary_before_max128_confirm_r2_20260306`, `/tmp/decode_boundary_before_max128_confirm_r3_20260306`
+    - candidate: `/tmp/decode_boundary_after_max128_confirm_r1_20260306`, `/tmp/decode_boundary_after_max128_confirm_r2_20260306`, `/tmp/decode_boundary_after_max128_confirm_r3_20260306`
+  - Confirmed median-of-medians:
+    - baseline `0.485209 ms/token`
+    - candidate `0.483041 ms/token`
+    - delta `-0.45%`
+  - Tail / throughput:
+    - p95 `0.540042 -> 0.539292 ms`
+    - p99 `0.696168 -> 0.696291 ms`
+    - throughput `2042.7 -> 2052.3 tok/s`
+  - Attribution:
+    - ANE kernel `0.397825 -> 0.397303 ms`
+    - surface I/O `0.031336 -> 0.029447 ms`
+  - Verdict: `SHIP` as a small, reproducible decode boundary-copy improvement. Remaining upside from this class is now small because decode remains eval-dominant.
+- [x] Lane-spatial sweep re-check at `maxSeq=128`
+  Review:
+  - Quick ANE-only artifacts:
+    - `/tmp/decode_lane_sweep_max128_l32_quick_20260306`
+    - `/tmp/decode_lane_sweep_max128_l64_quick_20260306`
+    - `/tmp/decode_lane_sweep_max128_l128_quick_20260306`
+  - Results:
+    - lane `32`: median `0.493250 ms`, `1991.6 tok/s`
+    - lane `64`: median `0.499916 ms`, `1962.7 tok/s`
+    - lane `128`: median `0.505333 ms`, `1957.4 tok/s`
+  - Verdict: `ABANDON` wider lane-spatial variants for the current decode contract. They regress median and do not reduce enough sync overhead to offset the cost.
+- [x] Decode mask-collapse probe (`dense mask` channels `768 -> 1`)
+  Review:
+  - TDD was added first by changing MIL-generator and hardware test expectations to a 1-channel decode mask path.
+  - Hardware outcome:
+    - probe families with reduced-mask variants still fail with `statusType=0x9`
+    - decode hardware tests also fail once the 1-channel mask contract is used
+  - Verdict: `ABANDON` the 1-channel mask collapse path on this host/runtime. The dense-mask contract remains the stable decode baseline.
+
 ### Decode Runtime Option Sweep (maxSeq=32, 2026-03-06)
 - [x] Quick 1-layer decode sweep rerun in the clean worktree:
   - artifact root: `/tmp/decode_sweep_max32_quick_20260306`
@@ -95,7 +140,11 @@ Goal: deliver maximum defensible ANE decode throughput and best-justified prefil
 
 ### Hypothesis-Driven Next Steps (for max performance)
 - [ ] H1: Implement decode dispatch-reduction path behind flag (target: fewer evals per token/layer).
-- [ ] H2: Minimize decode boundary CPU-touch copies and measure p95/p99 impact.
+- [x] H2: Minimize decode boundary CPU-touch copies and measure p95/p99 impact.
+  Review:
+  - Completed by the direct boundary spatial-slice ingress/egress path above.
+  - Confirmed gain is small but real (`-0.45%` median-of-medians at `maxSeq=128`) and primarily reduces surface I/O rather than ANE eval time.
+  - Further large decode wins now require dispatch reduction, not more boundary-copy trimming.
 - [ ] H3: Lock thermal/fairness benchmark protocol (interleaved repeats + cooldown + median-of-medians).
 - [ ] H4: Probe contract-safe decode tiling variants beyond current auxiliary-shape constraints.
 - [ ] H5: Prefill-only high-ROI fusion/chaining experiments (exclude unstable runtime option combos).
@@ -773,6 +822,11 @@ Goal: maximize advantage vs Core ML by eliminating structural overhead (dispatch
 
 ### What worked
 - Tiled decode IO reduction from `5c016ec` remains the best shipped improvement for longer contexts.
+- Direct boundary spatial-slice ingress/egress is also a real, smaller decode win:
+  - baseline median-of-medians `0.485209 ms/token`
+  - candidate median-of-medians `0.483041 ms/token`
+  - throughput `2042.7 -> 2052.3 tok/s`
+  - dominant attribution change: surface I/O `0.031336 -> 0.029447 ms/token`
 
 ### What did not work
 - Runtime option chasing at `maxSeq=32` did not beat baseline.
@@ -781,6 +835,8 @@ Goal: maximize advantage vs Core ML by eliminating structural overhead (dispatch
   - undersized input rejection passed
   - actual eval with external input surface failed with `statusType=0x9: Program Inference error`
   - decode chained parity test drifted to `NaN`
+- Wider `laneSpatial` variants (`64`, `128`) regressed at `maxSeq=128` relative to the current `32`-lane baseline.
+- Reducing the decode mask cache to 1 channel failed hardware eval with the same `statusType=0x9` ANE inference error family.
 
 ### Why
 - The remaining decode cost is mostly eval time, not simple copy overhead.

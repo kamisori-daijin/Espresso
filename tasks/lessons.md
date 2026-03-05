@@ -52,3 +52,4 @@
 ## 2026-03-06 — Performance Reporting Discipline
 - Every tuning cycle must document three things explicitly: what was tried, what worked, and what did not work.
 - Always explain why a change is believed to have helped, regressed, or failed to confirm; artifact-backed attribution is part of the deliverable, not optional commentary.
+- Do not discard confirmed sub-1% performance improvements as “too small” without documenting them. If a small gain survives repeated confirmation and tails stay flat, commit it, document it, and then continue iterating from the improved baseline.

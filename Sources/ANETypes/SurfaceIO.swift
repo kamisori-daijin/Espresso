@@ -272,6 +272,64 @@ public enum SurfaceIO {
         guard ok else { throw .interopCallFailed }
     }
 
+    public static func writeFP16SpatialSlice(
+        to surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatialIndex: Int,
+        spatial: Int,
+        data: UnsafeBufferPointer<Float>,
+        channels: Int
+    ) throws(SurfaceIOError) {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatialIndex32 = try checkedNonNegativeInt32(spatialIndex)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        precondition(data.count == channels)
+        if channels == 0 { return }
+        guard let src = data.baseAddress else {
+            preconditionFailure("Input base address is nil for non-empty buffer")
+        }
+
+        let ok = ane_interop_io_write_fp16_spatial_slice(
+            surface,
+            chOff32,
+            spatialIndex32,
+            spatial32,
+            src,
+            channels32
+        )
+        guard ok else { throw .interopCallFailed }
+    }
+
+    public static func readFP16SpatialSlice(
+        from surface: IOSurfaceRef,
+        channelOffset: Int,
+        spatialIndex: Int,
+        spatial: Int,
+        into dst: UnsafeMutableBufferPointer<Float>,
+        channels: Int
+    ) throws(SurfaceIOError) {
+        let chOff32 = try checkedNonNegativeInt32(channelOffset)
+        let spatialIndex32 = try checkedNonNegativeInt32(spatialIndex)
+        let spatial32 = try checkedNonNegativeInt32(spatial)
+        let channels32 = try checkedNonNegativeInt32(channels)
+        precondition(dst.count == channels)
+        if channels == 0 { return }
+        guard let out = dst.baseAddress else {
+            preconditionFailure("Destination base address is nil for non-empty buffer")
+        }
+
+        let ok = ane_interop_io_read_fp16_spatial_slice(
+            surface,
+            chOff32,
+            spatialIndex32,
+            spatial32,
+            out,
+            channels32
+        )
+        guard ok else { throw .interopCallFailed }
+    }
+
     public static func copyFP16Batched(dst: IOSurfaceRef,
                                        src: IOSurfaceRef,
                                        spatial: Int,

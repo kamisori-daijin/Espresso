@@ -425,23 +425,19 @@ public extension ForwardPass {
         let windowBase = DecodeTiling.windowBase(for: tokenIndex, laneSpatial: kernelMaxSeq)
         let windowLocalIndex = DecodeTiling.localIndex(for: tokenIndex, laneSpatial: kernelMaxSeq)
 
-        // CPU touch at decode boundary: write token embedding/state to a compact token scratch surface.
+        // CPU touch at decode boundary: write the current token directly into lane 0.
         var t0 = RuntimeClock.now()
-        xCur.withUnsafeBufferPointer { xBuf in
-            SurfaceIO.writeFP16(to: surfaceHandles[0].tokenScratch, data: xBuf, channels: dim, spatial: 1)
-        }
         do {
-            try SurfaceIO.copyFP16SpatialSlice(
-                dst: surfaceHandles[0].attnIn,
-                dstChannelOffset: 0,
-                dstSpatialIndex: 0,
-                dstSpatial: laneSpatial,
-                src: surfaceHandles[0].tokenScratch,
-                srcChannelOffset: 0,
-                srcSpatialIndex: 0,
-                srcSpatial: 1,
-                channels: dim
-            )
+            try xCur.withUnsafeBufferPointer { xBuf in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: surfaceHandles[0].attnIn,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    data: xBuf,
+                    channels: dim
+                )
+            }
         } catch {
             throw .invalidArguments("decode token lane write failed: \(error)")
         }
@@ -681,27 +677,23 @@ public extension ForwardPass {
             )
         }
 
-        // CPU touch at decode boundary: read final layer output.
+        // CPU touch at decode boundary: read final lane 0 output directly.
         let finalHandles = surfaceHandles[kernels.count - 1]
         let finalOut = finalHandles.ffnOut
         t0 = RuntimeClock.now()
         do {
-            try SurfaceIO.copyFP16SpatialSlice(
-                dst: finalHandles.tokenScratch,
-                dstChannelOffset: 0,
-                dstSpatialIndex: 0,
-                dstSpatial: 1,
-                src: finalOut,
-                srcChannelOffset: 0,
-                srcSpatialIndex: 0,
-                srcSpatial: laneSpatial,
-                channels: dim
-            )
+            try xCur.withUnsafeMutableBufferPointer { out in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: finalOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    into: out,
+                    channels: dim
+                )
+            }
         } catch {
             throw .invalidArguments("final decode lane unpack failed: \(error)")
-        }
-        xCur.withUnsafeMutableBufferPointer { out in
-            SurfaceIO.readFP16(from: finalHandles.tokenScratch, into: out, channelOffset: 0, channels: dim, spatial: 1)
         }
         timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 

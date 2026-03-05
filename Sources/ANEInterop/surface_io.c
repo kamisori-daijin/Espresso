@@ -168,6 +168,90 @@ cleanup:
     return ok;
 }
 
+bool ane_interop_io_write_fp16_spatial_slice(IOSurfaceRef surface,
+                                             int ch_off,
+                                             int spatial_index,
+                                             int spatial,
+                                             const float *data,
+                                             int channels) {
+    if (!surface || !data) return false;
+    if (ch_off < 0 || spatial_index < 0 || spatial < 0 || channels < 0) return false;
+    if (channels == 0) return true;
+    if (spatial == 0 || spatial_index >= spatial) return false;
+    if (channels > INT_MAX - ch_off) return false;
+
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(ch_off + channels - 1);
+    size_t maxIdxElems;
+    size_t elemCount;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, (size_t)spatial_index, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, 1, &elemCount)) return false;
+
+    size_t bytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &bytes)) return false;
+
+    if (IOSurfaceLock(surface, 0, NULL) != kIOReturnSuccess) return false;
+    bool ok = false;
+
+    void *base = IOSurfaceGetBaseAddress(surface);
+    if (!base) goto cleanup;
+    if (bytes > IOSurfaceGetAllocSize(surface)) goto cleanup;
+
+    _Float16 *dstF16 = (_Float16 *)base;
+    for (int c = 0; c < channels; c++) {
+        size_t idx = (size_t)(ch_off + c) * spatialSz + (size_t)spatial_index;
+        dstF16[idx] = (_Float16)data[c];
+    }
+    ok = true;
+
+cleanup:
+    IOSurfaceUnlock(surface, 0, NULL);
+    return ok;
+}
+
+bool ane_interop_io_read_fp16_spatial_slice(IOSurfaceRef surface,
+                                            int ch_off,
+                                            int spatial_index,
+                                            int spatial,
+                                            float *data,
+                                            int channels) {
+    if (!surface || !data) return false;
+    if (ch_off < 0 || spatial_index < 0 || spatial < 0 || channels < 0) return false;
+    if (channels == 0) return true;
+    if (spatial == 0 || spatial_index >= spatial) return false;
+    if (channels > INT_MAX - ch_off) return false;
+
+    size_t spatialSz = (size_t)spatial;
+    size_t maxCh = (size_t)(ch_off + channels - 1);
+    size_t maxIdxElems;
+    size_t elemCount;
+    if (mul_size_overflow(maxCh, spatialSz, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, (size_t)spatial_index, &maxIdxElems)) return false;
+    if (add_size_overflow(maxIdxElems, 1, &elemCount)) return false;
+
+    size_t bytes;
+    if (mul_size_overflow(elemCount, sizeof(_Float16), &bytes)) return false;
+
+    if (IOSurfaceLock(surface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) return false;
+    bool ok = false;
+
+    const void *base = IOSurfaceGetBaseAddress(surface);
+    if (!base) goto cleanup;
+    if (bytes > IOSurfaceGetAllocSize(surface)) goto cleanup;
+
+    const _Float16 *srcF16 = (const _Float16 *)base;
+    for (int c = 0; c < channels; c++) {
+        size_t idx = (size_t)(ch_off + c) * spatialSz + (size_t)spatial_index;
+        data[c] = (float)srcF16[idx];
+    }
+    ok = true;
+
+cleanup:
+    IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+    return ok;
+}
+
 bool ane_interop_io_write_fp16(IOSurfaceRef surface,
                                const float *data, int channels, int spatial) {
     return ane_interop_io_write_fp16_at(surface, 0, data, channels, spatial);

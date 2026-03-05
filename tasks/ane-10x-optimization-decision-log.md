@@ -58,6 +58,9 @@ Main benchmark commands used:
 | A16 | Fused decode layer prototype (`decode_attn_probe + decode_ffn` in one kernel behind `ESPRESSO_DECODE_LAYER_MODE=fusedLayer`) | Remove one eval per layer/token and test the biggest remaining decode dispatch lever | Quick split2 baseline `/tmp/decode_fused_cycle1_split2_quick_20260306`; compile stall sample `/tmp/espresso-bench_2026-03-06_014704_vEMy.sample.txt` | Prototype built and unit tests passed, but every fused decode compile stalled inside `_ANEClient compileModel`, including a stripped-down passthrough probe. No artifact directory was produced for the fused attempts. | **ABANDON** (compile instability / unsafe) |
 | A17 | Decode runtime option re-sweep at `maxSeq=32` in clean worktree (`preferCached`, `clientDirect`, queue depth, power, wired) | Re-check whether the current cool baseline still has any unclaimed runtime-option win before more invasive decode work | `/tmp/decode_sweep_max32_quick_20260306` | `preferCached` baseline remained best. Confirmation medians: baseline `0.4888/0.4941/0.4940`, `clientDirect` `0.4955/0.4954/0.4926`; median-of-medians delta `+0.27%` against `clientDirect`. `keepModelWired` regressed hard to median `0.587`. | **ABANDON** (runtime tuning exhausted for this shape) |
 | A18 | Request-level decode input surface rebinding (`attnOut -> ffnIn`, `ffnOut_L -> attnIn_L+1`) with request rebuild and client refresh attempts | Lowest-risk route to remove explicit copy steps and build groundwork for chaining | Hardware tests only; no benchmark artifact shipped because correctness/runtime gate failed before profiling | Undersized-surface rejection worked, but equal-size input rebinding caused private-runtime selector mismatches (`-[__NSArrayM procedureIndex]`, then `-[_ANERequest executionDelay]`) and still fell through to `statusType=0x9` ANE inference errors. Real rebinding is unsafe on this host/runtime. | **ABANDON** (fast rollback required) |
+| A19 | Direct decode boundary spatial-slice I/O (`attnIn` write + final `ffnOut` read) | Remove the extra `tokenScratch` boundary hops while keeping the proven two-kernel decode contract unchanged | `/tmp/decode_boundary_before_max128_confirm_r{1,2,3}_20260306`, `/tmp/decode_boundary_after_max128_confirm_r{1,2,3}_20260306` | Small but repeatable decode gain at `maxSeq=128`: median-of-medians `0.485209 -> 0.483041 ms/token` (`-0.45%`), throughput `2042.7 -> 2052.3 tok/s`, p95 slightly better, p99 effectively flat. Attribution is I/O-only: surface I/O `0.031336 -> 0.029447 ms/token`, ANE kernel time essentially flat. | **SHIP** |
+| A20 | Lane-spatial sweep re-check at `maxSeq=128` (`32`, `64`, `128`) | Test whether wider lane windows reduce enough tile-sync overhead to outweigh the extra surface footprint | `/tmp/decode_lane_sweep_max128_l32_quick_20260306`, `/tmp/decode_lane_sweep_max128_l64_quick_20260306`, `/tmp/decode_lane_sweep_max128_l128_quick_20260306` | Current decode contract still prefers `laneSpatial=32`. Wider lanes regressed median (`0.493250 -> 0.499916 -> 0.505333 ms`) and throughput (`1991.6 -> 1962.7 -> 1957.4 tok/s`). | **ABANDON** |
+| A21 | Decode mask-collapse probe (`dense mask` channels `768 -> 1`) | Reduce mask bandwidth and surface footprint on every token/layer update | Hardware tests + reverted local probe; no benchmark artifact shipped because eval failed before perf measurement | One-channel decode mask variants fail on this host/runtime with the same `statusType=0x9` ANE inference error family already seen in unsupported probe shapes. The dense 768-channel mask remains the stable contract. | **ABANDON** |
 
 ---
 
@@ -96,6 +99,33 @@ Interpretation:
   - After: `/tmp/decode_syncopt_after_max256_20260305`
     - mean `0.535`, median `0.492`, p95 `0.700`, p99 `0.836`, `1869 tok/s`
     - breakdown: ANE `0.436 ms`, IO `0.035 ms`
+
+4) Direct boundary spatial-slice I/O A/B (`maxSeq=128`, 3x confirmations):
+- Clean baseline artifacts:
+  - `/tmp/decode_boundary_before_max128_confirm_r1_20260306`
+  - `/tmp/decode_boundary_before_max128_confirm_r2_20260306`
+  - `/tmp/decode_boundary_before_max128_confirm_r3_20260306`
+- Candidate artifacts:
+  - `/tmp/decode_boundary_after_max128_confirm_r1_20260306`
+  - `/tmp/decode_boundary_after_max128_confirm_r2_20260306`
+  - `/tmp/decode_boundary_after_max128_confirm_r3_20260306`
+- Baseline medians: `0.484708`, `0.486417`, `0.485209`
+- Candidate medians: `0.481958`, `0.483041`, `0.488291`
+- Median-of-medians:
+  - baseline `0.485209 ms/token`
+  - candidate `0.483041 ms/token`
+  - delta `-0.45%`
+- Tail / throughput median-of-medians:
+  - p95 `0.540042 -> 0.539292 ms`
+  - p99 `0.696168 -> 0.696291 ms`
+  - throughput `2042.7 -> 2052.3 tok/s`
+- Attribution:
+  - ANE kernel `0.397825 -> 0.397303 ms/token`
+  - surface I/O `0.031336 -> 0.029447 ms/token`
+Interpretation:
+- This is a real but small decode improvement.
+- The gain comes from boundary I/O reduction only; it does not materially change ANE eval cost.
+- That makes it worth shipping, but it also reinforces that boundary-copy trimming alone will not get decode anywhere near the 6x target.
 
 4) Strict fairness snapshot after A13 (`maxSeq=128`):
 - Artifact: `/tmp/decode_syncopt_coreml_max128_20260305`
@@ -249,6 +279,11 @@ Prefill profile run:
   - `maxSeq=128`: median `0.685 -> 0.483 ms/token`, throughput `1445 -> 2040 tok/s`
   - `maxSeq=256`: median `0.685 -> 0.492 ms/token`, throughput `1448 -> 1869 tok/s`
   - Primary bottleneck shift: IO `~0.219/0.217 ms` down to `~0.032/0.035 ms` per token.
+- A19 direct boundary spatial-slice I/O is a smaller, reproducible follow-on win:
+  - `maxSeq=128`: median-of-medians `0.485209 -> 0.483041 ms/token` (`-0.45%`)
+  - throughput `2042.7 -> 2052.3 tok/s`
+  - surface I/O `0.031336 -> 0.029447 ms/token`
+  - p95 improved slightly; p99 stayed effectively flat
 
 ### Regressions or non-reproducible results (not kept)
 - Strict decode speedup headline regressed vs earlier best:
@@ -296,6 +331,26 @@ Prefill profile run:
   - Interpretation:
     - Rebuilding `_ANERequest` is not sufficient to safely rebind decode input surfaces after model load on this host/runtime.
     - This path is too unstable to benchmark or ship, so it was reverted immediately rather than iterated in the hot path.
+  - Decision: `ABANDON`.
+- Decode lane-spatial re-sweep did not uncover a better tiled contract:
+  - Evidence:
+    - `/tmp/decode_lane_sweep_max128_l32_quick_20260306`
+    - `/tmp/decode_lane_sweep_max128_l64_quick_20260306`
+    - `/tmp/decode_lane_sweep_max128_l128_quick_20260306`
+  - Medians:
+    - lane `32`: `0.493250 ms`
+    - lane `64`: `0.499916 ms`
+    - lane `128`: `0.505333 ms`
+  - Decision: `ABANDON` wider lane windows for the current decode contract.
+- Decode mask-collapse (`dense mask` channels `768 -> 1`) failed before benchmarking:
+  - Scope attempted:
+    - changed decode attention generator and runtime expectations to use a 1-channel mask cache
+    - updated hardware tests first to enforce the reduced-mask contract
+  - Outcome:
+    - probe families with reduced-mask variants still fail with `statusType=0x9`
+    - decode hardware tests fail once the one-channel mask path is exercised
+  - Interpretation:
+    - the dense-mask contract is not just conservative; it is currently the stable decode contract on this host/runtime
   - Decision: `ABANDON`.
 - Decode compile-time external surface aliasing was discarded before benchmarking:
   - Scope attempted:
@@ -345,4 +400,4 @@ Inference: strict decode/prefill regression assessment must be done against the 
 - Prefill large multi-x gains are unlikely on this host path without a meaningful reduction in host eval overhead; short-term expectation is parity-to-modest gains, not 3–6x.
 
 ### Next queued experiment
-- Build a minimal `_ANEChainingRequest` proof-of-life in the interop layer and validate it on hardware before touching decode hot-path code again.
+- Build a minimal `_ANEChainingRequest` / `prepareChainingWithModel` proof-of-life in the interop layer and validate it on hardware before touching decode hot-path code again.

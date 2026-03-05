@@ -61,6 +61,18 @@ bool ane_interop_io_copy_fp16_spatial_slice(IOSurfaceRef dst,
                                             int src_spatial_index,
                                             int src_spatial,
                                             int channels);
+bool ane_interop_io_write_fp16_spatial_slice(IOSurfaceRef surface,
+                                             int ch_off,
+                                             int spatial_index,
+                                             int spatial,
+                                             const float *data,
+                                             int channels);
+bool ane_interop_io_read_fp16_spatial_slice(IOSurfaceRef surface,
+                                            int ch_off,
+                                            int spatial_index,
+                                            int spatial,
+                                            float *data,
+                                            int channels);
 bool ane_interop_io_write_fp16(IOSurfaceRef surface,
                                const float *data, int channels, int spatial);
 bool ane_interop_io_read_fp16(IOSurfaceRef surface, int ch_off,
