@@ -25,7 +25,7 @@ Goal: land autoregressive decode with persistent FP16 KV-cache surfaces and prov
 - [x] Group 3: Add benchmark decode mode (`--decode`, `--decode-steps`, `--decode-max-seq`) and Core ML naive decode baseline
 - [x] Group 4: Emit decode artifacts (`summary.txt`, `summary.json`, per-token latency CSVs, per-layer decode kernel profile CSV)
 - [x] Group 5: Extend prefill profiling with host-vs-hw overhead splits and summary table
-- [ ] Group 6: Verify and capture reproducible evidence (build/tests + benchmark reruns within ±2%)
+- [x] Group 6: Verify and capture reproducible evidence (build/tests + benchmark reruns within ±2%)
 
 ### Decode Phase Review (2026-03-05)
 - Decode kernels compile (`decode_attn_qkv` + `decode_ffn`) and runtime wiring/CSV/reporting are integrated.
@@ -45,19 +45,28 @@ Goal: land autoregressive decode with persistent FP16 KV-cache surfaces and prov
   - Added explicit decode guardrails: current ANE decode path requires `decode-max-seq == decode lane spatial == 32` (fail-fast error otherwise).
   - Added hardware-gated decode state correctness test (`InferenceOptimizationTests.test_decode_kv_cache_updates_and_mask_progresses_on_hardware`) validating KV slice writes and mask progression.
 - 2026-03-05 benchmark snapshot (current path):
-  - `ESPRESSO_BENCH_SEED=1 .build/release/espresso-bench --decode --profile-kernels --warmup 2 --iterations 10 --decode-steps 32 --decode-max-seq 32 --output /tmp/decode_final_profile`
-  - ANE decode: mean `0.649 ms/token`, median `0.651 ms/token`, `1541.9 tok/s`
-  - Core ML naive decode fastest median (`.all`): `1.698 ms/token`
-  - Speedup vs fastest Core ML naive decode: `2.61x` (strict gate at `maxSeq=32`)
+  - `ESPRESSO_BENCH_SEED=1 .build/release/espresso-bench --decode --profile-kernels --warmup 50 --iterations 500 --decode-steps 32 --decode-max-seq 32 --output /tmp/decode_profile_ane10x_20260305`
+  - ANE decode: mean `0.651 ms/token`, median `0.629 ms/token`, `1535.8 tok/s`
+  - Core ML naive decode fastest median (`.cpuAndNeuralEngine`): `1.711 ms/token`
+  - Speedup vs fastest Core ML naive decode: `2.72x` (strict gate at `maxSeq=32`)
+- 2026-03-05 prefill profiling snapshot:
+  - `ESPRESSO_BENCH_SEED=1 .build/release/espresso-bench --perf-stats --inference-only --profile-kernels --warmup 50 --iterations 1000 --output /tmp/prefill_profile_ane10x_20260305`
+  - Summary table now reports host eval + host overhead + IO lock/body/unlock + handoff split per layer.
+  - `hwExecutionTime` remains unavailable on this host build (`_ANEPerformanceStats` request-buffer factory returns nil), and summary explicitly marks HW columns as unavailable.
+- 2026-03-05 reproducibility check:
+  - Run1: `/tmp/decode_repro_ane10x_run1` (`ANE_COMPILE_CACHE_POLICY=auto`) median `0.648479 ms/token`
+  - Run2: `/tmp/decode_repro_ane10x_run2` (`ANE_COMPILE_CACHE_POLICY=preferCached`) median `0.648500 ms/token`
+  - Delta: `0.0032%` (within ±2% target)
+  - Compile stability note: compile time swung from `49.49 s` (auto) to `52.7 ms` (preferCached); prefer cached policy for iteration/repro.
 - Next step: isolate the smallest eval-passing vs eval-failing multi-input MIL shape family (especially mixed input tensors and lane-packed outputs), then re-expand toward full decode attention.
 
-### Decode Artifact Index (to fill during execution)
-- [ ] `OUTPUT_DIR/summary.txt`
-- [ ] `OUTPUT_DIR/summary.json`
-- [ ] `OUTPUT_DIR/ane_decode_token_latencies.csv`
-- [ ] `OUTPUT_DIR/ane_decode_kernel_profile.csv`
-- [ ] `OUTPUT_DIR/coreml_decode_all_token_latencies.csv`
-- [ ] `OUTPUT_DIR/coreml_decode_cpu_and_neural_engine_token_latencies.csv`
+### Decode Artifact Index (2026-03-05)
+- [x] `/tmp/decode_profile_ane10x_20260305/summary.txt`
+- [x] `/tmp/decode_profile_ane10x_20260305/summary.json`
+- [x] `/tmp/decode_profile_ane10x_20260305/ane_decode_token_latencies.csv`
+- [x] `/tmp/decode_profile_ane10x_20260305/ane_decode_kernel_profile.csv`
+- [x] `/tmp/decode_profile_ane10x_20260305/coreml_decode_all_token_latencies.csv`
+- [x] `/tmp/decode_profile_ane10x_20260305/coreml_decode_cpuandneuralengine_token_latencies.csv`
 
 ## Benchmark Suite v1 (2026-03-05)
 - [x] Task 1: Add EspressoBench target scaffold to Package.swift

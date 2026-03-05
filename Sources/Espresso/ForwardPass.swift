@@ -270,20 +270,41 @@ public enum ForwardPass {
                 attnIn = try kernels[L].fwdAttn.inputSurface(at: 0)
             }
 
-            var t0 = RuntimeClock.now()
-            xCur.withUnsafeBufferPointer { xBuf in
-                SurfaceIO.writeFP16(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
+            var attnWriteLockUS: Double = 0
+            var attnWriteBodyUS: Double = 0
+            var attnWriteUnlockUS: Double = 0
+
+            let attnWriteStart = RuntimeClock.now()
+            if profiler == nil {
+                xCur.withUnsafeBufferPointer { xBuf in
+                    SurfaceIO.writeFP16(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
+                }
+            } else {
+                let lockStart = RuntimeClock.now()
+                precondition(SurfaceIO.lockWrite(attnIn))
+                attnWriteLockUS = RuntimeClock.us(RuntimeClock.now() - lockStart)
+
+                let bodyStart = RuntimeClock.now()
+                xCur.withUnsafeBufferPointer { xBuf in
+                    SurfaceIO.writeFP16Unlocked(to: attnIn, data: xBuf, channels: dim, spatial: seqLen)
+                }
+                attnWriteBodyUS = RuntimeClock.us(RuntimeClock.now() - bodyStart)
+
+                let unlockStart = RuntimeClock.now()
+                precondition(SurfaceIO.unlockWrite(attnIn))
+                attnWriteUnlockUS = RuntimeClock.us(RuntimeClock.now() - unlockStart)
             }
-            let attnWriteDelta = RuntimeClock.now() - t0
+            let attnWriteDelta = RuntimeClock.now() - attnWriteStart
             timings.tIO += RuntimeClock.ms(attnWriteDelta)
             let attnWriteUS = RuntimeClock.us(attnWriteDelta)
 
-            t0 = RuntimeClock.now()
+            var t0 = RuntimeClock.now()
             try kernels[L].fwdAttn.eval()
             let attnEvalDelta = RuntimeClock.now() - t0
             timings.tAne += RuntimeClock.ms(attnEvalDelta)
             let attnEvalUS = RuntimeClock.us(attnEvalDelta)
             let attnHwNS = kernels[L].fwdAttn.lastHWExecutionTimeNS()
+            let attnHostOverheadUS = max(0, attnEvalUS - Double(attnHwNS) / 1_000.0)
             let attnEvalEndTick = RuntimeClock.now()
 
             // Read only dim channels (the fused residual result).
@@ -303,30 +324,74 @@ public enum ForwardPass {
             }
 
             var attnReadUS: Double = 0
+            var attnReadLockUS: Double = 0
+            var attnReadBodyUS: Double = 0
+            var attnReadUnlockUS: Double = 0
             var ffnWriteUS: Double = 0
+            var ffnWriteLockUS: Double = 0
+            var ffnWriteBodyUS: Double = 0
+            var ffnWriteUnlockUS: Double = 0
             var ffnCopyUS: Double = 0
 
             switch handoff {
             case .cpuRoundTrip:
-                t0 = RuntimeClock.now()
-                xCur.withUnsafeMutableBufferPointer { xBuf in
-                    SurfaceIO.readFP16(
-                        from: attnOut,
-                        into: xBuf,
-                        channelOffset: 0,
-                        channels: dim,
-                        spatial: seqLen
-                    )
+                let attnReadStart = RuntimeClock.now()
+                if profiler == nil {
+                    xCur.withUnsafeMutableBufferPointer { xBuf in
+                        SurfaceIO.readFP16(
+                            from: attnOut,
+                            into: xBuf,
+                            channelOffset: 0,
+                            channels: dim,
+                            spatial: seqLen
+                        )
+                    }
+                } else {
+                    let lockStart = RuntimeClock.now()
+                    precondition(SurfaceIO.lockRead(attnOut))
+                    attnReadLockUS = RuntimeClock.us(RuntimeClock.now() - lockStart)
+
+                    let bodyStart = RuntimeClock.now()
+                    xCur.withUnsafeMutableBufferPointer { xBuf in
+                        SurfaceIO.readFP16Unlocked(
+                            from: attnOut,
+                            into: xBuf,
+                            channelOffset: 0,
+                            channels: dim,
+                            spatial: seqLen
+                        )
+                    }
+                    attnReadBodyUS = RuntimeClock.us(RuntimeClock.now() - bodyStart)
+
+                    let unlockStart = RuntimeClock.now()
+                    precondition(SurfaceIO.unlockRead(attnOut))
+                    attnReadUnlockUS = RuntimeClock.us(RuntimeClock.now() - unlockStart)
                 }
-                let attnReadDelta = RuntimeClock.now() - t0
+                let attnReadDelta = RuntimeClock.now() - attnReadStart
                 timings.tIO += RuntimeClock.ms(attnReadDelta)
                 attnReadUS = RuntimeClock.us(attnReadDelta)
 
-                t0 = RuntimeClock.now()
-                xCur.withUnsafeBufferPointer { xBuf in
-                    SurfaceIO.writeFP16(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
+                let ffnWriteStart = RuntimeClock.now()
+                if profiler == nil {
+                    xCur.withUnsafeBufferPointer { xBuf in
+                        SurfaceIO.writeFP16(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
+                    }
+                } else {
+                    let lockStart = RuntimeClock.now()
+                    precondition(SurfaceIO.lockWrite(ffnIn))
+                    ffnWriteLockUS = RuntimeClock.us(RuntimeClock.now() - lockStart)
+
+                    let bodyStart = RuntimeClock.now()
+                    xCur.withUnsafeBufferPointer { xBuf in
+                        SurfaceIO.writeFP16Unlocked(to: ffnIn, data: xBuf, channels: dim, spatial: seqLen)
+                    }
+                    ffnWriteBodyUS = RuntimeClock.us(RuntimeClock.now() - bodyStart)
+
+                    let unlockStart = RuntimeClock.now()
+                    precondition(SurfaceIO.unlockWrite(ffnIn))
+                    ffnWriteUnlockUS = RuntimeClock.us(RuntimeClock.now() - unlockStart)
                 }
-                let ffnWriteDelta = RuntimeClock.now() - t0
+                let ffnWriteDelta = RuntimeClock.now() - ffnWriteStart
                 timings.tIO += RuntimeClock.ms(ffnWriteDelta)
                 ffnWriteUS = RuntimeClock.us(ffnWriteDelta)
             case .fp16SurfaceCopy:
@@ -357,6 +422,7 @@ public enum ForwardPass {
             timings.tAne += RuntimeClock.ms(ffnEvalDelta)
             let ffnEvalUS = RuntimeClock.us(ffnEvalDelta)
             let ffnHwNS = kernels[L].fwdFFN.lastHWExecutionTimeNS()
+            let ffnHostOverheadUS = max(0, ffnEvalUS - Double(ffnHwNS) / 1_000.0)
 
             // Read only dim channels (the fused residual result).
             let ffnOut: IOSurfaceRef
@@ -366,31 +432,71 @@ public enum ForwardPass {
                 ffnOut = try kernels[L].fwdFFN.outputSurface(at: 0)
             }
 
-            t0 = RuntimeClock.now()
-            xCur.withUnsafeMutableBufferPointer { xBuf in
-                SurfaceIO.readFP16(
-                    from: ffnOut,
-                    into: xBuf,
-                    channelOffset: 0,
-                    channels: dim,
-                    spatial: seqLen
-                )
+            var ffnReadLockUS: Double = 0
+            var ffnReadBodyUS: Double = 0
+            var ffnReadUnlockUS: Double = 0
+
+            let ffnReadStart = RuntimeClock.now()
+            if profiler == nil {
+                xCur.withUnsafeMutableBufferPointer { xBuf in
+                    SurfaceIO.readFP16(
+                        from: ffnOut,
+                        into: xBuf,
+                        channelOffset: 0,
+                        channels: dim,
+                        spatial: seqLen
+                    )
+                }
+            } else {
+                let lockStart = RuntimeClock.now()
+                precondition(SurfaceIO.lockRead(ffnOut))
+                ffnReadLockUS = RuntimeClock.us(RuntimeClock.now() - lockStart)
+
+                let bodyStart = RuntimeClock.now()
+                xCur.withUnsafeMutableBufferPointer { xBuf in
+                    SurfaceIO.readFP16Unlocked(
+                        from: ffnOut,
+                        into: xBuf,
+                        channelOffset: 0,
+                        channels: dim,
+                        spatial: seqLen
+                    )
+                }
+                ffnReadBodyUS = RuntimeClock.us(RuntimeClock.now() - bodyStart)
+
+                let unlockStart = RuntimeClock.now()
+                precondition(SurfaceIO.unlockRead(ffnOut))
+                ffnReadUnlockUS = RuntimeClock.us(RuntimeClock.now() - unlockStart)
             }
-            let ffnReadDelta = RuntimeClock.now() - t0
+            let ffnReadDelta = RuntimeClock.now() - ffnReadStart
             timings.tIO += RuntimeClock.ms(ffnReadDelta)
             let ffnReadUS = RuntimeClock.us(ffnReadDelta)
 
             profiler?.record(
                 layerIndex: L,
                 attnWriteUS: attnWriteUS,
+                attnWriteLockUS: attnWriteLockUS,
+                attnWriteBodyUS: attnWriteBodyUS,
+                attnWriteUnlockUS: attnWriteUnlockUS,
                 attnEvalUS: attnEvalUS,
                 attnHwNS: attnHwNS,
+                attnHostOverheadUS: attnHostOverheadUS,
                 attnReadUS: attnReadUS,
+                attnReadLockUS: attnReadLockUS,
+                attnReadBodyUS: attnReadBodyUS,
+                attnReadUnlockUS: attnReadUnlockUS,
                 ffnWriteUS: ffnWriteUS,
+                ffnWriteLockUS: ffnWriteLockUS,
+                ffnWriteBodyUS: ffnWriteBodyUS,
+                ffnWriteUnlockUS: ffnWriteUnlockUS,
                 ffnCopyUS: ffnCopyUS,
                 ffnEvalUS: ffnEvalUS,
                 ffnHwNS: ffnHwNS,
+                ffnHostOverheadUS: ffnHostOverheadUS,
                 ffnReadUS: ffnReadUS,
+                ffnReadLockUS: ffnReadLockUS,
+                ffnReadBodyUS: ffnReadBodyUS,
+                ffnReadUnlockUS: ffnReadUnlockUS,
                 gapAttnToFfnUS: gapUS
             )
         }

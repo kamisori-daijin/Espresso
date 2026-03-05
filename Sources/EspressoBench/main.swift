@@ -206,9 +206,12 @@ func benchmarkStats(_ result: BenchmarkResult) -> [String: Any] {
 func inferenceProfileAverages(_ profile: InferenceKernelProfile) -> [[String: Any]] {
     profile.layers.indices.map { layerIdx in
         let mean = profile.averageLayerMetrics(layerIndex: layerIdx)
+        let layer = profile.layers[layerIdx]
+        let hasHWExecutionTime = layer.attnHwNS.contains(where: { $0 > 0 }) || layer.ffnHwNS.contains(where: { $0 > 0 })
         return [
             "layer": layerIdx,
             "samples": mean.sampleCount,
+            "hw_execution_time_available": hasHWExecutionTime,
             "attn_eval_host_us": mean.attnEvalUS,
             "attn_hw_us": mean.attnHwUS,
             "attn_host_overhead_us": mean.attnHostOverheadUS,

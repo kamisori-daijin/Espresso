@@ -267,8 +267,10 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
                 if (ane_interop_trace_enabled()) {
                     fprintf(stderr, "ANE perfStats factory: %s (buf=%p bufSize=%u)\n", perfStats ? "OK" : "nil", buf, bufSize);
                 }
-            } else if (ane_interop_trace_enabled()) {
-                fprintf(stderr, "ANE perfStats: class/method unavailable\n");
+            }
+
+            if (ane_interop_trace_enabled() && !perfStats) {
+                fprintf(stderr, "ANE perfStats request-buffer factory returned nil\n");
             }
         }
 
@@ -612,25 +614,21 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
         SEL reqSelPerfWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:perfStats:procedureIndex:);
         SEL reqSelWB = @selector(requestWithInputs:inputIndices:outputs:outputIndices:weightsBuffer:procedureIndex:);
         if (perfStats) {
-            if ([g_ANEReq respondsToSelector:reqSelPerfWB]) {
+            req = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:),
+                wIns, iIdx, wOuts, oIdx, perfStats, @0);
+            if (!req && [g_ANEReq respondsToSelector:reqSelPerfWB]) {
                 req = ((id(*)(Class,SEL,id,id,id,id,id,id,id))objc_msgSend)(
                     g_ANEReq, reqSelPerfWB, wIns, iIdx, wOuts, oIdx, nil, perfStats, @0);
             }
-            if (!req) {
-                req = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
-                    g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:perfStats:procedureIndex:),
-                    wIns, iIdx, wOuts, oIdx, perfStats, @0);
-            }
         } else {
             // If perfStats factory is unavailable but perfStatsMask is set, the driver may attach perfStatsArray.
-            if ([g_ANEReq respondsToSelector:reqSelWB]) {
+            req = ((id(*)(Class,SEL,id,id,id,id,id))objc_msgSend)(
+                g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:procedureIndex:),
+                wIns, iIdx, wOuts, oIdx, @0);
+            if (!req && [g_ANEReq respondsToSelector:reqSelWB]) {
                 req = ((id(*)(Class,SEL,id,id,id,id,id,id))objc_msgSend)(
                     g_ANEReq, reqSelWB, wIns, iIdx, wOuts, oIdx, nil, @0);
-            }
-            if (!req) {
-                req = ((id(*)(Class,SEL,id,id,id,id,id))objc_msgSend)(
-                    g_ANEReq, @selector(requestWithInputs:inputIndices:outputs:outputIndices:procedureIndex:),
-                    wIns, iIdx, wOuts, oIdx, @0);
             }
         }
         if (!req) {

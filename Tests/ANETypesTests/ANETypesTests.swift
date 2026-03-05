@@ -476,6 +476,108 @@ final class ANETypesTests: XCTestCase {
         }
     }
 
+    func test_surface_copy_fp16_spatial_slice_single_channel_mask_flip() throws {
+        let src = makeSurface(bytes: 1 * 1 * 2)
+        let dstSpatial = 8
+        let dst = makeSurface(bytes: 1 * dstSpatial * 2)
+
+        let zero: [Float] = [0]
+        zero.withUnsafeBufferPointer { srcBuf in
+            SurfaceIO.writeFP16(to: src, data: srcBuf, channels: 1, spatial: 1)
+        }
+
+        let masked = Array(repeating: Float(-1e4), count: dstSpatial)
+        masked.withUnsafeBufferPointer { dstBuf in
+            SurfaceIO.writeFP16(to: dst, data: dstBuf, channels: 1, spatial: dstSpatial)
+        }
+
+        let flipIndex = 3
+        try SurfaceIO.copyFP16SpatialSlice(
+            dst: dst,
+            dstChannelOffset: 0,
+            dstSpatialIndex: flipIndex,
+            dstSpatial: dstSpatial,
+            src: src,
+            srcChannelOffset: 0,
+            srcSpatialIndex: 0,
+            srcSpatial: 1,
+            channels: 1
+        )
+
+        var out = Array(repeating: Float.nan, count: dstSpatial)
+        out.withUnsafeMutableBufferPointer { outBuf in
+            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: 1, spatial: dstSpatial)
+        }
+
+        for i in 0..<dstSpatial {
+            if i == flipIndex {
+                XCTAssertEqual(out[i], 0, accuracy: 0)
+            } else {
+                XCTAssertEqual(out[i], masked[i], accuracy: 1e-2)
+            }
+        }
+    }
+
+    func test_surface_copy_fp16_spatial_slice_with_channel_offsets() throws {
+        let srcChannels = 10
+        let srcSpatial = 2
+        let dstChannels = 12
+        let dstSpatial = 4
+
+        let src = makeSurface(bytes: srcChannels * srcSpatial * 2)
+        let dst = makeSurface(bytes: dstChannels * dstSpatial * 2)
+
+        let srcInput: [Float] = (0..<(srcChannels * srcSpatial)).map { i in
+            Float(i) * 0.25 - 3.0
+        }
+        srcInput.withUnsafeBufferPointer { srcBuf in
+            SurfaceIO.writeFP16(to: src, data: srcBuf, channels: srcChannels, spatial: srcSpatial)
+        }
+
+        let zeros = Array(repeating: Float(0), count: dstChannels * dstSpatial)
+        zeros.withUnsafeBufferPointer { z in
+            SurfaceIO.writeFP16(to: dst, data: z, channels: dstChannels, spatial: dstSpatial)
+        }
+
+        let srcChannelOffset = 3
+        let dstChannelOffset = 5
+        let copyChannels = 4
+        let srcIndex = 1
+        let dstIndex = 2
+
+        try SurfaceIO.copyFP16SpatialSlice(
+            dst: dst,
+            dstChannelOffset: dstChannelOffset,
+            dstSpatialIndex: dstIndex,
+            dstSpatial: dstSpatial,
+            src: src,
+            srcChannelOffset: srcChannelOffset,
+            srcSpatialIndex: srcIndex,
+            srcSpatial: srcSpatial,
+            channels: copyChannels
+        )
+
+        var out = Array(repeating: Float.nan, count: dstChannels * dstSpatial)
+        out.withUnsafeMutableBufferPointer { outBuf in
+            SurfaceIO.readFP16(from: dst, into: outBuf, channelOffset: 0, channels: dstChannels, spatial: dstSpatial)
+        }
+
+        for ch in 0..<dstChannels {
+            for sp in 0..<dstSpatial {
+                let outIdx = ch * dstSpatial + sp
+                let expected: Float
+                if sp == dstIndex && (dstChannelOffset..<(dstChannelOffset + copyChannels)).contains(ch) {
+                    let srcCh = srcChannelOffset + (ch - dstChannelOffset)
+                    let srcIdxFlat = srcCh * srcSpatial + srcIndex
+                    expected = srcInput[srcIdxFlat]
+                } else {
+                    expected = 0
+                }
+                XCTAssertEqual(out[outIdx], expected, accuracy: 1e-2)
+            }
+        }
+    }
+
     func test_surface_write_fp16_at_batched_regions() throws {
         let channels = 12
         let spatial = 4
