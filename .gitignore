@@ -21,6 +21,9 @@ xcuserdata/
 # Claude Code local settings
 .claude/
 
+# Git worktrees
+.worktrees/
+
 # Large model weights (>10MB binaries)
 # Golden test fixtures are tracked; add entries here for actual model weights
 *.gguf
