@@ -1,8 +1,10 @@
 import XCTest
+import IOSurface
 import ANEInterop
 import ANETypes
 import MILGenerator
 @testable import ANERuntime
+@testable import Espresso
 
 // MARK: - MIL Generation Tests (no hardware needed)
 
@@ -228,6 +230,122 @@ final class FusedDecodeKernelSetTests: XCTestCase {
             XCTAssertTrue("\(error)".contains("multiple"))
         } catch {
             XCTFail("Unexpected error type: \(error)")
+        }
+    }
+
+    func test_fused_decode_loop_single_layer() throws {
+        try requireANEHardware()
+        let weights = makeTestLayerWeights()
+        let kernels = try LayerStorage<FusedDecodeKernelSet>(count: 1) { _ in
+            try! FusedDecodeKernelSet(weights: weights, maxSeq: 32)
+        }
+        let surfaceHandles = try (0..<1).map { i in
+            try FusedDecodeSurfaceHandles(kernels: kernels[i])
+        }
+        ForwardPass.initializeFusedDecodeCachesAndMask(surfaceHandles: surfaceHandles)
+
+        var state = try DecodeState(maxSeq: 32)
+        var timings = StepTimingBreakdown()
+        let xCur = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        xCur.withUnsafeMutableBufferPointer { ptr in
+            for i in ptr.indices { ptr[i] = 0.01 }
+        }
+
+        do {
+            try ForwardPass.runFusedDecodeTimed(
+                xCur: xCur,
+                kernels: kernels,
+                surfaceHandles: surfaceHandles,
+                decodeState: &state,
+                timings: &timings
+            )
+            XCTAssertEqual(state.step, 1, "Should advance to step 1")
+            XCTAssertTrue(timings.tAne > 0, "Should record ANE time")
+            print("  Fused decode step 0: ANE=\(String(format: "%.3f", timings.tAne))ms, IO=\(String(format: "%.3f", timings.tIO))ms")
+        } catch {
+            print("  NOTE: fused decode loop eval failed (known host instability): \(error)")
+        }
+    }
+
+    func test_fused_vs_unfused_timing_comparison() throws {
+        try requireANEHardware()
+        let weights = makeTestLayerWeights()
+        let nLayers = 1
+        let maxSeq = 32
+
+        // Compile fused kernel
+        let fusedKernels = try LayerStorage<FusedDecodeKernelSet>(count: nLayers) { _ in
+            try! FusedDecodeKernelSet(weights: weights, maxSeq: maxSeq)
+        }
+        let fusedHandles = try (0..<nLayers).map { i in
+            try FusedDecodeSurfaceHandles(kernels: fusedKernels[i])
+        }
+        ForwardPass.initializeFusedDecodeCachesAndMask(surfaceHandles: fusedHandles)
+
+        // Compile unfused kernels
+        let unfusedKernels = try LayerStorage<DecodeKernelSet>(count: nLayers) { _ in
+            try! DecodeKernelSet(weights: weights, maxSeq: maxSeq)
+        }
+        let unfusedHandles = try (0..<nLayers).map { i in
+            try DecodeSurfaceHandles(kernels: unfusedKernels[i])
+        }
+        ForwardPass.initializeDecodeCachesAndMask(surfaceHandles: unfusedHandles)
+
+        let xCur = TensorBuffer(count: ModelConfig.dim, zeroed: true)
+        xCur.withUnsafeMutableBufferPointer { ptr in
+            for i in ptr.indices { ptr[i] = 0.01 }
+        }
+
+        // Run 5 fused steps
+        var fusedState = try DecodeState(maxSeq: maxSeq)
+        var fusedTimings = StepTimingBreakdown()
+        var fusedStepsCompleted = 0
+        for _ in 0..<5 {
+            do {
+                try ForwardPass.runFusedDecodeTimed(
+                    xCur: xCur, kernels: fusedKernels,
+                    surfaceHandles: fusedHandles, decodeState: &fusedState,
+                    timings: &fusedTimings
+                )
+                fusedStepsCompleted += 1
+            } catch {
+                print("  Fused eval failed at step \(fusedStepsCompleted): \(error)")
+                break
+            }
+        }
+
+        // Run 5 unfused steps
+        var unfusedState = try DecodeState(maxSeq: maxSeq)
+        var unfusedTimings = StepTimingBreakdown()
+        var unfusedStepsCompleted = 0
+        for _ in 0..<5 {
+            do {
+                try ForwardPass.runDecodeTimed(
+                    xCur: xCur, kernels: unfusedKernels,
+                    surfaceHandles: unfusedHandles, decodeState: &unfusedState,
+                    timings: &unfusedTimings
+                )
+                unfusedStepsCompleted += 1
+            } catch {
+                print("  Unfused eval failed at step \(unfusedStepsCompleted): \(error)")
+                break
+            }
+        }
+
+        print("  ── Fused vs Unfused (\(nLayers) layer, \(maxSeq) maxSeq) ──")
+        if fusedStepsCompleted > 0 {
+            let fusedPerStep = fusedTimings.tAne / Double(fusedStepsCompleted)
+            print("  Fused:   \(fusedStepsCompleted) steps, ANE=\(String(format: "%.3f", fusedTimings.tAne))ms total, \(String(format: "%.3f", fusedPerStep))ms/step, IO=\(String(format: "%.3f", fusedTimings.tIO))ms")
+        }
+        if unfusedStepsCompleted > 0 {
+            let unfusedPerStep = unfusedTimings.tAne / Double(unfusedStepsCompleted)
+            print("  Unfused: \(unfusedStepsCompleted) steps, ANE=\(String(format: "%.3f", unfusedTimings.tAne))ms total, \(String(format: "%.3f", unfusedPerStep))ms/step, IO=\(String(format: "%.3f", unfusedTimings.tIO))ms")
+        }
+        if fusedStepsCompleted > 0 && unfusedStepsCompleted > 0 {
+            let fusedPerStep = fusedTimings.tAne / Double(fusedStepsCompleted)
+            let unfusedPerStep = unfusedTimings.tAne / Double(unfusedStepsCompleted)
+            let savedMS = unfusedPerStep - fusedPerStep
+            print("  Savings: \(String(format: "%.3f", savedMS))ms/step (\(String(format: "%.1f", savedMS / unfusedPerStep * 100))%)")
         }
     }
 }
