@@ -86,3 +86,9 @@
 - Blocker: the current benchmark/runtime path is hidden-state based and does not provide a token-level generation + batched verification loop for speculative decoding.
 - Existing training code has embeddings/classifier math, but there is no ready-made inference path for meaningful accept-rate measurement.
 - Net effect for this pass: no benchmark and no landed decode savings.
+
+### Avenue 6 review
+- Status: abandoned
+- Reason: the fused decode loop is dependency-bound, with nearly all useful host I/O occurring after eval and therefore not overlapable with a background GCD queue.
+- Prior probe result also showed the completion handler is synchronous, not a true async completion signal.
+- Net effect for this pass: no benchmark and no landed decode savings.

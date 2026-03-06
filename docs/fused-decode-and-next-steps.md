@@ -311,7 +311,7 @@ budget (which is capped at ~100 per process) and surface memory.
 | 3. Metal+ANE hybrid | abandoned | +0.000ms | 0.000ms |
 | 4. CoreML baseline | measured | N/A | 0.000ms |
 | 5. Speculative decode | abandoned | +0.000ms | 0.000ms |
-| 6. GCD pipeline | pending | pending | 0.000ms |
+| 6. GCD pipeline | abandoned | +0.000ms | 0.000ms |
 
 Direct ANE: 2.875ms/token
 CoreML:     3.007ms/token
@@ -492,3 +492,24 @@ Timing impact recorded for this pass:
 - No benchmark recorded.
 - Landed decode savings: `+0.000 ms/token`
 - Cumulative savings after Avenue 5: `0.000 ms/token`
+
+## 12. Avenue 6 Result — GCD Pipeline with CompletionHandler (ABANDONED)
+
+Date: 2026-03-06
+
+Why this was abandoned without a code variant:
+- The earlier completion-handler probe already showed that the standard eval completion callback is synchronous on the calling thread, so there is no true async wakeup to exploit.
+- The fused decode loop (`runFusedDecodeTimed`) is dependency-bound in the wrong place for host-side pipelining:
+  - The token lane write happens before eval.
+  - The meaningful per-layer host work after that is `eval -> K cache writeback -> V cache writeback -> mask flip -> xNext chain`.
+  - Those cache and chain operations all depend on eval outputs and therefore cannot overlap the eval that produces them.
+- The current measured decode I/O budget is only about `0.100 ms/token` total, and most of that budget sits in post-eval dependent copies.
+
+Feasibility judgment:
+- A background GCD queue could at best hide the tiny pre-eval host work (token lane write, occasional window sync).
+- That theoretical headroom is below the avenue's `10 us/token` abandon threshold once constrained by the actual dependency graph.
+
+Timing impact recorded for this pass:
+- No benchmark recorded.
+- Landed decode savings: `+0.000 ms/token`
+- Cumulative savings after Avenue 6: `0.000 ms/token`
