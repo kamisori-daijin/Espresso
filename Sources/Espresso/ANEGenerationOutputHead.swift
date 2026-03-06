@@ -6,6 +6,82 @@ import ANETypes
 public enum GenerationOutputHeadBackend: Sendable {
     case cpu
     case aneClassifier
+    case aneRMSNormClassifier
+}
+
+private enum ANEGenerationOutputHeadIO {
+    static func writeSingleToken(
+        _ input: borrowing TensorBuffer,
+        to surface: IOSurfaceRef,
+        laneSpatial: Int,
+        zeroInput: borrowing TensorBuffer
+    ) throws(GenerationError) {
+        precondition(input.count == ModelConfig.dim)
+        if laneSpatial == 1 {
+            input.withUnsafeBufferPointer { src in
+                SurfaceIO.writeFP16(to: surface, data: src, channels: ModelConfig.dim, spatial: 1)
+            }
+            return
+        }
+
+        do {
+            zeroInput.withUnsafeBufferPointer { zeroPtr in
+                SurfaceIO.writeFP16(
+                    to: surface,
+                    data: zeroPtr,
+                    channels: ModelConfig.dim,
+                    spatial: laneSpatial
+                )
+            }
+            try input.withUnsafeBufferPointer { src in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: surface,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    data: src,
+                    channels: ModelConfig.dim
+                )
+            }
+        } catch {
+            throw .runtimeFailure("ANE output-head input write failed: \(error)")
+        }
+    }
+
+    static func readSingleTokenLogits(
+        from surface: IOSurfaceRef,
+        into logits: borrowing TensorBuffer,
+        vocabSize: Int,
+        laneSpatial: Int
+    ) throws(GenerationError) {
+        precondition(logits.count == vocabSize)
+        do {
+            if laneSpatial == 1 {
+                logits.withUnsafeMutableBufferPointer { dst in
+                    SurfaceIO.readFP16(
+                        from: surface,
+                        into: dst,
+                        channelOffset: 0,
+                        channels: vocabSize,
+                        spatial: 1
+                    )
+                }
+            } else {
+                try logits.withUnsafeMutableBufferPointer { dst in
+                    try SurfaceIO.readFP16SpatialSlice(
+                        from: surface,
+                        channelOffset: 0,
+                        spatialIndex: 0,
+                        spatial: laneSpatial,
+                        into: dst,
+                        channels: vocabSize
+                    )
+                }
+            }
+        } catch {
+            throw .runtimeFailure("ANE output-head output read failed: \(error)")
+        }
+    }
 }
 
 final class ANEGenerationClassifierHead {
@@ -47,34 +123,12 @@ final class ANEGenerationClassifierHead {
         precondition(normalizedInput.count == ModelConfig.dim)
         precondition(logits.count == vocabSize)
 
-        do {
-            if laneSpatial == 1 {
-                normalizedInput.withUnsafeBufferPointer { src in
-                    SurfaceIO.writeFP16(to: inputSurface, data: src, channels: ModelConfig.dim, spatial: 1)
-                }
-            } else {
-                zeroInput.withUnsafeBufferPointer { zeroPtr in
-                    SurfaceIO.writeFP16(
-                        to: inputSurface,
-                        data: zeroPtr,
-                        channels: ModelConfig.dim,
-                        spatial: laneSpatial
-                    )
-                }
-                try normalizedInput.withUnsafeBufferPointer { src in
-                    try SurfaceIO.writeFP16SpatialSlice(
-                        to: inputSurface,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: laneSpatial,
-                        data: src,
-                        channels: ModelConfig.dim
-                    )
-                }
-            }
-        } catch {
-            throw .runtimeFailure("ANE classifier input write failed: \(error)")
-        }
+        try ANEGenerationOutputHeadIO.writeSingleToken(
+            normalizedInput,
+            to: inputSurface,
+            laneSpatial: laneSpatial,
+            zeroInput: zeroInput
+        )
 
         do {
             try kernelSet.classifier.eval()
@@ -82,31 +136,74 @@ final class ANEGenerationClassifierHead {
             throw .runtimeFailure("ANE classifier eval failed: \(error)")
         }
 
+        try ANEGenerationOutputHeadIO.readSingleTokenLogits(
+            from: outputSurface,
+            into: logits,
+            vocabSize: vocabSize,
+            laneSpatial: laneSpatial
+        )
+    }
+}
+
+final class ANEGenerationRMSNormClassifierHead {
+    private static let defaultLaneSpatial = 32
+
+    let kernelSet: GenerationRMSNormClassifierKernelSet
+    let inputSurface: IOSurfaceRef
+    let outputSurface: IOSurfaceRef
+    let vocabSize: Int
+    let laneSpatial: Int
+    let zeroInput: TensorBuffer
+
+    init(
+        rmsFinal: borrowing TensorBuffer,
+        classifierWeights: borrowing TensorBuffer,
+        vocabSize: Int,
+        laneSpatial: Int = defaultLaneSpatial
+    ) throws(GenerationError) {
         do {
-            if laneSpatial == 1 {
-                logits.withUnsafeMutableBufferPointer { dst in
-                    SurfaceIO.readFP16(
-                        from: outputSurface,
-                        into: dst,
-                        channelOffset: 0,
-                        channels: vocabSize,
-                        spatial: 1
-                    )
-                }
-            } else {
-                try logits.withUnsafeMutableBufferPointer { dst in
-                    try SurfaceIO.readFP16SpatialSlice(
-                        from: outputSurface,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: laneSpatial,
-                        into: dst,
-                        channels: vocabSize
-                    )
-                }
-            }
+            let kernelSet = try GenerationRMSNormClassifierKernelSet(
+                rmsFinal: rmsFinal,
+                classifier: classifierWeights,
+                vocabSize: vocabSize,
+                laneSpatial: laneSpatial
+            )
+            self.inputSurface = try kernelSet.rmsNormClassifier.inputSurface(at: 0)
+            self.outputSurface = try kernelSet.rmsNormClassifier.outputSurface(at: 0)
+            self.kernelSet = kernelSet
+            self.vocabSize = vocabSize
+            self.laneSpatial = laneSpatial
+            self.zeroInput = TensorBuffer(count: ModelConfig.dim * laneSpatial, zeroed: true)
         } catch {
-            throw .runtimeFailure("ANE classifier output read failed: \(error)")
+            throw .runtimeFailure("ANE fused output-head setup failed: \(error)")
         }
+    }
+
+    func project(
+        rawInput: borrowing TensorBuffer,
+        logits: borrowing TensorBuffer
+    ) throws(GenerationError) {
+        precondition(rawInput.count == ModelConfig.dim)
+        precondition(logits.count == vocabSize)
+
+        try ANEGenerationOutputHeadIO.writeSingleToken(
+            rawInput,
+            to: inputSurface,
+            laneSpatial: laneSpatial,
+            zeroInput: zeroInput
+        )
+
+        do {
+            try kernelSet.rmsNormClassifier.eval()
+        } catch {
+            throw .runtimeFailure("ANE fused output-head eval failed: \(error)")
+        }
+
+        try ANEGenerationOutputHeadIO.readSingleTokenLogits(
+            from: outputSurface,
+            into: logits,
+            vocabSize: vocabSize,
+            laneSpatial: laneSpatial
+        )
     }
 }

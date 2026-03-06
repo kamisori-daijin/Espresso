@@ -871,3 +871,74 @@ Decision:
   - classifier-only ANE offload is not enough to restore the missing `>=2x` recurrent advantage by itself
   - further time on this exact probe has low upside unless the next step is a fused final RMSNorm + classifier path
 - The next materially larger opportunity is still likely recurrent multi-layer fusion, not more small output-head tuning.
+
+## Fused Output-Head Follow-up (March 7, 2026)
+
+Goal:
+- Test the only still-credible head-side follow-up after classifier-only ANE offload: fuse final RMSNorm and classifier into one lane-packed ANE head.
+
+Implementation:
+- Added:
+  - `GenerationRMSNormClassifierGenerator`
+  - `GenerationRMSNormClassifierKernelSet`
+  - `GenerationOutputHeadBackend.aneRMSNormClassifier`
+- Kept the same proven lane-packed shape:
+  - input `[1, dim, 1, 32]`
+  - output `[1, vocab, 1, 32]`
+  - write/read only spatial lane `0`
+- Verification stays on CPU. This is still a step-level autoregressive head path only.
+
+Benchmark protocol:
+- `mach_absolute_time()` / `mach_timebase_info`
+- `3` warmup iterations
+- `20` timed iterations
+- prompt `[0]`
+- `8` generated tokens
+- recurrent generation, `6` layers
+
+Results:
+- recurrent generation, CPU head:
+  - `4.128354 ms/token`
+  - `242.23 tok/s`
+  - compile `445.79 ms`
+  - trunk `2.721484 ms/token`
+  - head `1.375232 ms/token`
+- recurrent generation, ANE classifier head:
+  - `3.761755 ms/token`
+  - `265.83 tok/s`
+  - compile `634.18 ms`
+  - trunk `2.655479 ms/token`
+  - head `1.098206 ms/token`
+- recurrent generation, fused ANE RMSNorm+classifier head:
+  - `3.564776 ms/token`
+  - `280.54 tok/s`
+  - compile `612.15 ms`
+  - trunk `2.615005 ms/token`
+  - head `0.936549 ms/token`
+
+Delta:
+- fused vs classifier-only ANE head:
+  - `-0.196979 ms/token` (`5.24%` faster)
+  - `+14.71 tok/s` (`5.53%` faster)
+  - head bucket improved by `0.161656 ms/token`
+- fused vs CPU head:
+  - `-0.563578 ms/token` (`13.65%` faster)
+- remaining gap to `>=2x` over direct transformer generation (`6.558745 ms/token`):
+  - about `0.285404 ms/token`
+
+Interpretation:
+- The user instinct was directionally correct: there is still real signal in the head.
+- Fusing RMSNorm into the ANE head produced another measurable win beyond classifier-only offload.
+- But the follow-up still missed the predeclared continuation gate of `>=0.25 ms/token` additional end-to-end savings over the current ANE classifier head.
+
+Most likely next limiter:
+- The fused head still returns full-vocab logits to the host every step.
+- That means the next head-side win probably needs a different mechanism:
+  - on-device token selection / argmax
+  - or another reduction that materially shrinks logits readback
+
+Decision:
+- Keep the fused head because it is faster.
+- Do not spend unbounded time tuning this same full-logits-return path further.
+- If head-side work continues, make it a bounded probe around avoiding full-vocab logits readback.
+- Otherwise, return to the higher-upside path: recurrent multi-layer fusion.

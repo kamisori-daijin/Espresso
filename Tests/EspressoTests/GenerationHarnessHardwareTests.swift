@@ -694,11 +694,20 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             iterations: iterations,
             outputHeadBackend: .aneClassifier
         )
+        let fusedHead = try benchmarkRecurrentEchoGeneration(
+            layerCount: 6,
+            promptTokens: prompt,
+            maxNewTokens: maxNewTokens,
+            warmup: warmup,
+            iterations: iterations,
+            outputHeadBackend: .aneRMSNormClassifier
+        )
 
         print(
             """
             recurrent generation cpu-head median=\(cpuHead.medianTokenMs) ms/token tps=\(cpuHead.medianTokensPerSecond) compile=\(cpuHead.compileTimeMs) trunk=\(cpuHead.medianTrunkMsPerToken) logits=\(cpuHead.medianLogitsMsPerToken)
             recurrent generation ane-head median=\(aneHead.medianTokenMs) ms/token tps=\(aneHead.medianTokensPerSecond) compile=\(aneHead.compileTimeMs) trunk=\(aneHead.medianTrunkMsPerToken) logits=\(aneHead.medianLogitsMsPerToken)
+            recurrent generation fused-head median=\(fusedHead.medianTokenMs) ms/token tps=\(fusedHead.medianTokensPerSecond) compile=\(fusedHead.compileTimeMs) trunk=\(fusedHead.medianTrunkMsPerToken) logits=\(fusedHead.medianLogitsMsPerToken)
             """
         )
 
@@ -706,6 +715,9 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         XCTAssertGreaterThan(aneHead.medianTokenMs, 0)
         XCTAssertGreaterThan(aneHead.compileTimeMs, 0)
         XCTAssertGreaterThan(aneHead.medianLogitsMsPerToken, 0)
+        XCTAssertGreaterThan(fusedHead.medianTokenMs, 0)
+        XCTAssertGreaterThan(fusedHead.compileTimeMs, 0)
+        XCTAssertGreaterThan(fusedHead.medianLogitsMsPerToken, 0)
     }
 
     private func benchmarkDirectEchoGeneration(

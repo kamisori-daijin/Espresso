@@ -1,85 +1,97 @@
-# ANE Output-Head Optimization Gate (2026-03-07)
+# ANE Fused Output-Head Gate (2026-03-07)
 
 ## Plan
-- [x] Re-read the latest recurrent generation findings, project memory, and the current generation harness before changing direction again.
+- [x] Re-read the current classifier-only output-head results and the latest generation harness before continuing.
 - [x] State the breakthrough hypothesis up front:
-  - [x] The recurrent trunk already moved the bottleneck to final RMSNorm + classifier logits.
-  - [x] Offloading the logits head to ANE is the highest-upside next step because it attacks the largest remaining controllable cost on the best architecture path.
+  - [x] The remaining head budget is still large enough that a fused lane-packed `RMSNorm + classifier` head could matter.
+  - [x] The classifier-only ANE head already proved the output head is movable, but not enough of it moved.
 - [x] State the decisive metric and stop condition up front:
-  - [x] The target is to recover the lost `>=2x` end-to-end win for the `6`-layer recurrent generation path over the current transformer generation path.
-  - [x] Using the latest baseline (`4.000445 ms/token` recurrent-6 vs `6.558745 ms/token` direct transformer generation), the new head path needs to save roughly `0.72 ms/token` end-to-end to get back under `3.28 ms/token`.
-  - [x] Stop quickly if a large-vocab ANE classifier kernel:
-    - [x] fails to compile with a controlled `InvalidMILProgram` / entitlement wall / unrecoverable crash
-    - [x] or saves less than about `0.7 ms/token` end-to-end on recurrent-6 generation
-    - [x] or shifts cost into extra host I/O enough to erase the theoretical win
+  - [x] Current recurrent `6`-layer ANE classifier-head baseline: `3.710214 ms/token`, `269.53 tok/s`, logits `1.094966 ms/token`
+  - [x] To get back to `>=2x` over direct transformer generation (`6.558745 ms/token`), recurrent `6`-layer generation needs to get under `3.279373 ms/token`
+  - [x] That means this follow-up needs another `~0.431 ms/token` end-to-end beyond the current ANE classifier backend to fully clear the old gate
+  - [x] Continue only if fused head saves another clearly material chunk of runtime:
+    - [x] roughly `>=0.25 ms/token` over the current ANE classifier-head baseline, or
+    - [x] enough head-side savings to make a second fusion step obviously justified
+  - [x] Stop quickly if:
+    - [x] fused large-vocab head fails with `InvalidMILProgram` / `statusType=0x9` / unrecoverable crash
+    - [x] fused head is not measurably better than classifier-only ANE offload
+    - [x] compile time balloons enough to make iteration impractical
 - [x] Record the current baselines before implementation:
-  - [x] direct transformer generation, `6` layers: `6.558745 ms/token`, `152.47 tok/s`, trunk `5.28449`, logits `1.26048`
-  - [x] recurrent generation, `6` layers: `4.000445 ms/token`, `249.97 tok/s`, trunk `2.73244`, logits `1.26102`
-  - [x] CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`, trunk `5.11926`, logits `1.35556`
-  - [x] key inference: the current recurrent path no longer wins by enough because logits stayed around `1.26 ms/token`
+  - [x] direct transformer generation, `6` layers: `6.558745 ms/token`, `152.47 tok/s`
+  - [x] recurrent generation, CPU head, `6` layers: `3.965409 ms/token`, `252.18 tok/s`, logits `1.292997`
+  - [x] recurrent generation, ANE classifier head, `6` layers: `3.710214 ms/token`, `269.53 tok/s`, logits `1.094966`
+  - [x] key inference: classifier-only ANE offload saved `0.255195 ms/token`, which is real but too small
 - [x] Rewrite the work around the next honest probe:
-  - [x] build a minimal ANE-side logits kernel first
-  - [x] keep RMSNorm on CPU initially unless the classifier-only path is not enough
-  - [x] integrate the new head behind a small selectable backend in the generation harness
-  - [x] benchmark the new head on recurrent generation before touching deeper recurrent stacks
+  - [x] keep the proven lane-packed `spatial=32` shape
+  - [x] fuse final RMSNorm + classifier into one ANE kernel
+  - [x] use the recurrent generation path first
+  - [x] preserve CPU and classifier-only ANE heads as controls
 - [x] Add failing tests first:
-  - [x] ANE classifier/logits kernel contract test
-  - [x] generation benchmark accounting for CPU-head vs ANE-head selection
-  - [x] hardware-gated recurrent generation benchmark comparing CPU logits vs ANE logits
-- [x] Implement the minimal ANE logits path:
-  - [x] add a MIL generator for single-token classifier projection (`dim -> vocab`)
-  - [x] add a runtime kernel wrapper and surface handles
-  - [x] keep the first pass minimal: CPU RMSNorm + ANE classifier projection
-  - [x] read logits back into the existing token-selection path
-  - [x] fail fast on unsupported compile/runtime behavior instead of stretching the avenue
-- [x] Integrate with the generation harness:
-  - [x] add a selectable output-head backend for generation
-  - [x] use the new backend on the recurrent generation path first
-  - [x] preserve the current CPU path as control
-  - [x] keep verification on the CPU path unless the ANE head clearly works and merits expansion
+  - [x] fused RMSNorm+classifier MIL generator contract test
+  - [x] fused kernel-set compile spec test
+  - [x] generation hardware benchmark comparing:
+    - [x] CPU head
+    - [x] ANE classifier head
+    - [x] fused ANE RMSNorm+classifier head
+- [x] Implement the fused head:
+  - [x] add a MIL generator for lane-packed final RMSNorm + classifier
+  - [x] add a runtime kernel wrapper
+  - [x] add a new generation output-head backend case
+  - [x] write/read only spatial lane `0` at runtime
+  - [x] keep failure behavior explicit and bounded
+- [x] Integrate with generation:
+  - [x] recurrent generation path first
+  - [x] keep verification on CPU
+  - [x] only extend direct transformer generation if recurrent numbers justify it
 - [x] Benchmark in order:
-  - [x] current recurrent-6 generation control
-  - [x] recurrent-6 generation with ANE classifier head
-  - [ ] direct transformer generation with ANE classifier head only if the recurrent path clearly benefits
+  - [x] recurrent `6`-layer CPU head control
+  - [x] recurrent `6`-layer ANE classifier-head control
+  - [x] recurrent `6`-layer fused ANE RMSNorm+classifier head
 - [x] Report:
   - [x] `ms/token`
   - [x] `tok/s`
   - [x] compile time
-  - [x] trunk time vs logits time
-  - [x] end-to-end delta vs current recurrent-6 control
+  - [x] trunk time vs head time
+  - [x] end-to-end delta vs classifier-only ANE head
 - [x] Apply the gate immediately after results:
-  - [ ] continue only if recurrent-6 generation gets back to about `>=2x` over direct transformer generation or shows a clearly expandable head-side win
-  - [x] otherwise stop and document that the output-head probe is not sufficient
+  - [ ] continue only if the fused head saves another material chunk (`>=0.25 ms/token`) or obviously unlocks a larger on-device reduction path
+  - [x] otherwise stop and document that head-side work is exhausted enough to shift focus back to recurrent trunk fusion
 - [x] Append findings to `docs/fused-decode-and-next-steps.md`.
 - [x] Update project memory with durable findings.
 - [ ] Fill in this review section and commit atomically.
 
 ## Review
-- Status: completed for the classifier-only output-head probe.
+- Status: in progress.
 - Starting point:
   - direct transformer generation, `6` layers: `6.558745 ms/token`, `152.47 tok/s`
-  - recurrent generation, `6` layers: `4.000445 ms/token`, `249.97 tok/s`
-  - CoreML generation baseline: `6.582224 ms/token`, `151.93 tok/s`
+  - recurrent generation, ANE classifier head, `6` layers: `3.710214 ms/token`, `269.53 tok/s`
 - Most important current constraint:
-  - recurrent trunk latency is no longer the dominant problem
-  - logits remain about `1.26-1.36 ms/token`
-  - therefore the next honest optimization target is the output head, not more recurrent depth
+  - the head still costs about `1.095 ms/token`
+  - the current ANE classifier head moved only part of that cost
+  - the best remaining bounded head-side probe is fused `RMSNorm + classifier`, not more classifier-only tuning
 - What changed:
-  - added a selectable `GenerationOutputHeadBackend`
-  - added a minimal ANE classifier kernel (`GenerationClassifierGenerator` / `GenerationClassifierKernelSet`)
-  - routed direct and recurrent generation through the ANE classifier backend for step-level logits only
-- Important implementation finding:
-  - a single-token large-vocab classifier shape (`[1, dim, 1, 1] -> [1, vocab, 1, 1]`) compiled but failed at eval with `statusType=0x9`
-  - a lane-packed classifier shape (`[1, dim, 1, 32] -> [1, vocab, 1, 32]`) succeeded when only spatial lane `0` was written/read
+  - added `GenerationRMSNormClassifierGenerator`
+  - added `GenerationRMSNormClassifierKernelSet`
+  - added a new `GenerationOutputHeadBackend.aneRMSNormClassifier`
+  - routed recurrent generation through a fused lane-packed `RMSNorm + classifier` ANE head
 - Results on recurrent generation, `6` layers:
-  - CPU head: `3.965409 ms/token`, `252.18 tok/s`, compile `407.17 ms`, trunk `2.661490`, logits `1.292997`
-  - ANE classifier head: `3.710214 ms/token`, `269.53 tok/s`, compile `585.46 ms`, trunk `2.607659`, logits `1.094966`
-  - end-to-end savings: `0.255195 ms/token` (`6.4%`)
-  - logits savings: `0.198031 ms/token` (`15.3%`)
-  - compile-time increase: `178.29 ms`
+  - CPU head: `4.128354 ms/token`, `242.23 tok/s`, compile `445.79 ms`, trunk `2.721484`, head `1.375232`
+  - ANE classifier head: `3.761755 ms/token`, `265.83 tok/s`, compile `634.18 ms`, trunk `2.655479`, head `1.098206`
+  - fused ANE RMSNorm+classifier head: `3.564776 ms/token`, `280.54 tok/s`, compile `612.15 ms`, trunk `2.615005`, head `0.936549`
+- Deltas:
+  - fused vs classifier-only ANE head:
+    - `0.196979 ms/token` faster (`5.24%`)
+    - `14.71 tok/s` faster (`5.53%`)
+    - head bucket down by `0.161656 ms/token`
+  - fused vs CPU head:
+    - `0.563578 ms/token` faster (`13.65%`)
+  - remaining gap to `>=2x` over direct transformer generation:
+    - about `0.285404 ms/token`
 - Decision:
-  - this is a real gain, but it misses the predeclared `~0.7 ms/token` gate by a wide margin
-  - classifier-only ANE offload is therefore not sufficient to recover the lost `>=2x` recurrent win over direct transformer generation
-  - the next credible move is not more tuning of this exact probe; it is either:
-    - fused RMSNorm + classifier on ANE if you want one last bounded head-side attempt, or
-    - recurrent multi-layer fusion if the goal is the next materially larger win
+  - there is still real head-side signal here
+  - fused head is a meaningful improvement over classifier-only offload
+  - but it still misses the predeclared `>=0.25 ms/token` continuation gate over the current ANE classifier-head baseline
+  - the next head-side step would need a different mechanism, most likely:
+    - reduce or avoid full-vocab logits readback
+    - or compute token selection on-device
+  - absent that, the next higher-upside avenue is recurrent multi-layer fusion

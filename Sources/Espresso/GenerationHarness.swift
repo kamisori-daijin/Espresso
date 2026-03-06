@@ -499,6 +499,7 @@ public struct ANEDirectGenerationModel: ~Copyable, AutoregressiveLanguageModel, 
     private let verifyRMSWorkspace: RMSNorm.Workspace
     private let outputHeadBackend: GenerationOutputHeadBackend
     private let aneClassifierHead: ANEGenerationClassifierHead?
+    private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private var decodeHandles: [DecodeSurfaceHandles]
     private var inferenceHandles: [InferenceSurfaceHandles]
     private var decodeState: DecodeState
@@ -558,6 +559,14 @@ public struct ANEDirectGenerationModel: ~Copyable, AutoregressiveLanguageModel, 
             embedding: embedding,
             classifier: classifier
         )
+        let aneRMSNormClassifierHead = try Self.makeANERMSNormClassifierHead(
+            outputHeadBackend: outputHeadBackend,
+            vocabSize: vocabSize,
+            sharedClassifier: sharedClassifier,
+            rmsFinal: rmsFinal,
+            embedding: embedding,
+            classifier: classifier
+        )
         let compileTimeMs = GenerationClock.milliseconds(start: compileStart, end: GenerationClock.now())
         let decodeHandles = try Self.makeDecodeHandles(
             kernels: decodeKernels,
@@ -588,6 +597,7 @@ public struct ANEDirectGenerationModel: ~Copyable, AutoregressiveLanguageModel, 
         self.verifyRMSWorkspace = RMSNorm.Workspace(seqLen: ModelConfig.seqLen)
         self.outputHeadBackend = outputHeadBackend
         self.aneClassifierHead = aneClassifierHead
+        self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
         self.decodeHandles = decodeHandles
         self.inferenceHandles = inferenceHandles
         self.decodeState = decodeState
@@ -695,6 +705,35 @@ public struct ANEDirectGenerationModel: ~Copyable, AutoregressiveLanguageModel, 
                 return try ANEGenerationClassifierHead(classifierWeights: embedding, vocabSize: vocabSize)
             }
             return try ANEGenerationClassifierHead(classifierWeights: classifier, vocabSize: vocabSize)
+        case .aneRMSNormClassifier:
+            return nil
+        }
+    }
+
+    private static func makeANERMSNormClassifierHead(
+        outputHeadBackend: GenerationOutputHeadBackend,
+        vocabSize: Int,
+        sharedClassifier: Bool,
+        rmsFinal: borrowing TensorBuffer,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer
+    ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
+        switch outputHeadBackend {
+        case .cpu, .aneClassifier:
+            return nil
+        case .aneRMSNormClassifier:
+            if sharedClassifier {
+                return try ANEGenerationRMSNormClassifierHead(
+                    rmsFinal: rmsFinal,
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize
+                )
+            }
+            return try ANEGenerationRMSNormClassifierHead(
+                rmsFinal: rmsFinal,
+                classifierWeights: classifier,
+                vocabSize: vocabSize
+            )
         }
     }
 
@@ -817,17 +856,19 @@ public struct ANEDirectGenerationModel: ~Copyable, AutoregressiveLanguageModel, 
 
     private mutating func projectStepLogits() throws(GenerationError) -> [Float] {
         let logitsStart = GenerationClock.now()
-        xCur.withUnsafePointer { xPtr in
-            stepNorm.withUnsafeMutablePointer { normPtr in
-                rmsFinal.withUnsafePointer { rmsPtr in
-                    RMSNorm.forward(
-                        output: normPtr,
-                        input: xPtr,
-                        weights: rmsPtr,
-                        dim: ModelConfig.dim,
-                        seqLen: 1,
-                        workspace: stepRMSWorkspace
-                    )
+        if outputHeadBackend != .aneRMSNormClassifier {
+            xCur.withUnsafePointer { xPtr in
+                stepNorm.withUnsafeMutablePointer { normPtr in
+                    rmsFinal.withUnsafePointer { rmsPtr in
+                        RMSNorm.forward(
+                            output: normPtr,
+                            input: xPtr,
+                            weights: rmsPtr,
+                            dim: ModelConfig.dim,
+                            seqLen: 1,
+                            workspace: stepRMSWorkspace
+                        )
+                    }
                 }
             }
         }
@@ -862,6 +903,11 @@ public struct ANEDirectGenerationModel: ~Copyable, AutoregressiveLanguageModel, 
                 throw .runtimeFailure("ANE classifier backend requested without compiled head")
             }
             try aneClassifierHead.project(normalizedInput: stepNorm, logits: stepLogits)
+        case .aneRMSNormClassifier:
+            guard let aneRMSNormClassifierHead else {
+                throw .runtimeFailure("ANE fused output-head backend requested without compiled head")
+            }
+            try aneRMSNormClassifierHead.project(rawInput: xCur, logits: stepLogits)
         }
 
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
@@ -946,6 +992,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, AutoregressiveLanguageMode
     private let stepRMSWorkspace: RMSNorm.Workspace
     private let outputHeadBackend: GenerationOutputHeadBackend
     private let aneClassifierHead: ANEGenerationClassifierHead?
+    private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private var activationA: TensorBuffer
     private var activationB: TensorBuffer
     private var currentActivationIsA: Bool
@@ -997,6 +1044,14 @@ public struct ANERecurrentGenerationModel: ~Copyable, AutoregressiveLanguageMode
             embedding: embedding,
             classifier: classifier
         )
+        let aneRMSNormClassifierHead = try Self.makeANERMSNormClassifierHead(
+            outputHeadBackend: outputHeadBackend,
+            vocabSize: vocabSize,
+            sharedClassifier: sharedClassifier,
+            rmsFinal: rmsFinal,
+            embedding: embedding,
+            classifier: classifier
+        )
         let compileTimeMs = GenerationClock.milliseconds(start: compileStart, end: GenerationClock.now())
 
         self.vocabSize = vocabSize
@@ -1012,6 +1067,7 @@ public struct ANERecurrentGenerationModel: ~Copyable, AutoregressiveLanguageMode
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.outputHeadBackend = outputHeadBackend
         self.aneClassifierHead = aneClassifierHead
+        self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
         self.activationA = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.activationB = TensorBuffer(count: ModelConfig.dim, zeroed: true)
         self.currentActivationIsA = true
@@ -1049,6 +1105,35 @@ public struct ANERecurrentGenerationModel: ~Copyable, AutoregressiveLanguageMode
                 return try ANEGenerationClassifierHead(classifierWeights: embedding, vocabSize: vocabSize)
             }
             return try ANEGenerationClassifierHead(classifierWeights: classifier, vocabSize: vocabSize)
+        case .aneRMSNormClassifier:
+            return nil
+        }
+    }
+
+    private static func makeANERMSNormClassifierHead(
+        outputHeadBackend: GenerationOutputHeadBackend,
+        vocabSize: Int,
+        sharedClassifier: Bool,
+        rmsFinal: borrowing TensorBuffer,
+        embedding: borrowing TensorBuffer,
+        classifier: borrowing TensorBuffer
+    ) throws(GenerationError) -> ANEGenerationRMSNormClassifierHead? {
+        switch outputHeadBackend {
+        case .cpu, .aneClassifier:
+            return nil
+        case .aneRMSNormClassifier:
+            if sharedClassifier {
+                return try ANEGenerationRMSNormClassifierHead(
+                    rmsFinal: rmsFinal,
+                    classifierWeights: embedding,
+                    vocabSize: vocabSize
+                )
+            }
+            return try ANEGenerationRMSNormClassifierHead(
+                rmsFinal: rmsFinal,
+                classifierWeights: classifier,
+                vocabSize: vocabSize
+            )
         }
     }
 
@@ -1144,33 +1229,35 @@ public struct ANERecurrentGenerationModel: ~Copyable, AutoregressiveLanguageMode
 
     private mutating func projectCurrentLogits() throws(GenerationError) -> [Float] {
         let logitsStart = GenerationClock.now()
-        if currentActivationIsA {
-            activationA.withUnsafePointer { xPtr in
-                stepNorm.withUnsafeMutablePointer { normPtr in
-                    rmsFinal.withUnsafePointer { rmsPtr in
-                        RMSNorm.forward(
-                            output: normPtr,
-                            input: xPtr,
-                            weights: rmsPtr,
-                            dim: ModelConfig.dim,
-                            seqLen: 1,
-                            workspace: stepRMSWorkspace
-                        )
+        if outputHeadBackend != .aneRMSNormClassifier {
+            if currentActivationIsA {
+                activationA.withUnsafePointer { xPtr in
+                    stepNorm.withUnsafeMutablePointer { normPtr in
+                        rmsFinal.withUnsafePointer { rmsPtr in
+                            RMSNorm.forward(
+                                output: normPtr,
+                                input: xPtr,
+                                weights: rmsPtr,
+                                dim: ModelConfig.dim,
+                                seqLen: 1,
+                                workspace: stepRMSWorkspace
+                            )
+                        }
                     }
                 }
-            }
-        } else {
-            activationB.withUnsafePointer { xPtr in
-                stepNorm.withUnsafeMutablePointer { normPtr in
-                    rmsFinal.withUnsafePointer { rmsPtr in
-                        RMSNorm.forward(
-                            output: normPtr,
-                            input: xPtr,
-                            weights: rmsPtr,
-                            dim: ModelConfig.dim,
-                            seqLen: 1,
-                            workspace: stepRMSWorkspace
-                        )
+            } else {
+                activationB.withUnsafePointer { xPtr in
+                    stepNorm.withUnsafeMutablePointer { normPtr in
+                        rmsFinal.withUnsafePointer { rmsPtr in
+                            RMSNorm.forward(
+                                output: normPtr,
+                                input: xPtr,
+                                weights: rmsPtr,
+                                dim: ModelConfig.dim,
+                                seqLen: 1,
+                                workspace: stepRMSWorkspace
+                            )
+                        }
                     }
                 }
             }
@@ -1206,6 +1293,15 @@ public struct ANERecurrentGenerationModel: ~Copyable, AutoregressiveLanguageMode
                 throw .runtimeFailure("ANE classifier backend requested without compiled head")
             }
             try aneClassifierHead.project(normalizedInput: stepNorm, logits: stepLogits)
+        case .aneRMSNormClassifier:
+            guard let aneRMSNormClassifierHead else {
+                throw .runtimeFailure("ANE fused output-head backend requested without compiled head")
+            }
+            if currentActivationIsA {
+                try aneRMSNormClassifierHead.project(rawInput: activationA, logits: stepLogits)
+            } else {
+                try aneRMSNormClassifierHead.project(rawInput: activationB, logits: stepLogits)
+            }
         }
 
         logitsLatencyMs += GenerationClock.milliseconds(start: logitsStart, end: GenerationClock.now())
