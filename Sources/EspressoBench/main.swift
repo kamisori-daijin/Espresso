@@ -2,6 +2,7 @@ import Foundation
 import ANETypes
 import ANERuntime
 import Espresso
+import MILGenerator
 import Darwin
 
 // MARK: - CLI Argument Parsing
@@ -24,6 +25,27 @@ struct BenchmarkOptions {
     var dumpANE: Bool = false
     var dumpANEFilter: String? = nil
     var perfStats: Bool = false
+    var probeChainingPrepare: Bool = false
+    var probeChainingSkipPrepare: Bool = false
+    var probeChainingCallBuffersReady: Bool = false
+    var probeChainingCallEnqueueSets: Bool = false
+    var probeChainingScalarLoopback: Bool = false
+    var probeChainingStatsSurfaceMode: String = "output0"
+    var probeChainingRequestProcedureIndex: UInt32 = 0
+    var probeChainingRequestTransactionHandle: UInt64 = 0
+    var probeChainingRequestFWEnqueueDelay: UInt64 = 0
+    var probeChainingRequestMemoryPoolId: UInt64 = 0
+    var probeChainingEnqueueProcedureIndex: UInt32 = 0
+    var probeChainingEnqueueSetIndex: UInt32 = 0
+    var probeChainingEnqueueSignalValue: UInt64 = 0
+    var probeChainingEnqueueSignalNotRequired: Bool = true
+    var probeChainingEnqueueOpenLoop: Bool = false
+    var probeChainingReadyProcedureIndex: UInt32 = 0
+    var probeChainingReadyExecutionDelay: UInt64 = 0
+    var probeChainingUseSharedSignalEvent: Bool = false
+    var probeChainingSharedSignalEventValue: UInt64 = 1
+    var probeChainingSharedSignalEventSymbolIndex: UInt32 = 0
+    var probeChainingSharedSignalEventType: Int64 = 0
 
     static func parse(_ args: [String]) -> BenchmarkOptions {
         var opts = BenchmarkOptions()
@@ -105,6 +127,118 @@ struct BenchmarkOptions {
                 opts.dumpANEFilter = args[i]
             case "--perf-stats":
                 opts.perfStats = true
+            case "--probe-chaining-prepare":
+                opts.probeChainingPrepare = true
+            case "--probe-chaining-skip-prepare":
+                opts.probeChainingSkipPrepare = true
+            case "--probe-chaining-call-buffers-ready":
+                opts.probeChainingCallBuffersReady = true
+            case "--probe-chaining-call-enqueue-sets":
+                opts.probeChainingCallEnqueueSets = true
+            case "--probe-chaining-scalar-loopback":
+                opts.probeChainingScalarLoopback = true
+            case "--probe-chaining-stats-surface":
+                i += 1
+                guard i < args.count else {
+                    printStderr("--probe-chaining-stats-surface requires one of: output0, null, scratch")
+                    exit(1)
+                }
+                let mode = args[i].lowercased()
+                guard ["output0", "null", "scratch"].contains(mode) else {
+                    printStderr("--probe-chaining-stats-surface requires one of: output0, null, scratch")
+                    exit(1)
+                }
+                opts.probeChainingStatsSurfaceMode = mode
+            case "--probe-chaining-request-procedure-index":
+                i += 1
+                guard i < args.count, let v = UInt32(args[i]) else {
+                    printStderr("--probe-chaining-request-procedure-index requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingRequestProcedureIndex = v
+            case "--probe-chaining-request-transaction-handle":
+                i += 1
+                guard i < args.count, let v = UInt64(args[i]) else {
+                    printStderr("--probe-chaining-request-transaction-handle requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingRequestTransactionHandle = v
+            case "--probe-chaining-request-fw-enqueue-delay":
+                i += 1
+                guard i < args.count, let v = UInt64(args[i]) else {
+                    printStderr("--probe-chaining-request-fw-enqueue-delay requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingRequestFWEnqueueDelay = v
+            case "--probe-chaining-request-memory-pool-id":
+                i += 1
+                guard i < args.count, let v = UInt64(args[i]) else {
+                    printStderr("--probe-chaining-request-memory-pool-id requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingRequestMemoryPoolId = v
+            case "--probe-chaining-enqueue-procedure-index":
+                i += 1
+                guard i < args.count, let v = UInt32(args[i]) else {
+                    printStderr("--probe-chaining-enqueue-procedure-index requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingEnqueueProcedureIndex = v
+            case "--probe-chaining-enqueue-set-index":
+                i += 1
+                guard i < args.count, let v = UInt32(args[i]) else {
+                    printStderr("--probe-chaining-enqueue-set-index requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingEnqueueSetIndex = v
+            case "--probe-chaining-enqueue-signal-value":
+                i += 1
+                guard i < args.count, let v = UInt64(args[i]) else {
+                    printStderr("--probe-chaining-enqueue-signal-value requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingEnqueueSignalValue = v
+            case "--probe-chaining-enqueue-require-signal":
+                opts.probeChainingEnqueueSignalNotRequired = false
+            case "--probe-chaining-enqueue-open-loop":
+                opts.probeChainingEnqueueOpenLoop = true
+            case "--probe-chaining-ready-procedure-index":
+                i += 1
+                guard i < args.count, let v = UInt32(args[i]) else {
+                    printStderr("--probe-chaining-ready-procedure-index requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingReadyProcedureIndex = v
+            case "--probe-chaining-ready-execution-delay":
+                i += 1
+                guard i < args.count, let v = UInt64(args[i]) else {
+                    printStderr("--probe-chaining-ready-execution-delay requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingReadyExecutionDelay = v
+            case "--probe-chaining-use-shared-signal-event":
+                opts.probeChainingUseSharedSignalEvent = true
+            case "--probe-chaining-shared-signal-value":
+                i += 1
+                guard i < args.count, let v = UInt64(args[i]) else {
+                    printStderr("--probe-chaining-shared-signal-value requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingSharedSignalEventValue = v
+            case "--probe-chaining-shared-signal-symbol-index":
+                i += 1
+                guard i < args.count, let v = UInt32(args[i]) else {
+                    printStderr("--probe-chaining-shared-signal-symbol-index requires a non-negative integer argument")
+                    exit(1)
+                }
+                opts.probeChainingSharedSignalEventSymbolIndex = v
+            case "--probe-chaining-shared-signal-event-type":
+                i += 1
+                guard i < args.count, let v = Int64(args[i]) else {
+                    printStderr("--probe-chaining-shared-signal-event-type requires an integer argument")
+                    exit(1)
+                }
+                opts.probeChainingSharedSignalEventType = v
             case "--help", "-h":
                 printUsage()
                 exit(0)
@@ -143,6 +277,27 @@ struct BenchmarkOptions {
           --dump-ane         Dump ObjC runtime methods/properties for private ANE classes
           --dump-ane-filter S  Only show methods/properties containing substring S
           --perf-stats       Enable `_ANEPerformanceStats` collection for direct ANE eval (sets ANE_PERF_STATS=1)
+          --probe-chaining-prepare  Run isolated chaining prepare probe with primary output stats surface
+          --probe-chaining-skip-prepare  Stop the isolated chaining probe before `prepareChainingWithModel`
+          --probe-chaining-call-buffers-ready  Call `buffersReadyWithModel` before prepare in the isolated chaining probe
+          --probe-chaining-call-enqueue-sets  Call `enqueueSetsWithModel` before prepare in the isolated chaining probe
+          --probe-chaining-scalar-loopback  Pass scalar loopback symbol ids instead of arrays
+          --probe-chaining-stats-surface MODE  Set chaining stats surface mode: output0, null, scratch (default: output0)
+          --probe-chaining-request-procedure-index N  Override chaining request procedureIndex (default: 0)
+          --probe-chaining-request-transaction-handle N  Override chaining request transactionHandle (default: 0)
+          --probe-chaining-request-fw-enqueue-delay N  Override chaining request fwEnqueueDelay (default: 0)
+          --probe-chaining-request-memory-pool-id N  Override chaining request memoryPoolId (default: 0)
+          --probe-chaining-enqueue-procedure-index N  Override enqueueSets procedureIndex (default: 0)
+          --probe-chaining-enqueue-set-index N  Override enqueueSets setIndex (default: 0)
+          --probe-chaining-enqueue-signal-value N  Override enqueueSets signalValue (default: 0)
+          --probe-chaining-enqueue-require-signal  Set enqueueSets signalNotRequired=false
+          --probe-chaining-enqueue-open-loop  Set enqueueSets isOpenLoop=true
+          --probe-chaining-ready-procedure-index N  Override buffersReady procedureIndex (default: 0)
+          --probe-chaining-ready-execution-delay N  Override buffersReady executionDelay (default: 0)
+          --probe-chaining-use-shared-signal-event  Build a `_ANESharedSignalEvent` and pass it in chaining signalEvents
+          --probe-chaining-shared-signal-value N  Override shared signal event value (default: 1)
+          --probe-chaining-shared-signal-symbol-index N  Override shared signal event symbolIndex (default: 0)
+          --probe-chaining-shared-signal-event-type N  Override shared signal event eventType (default: 0)
           -h, --help         Show this help
         """)
     }
@@ -151,6 +306,184 @@ struct BenchmarkOptions {
 // MARK: - Main
 
 let opts = BenchmarkOptions.parse(CommandLine.arguments)
+
+private let chainingProbeChannels = 4
+private let chainingProbeSpatial = 8
+private let chainingProbeBytes = chainingProbeChannels * chainingProbeSpatial * MemoryLayout<UInt16>.stride
+
+func chainingProbeWeightBlob(channels: Int) -> Data {
+    var weights = [Float](repeating: 0, count: channels * channels)
+    for i in 0..<channels {
+        weights[i * channels + i] = 1
+    }
+    return WeightBlob.build(from: weights, rows: channels, cols: channels)
+}
+
+func makeChainingProbeKernel() throws -> ANEKernel {
+    let mil = GenericMIL.conv(inCh: chainingProbeChannels, outCh: chainingProbeChannels, spatial: chainingProbeSpatial)
+    return try ANEKernel(
+        milText: mil,
+        weights: [(path: "@model_path/weights/weight.bin", data: chainingProbeWeightBlob(channels: chainingProbeChannels))],
+        inputBytes: chainingProbeBytes,
+        outputBytes: chainingProbeBytes
+    )
+}
+
+func chainingProbeJSON(_ probe: ANEChainingProbe) -> [String: Any] {
+    [
+        "has_chaining_request_class": probe.hasChainingRequestClass,
+        "has_prepare_selector": probe.hasPrepareSelector,
+        "has_output_sets_factory": probe.hasOutputSetsFactory,
+        "has_output_set_enqueue_class": probe.hasOutputSetEnqueueClass,
+        "has_input_buffers_ready_class": probe.hasInputBuffersReadyClass,
+        "has_shared_signal_event_class": probe.hasSharedSignalEventClass,
+        "built_output_set": probe.builtOutputSet,
+        "built_output_set_enqueue": probe.builtOutputSetEnqueue,
+        "built_input_buffers_ready": probe.builtInputBuffersReady,
+        "built_shared_signal_event": probe.builtSharedSignalEvent,
+        "built_request": probe.builtRequest,
+        "used_array_loopback_symbol_indices": probe.usedArrayLoopbackSymbolIndices,
+        "used_real_stats_surface": probe.usedRealStatsSurface,
+        "request_validated": probe.requestValidated,
+        "request_valid": probe.requestValid,
+        "request_validation_failed": probe.requestValidationFailed,
+        "input_buffers_ready_validation_failed": probe.inputBuffersReadyValidationFailed,
+        "called_buffers_ready": probe.calledBuffersReady,
+        "buffers_ready_succeeded": probe.buffersReadySucceeded,
+        "called_enqueue_sets": probe.calledEnqueueSets,
+        "enqueue_sets_succeeded": probe.enqueueSetsSucceeded,
+        "prepared": probe.prepared,
+        "stage": probe.stage,
+    ]
+}
+
+func printJSONObject(_ object: Any) throws {
+    let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+    if let text = String(data: data, encoding: .utf8) {
+        print(text)
+    } else {
+        throw NSError(domain: "EspressoBench.JSON", code: 1)
+    }
+}
+
+func resolveOutputDir(_ opts: BenchmarkOptions) -> String {
+    if let dir = opts.outputDir {
+        return dir
+    }
+    let dateFormatter = DateFormatter()
+    dateFormatter.dateFormat = "yyyy-MM-dd-HHmmss"
+    dateFormatter.locale = Locale(identifier: "en_US_POSIX")
+    let timestamp = dateFormatter.string(from: Date())
+    return "benchmarks/results/\(timestamp)"
+}
+
+struct ChainingPrepareProbeConfig {
+    let statsSurfaceMode: String
+    let useRealStatsSurface: Bool
+    let skipPrepare: Bool
+    let callBuffersReady: Bool
+    let callEnqueueSets: Bool
+    let useScalarLoopbackSymbolIndices: Bool
+    let requestProcedureIndex: UInt32
+    let requestTransactionHandle: UInt64
+    let requestFWEnqueueDelay: UInt64
+    let requestMemoryPoolId: UInt64
+    let enqueueProcedureIndex: UInt32
+    let enqueueSetIndex: UInt32
+    let enqueueSignalValue: UInt64
+    let enqueueSignalNotRequired: Bool
+    let enqueueOpenLoop: Bool
+    let readyProcedureIndex: UInt32
+    let readyExecutionDelay: UInt64
+    let useSharedSignalEvent: Bool
+    let sharedSignalEventValue: UInt64
+    let sharedSignalEventSymbolIndex: UInt32
+    let sharedSignalEventType: Int64
+
+    init(options: BenchmarkOptions) {
+        statsSurfaceMode = options.probeChainingStatsSurfaceMode
+        useRealStatsSurface = options.probeChainingStatsSurfaceMode == "output0"
+        skipPrepare = options.probeChainingSkipPrepare
+        callBuffersReady = options.probeChainingCallBuffersReady
+        callEnqueueSets = options.probeChainingCallEnqueueSets
+        useScalarLoopbackSymbolIndices = options.probeChainingScalarLoopback
+        requestProcedureIndex = options.probeChainingRequestProcedureIndex
+        requestTransactionHandle = options.probeChainingRequestTransactionHandle
+        requestFWEnqueueDelay = options.probeChainingRequestFWEnqueueDelay
+        requestMemoryPoolId = options.probeChainingRequestMemoryPoolId
+        enqueueProcedureIndex = options.probeChainingEnqueueProcedureIndex
+        enqueueSetIndex = options.probeChainingEnqueueSetIndex
+        enqueueSignalValue = options.probeChainingEnqueueSignalValue
+        enqueueSignalNotRequired = options.probeChainingEnqueueSignalNotRequired
+        enqueueOpenLoop = options.probeChainingEnqueueOpenLoop
+        readyProcedureIndex = options.probeChainingReadyProcedureIndex
+        readyExecutionDelay = options.probeChainingReadyExecutionDelay
+        useSharedSignalEvent = options.probeChainingUseSharedSignalEvent
+        sharedSignalEventValue = options.probeChainingSharedSignalEventValue
+        sharedSignalEventSymbolIndex = options.probeChainingSharedSignalEventSymbolIndex
+        sharedSignalEventType = options.probeChainingSharedSignalEventType
+    }
+
+    func applyEnvironment() {
+        if useRealStatsSurface {
+            unsetenv("ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE")
+        } else {
+            setenv("ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE", statsSurfaceMode, 1)
+        }
+    }
+}
+
+func chainingPrepareProbeSummary(
+    options: BenchmarkOptions,
+    probeConfig: ChainingPrepareProbeConfig,
+    resultStatus: String,
+    resultMetrics: [String: Any] = [:],
+    probe: ANEChainingProbe? = nil,
+    error: String? = nil
+) -> [String: Any] {
+    var summary = RunMetadata.base(mode: "chaining-prepare-probe", options: options)
+    summary["probe_options"] = [
+        "stats_surface_mode": probeConfig.statsSurfaceMode,
+        "use_real_stats_surface": probeConfig.useRealStatsSurface,
+        "skip_prepare": probeConfig.skipPrepare,
+        "call_buffers_ready": probeConfig.callBuffersReady,
+        "call_enqueue_sets": probeConfig.callEnqueueSets,
+        "scalar_loopback": probeConfig.useScalarLoopbackSymbolIndices,
+        "request_procedure_index": probeConfig.requestProcedureIndex,
+        "request_transaction_handle": probeConfig.requestTransactionHandle,
+        "request_fw_enqueue_delay": probeConfig.requestFWEnqueueDelay,
+        "request_memory_pool_id": probeConfig.requestMemoryPoolId,
+        "enqueue_procedure_index": probeConfig.enqueueProcedureIndex,
+        "enqueue_set_index": probeConfig.enqueueSetIndex,
+        "enqueue_signal_value": probeConfig.enqueueSignalValue,
+        "enqueue_signal_not_required": probeConfig.enqueueSignalNotRequired,
+        "enqueue_open_loop": probeConfig.enqueueOpenLoop,
+        "ready_procedure_index": probeConfig.readyProcedureIndex,
+        "ready_execution_delay": probeConfig.readyExecutionDelay,
+        "use_shared_signal_event": probeConfig.useSharedSignalEvent,
+        "shared_signal_event_value": probeConfig.sharedSignalEventValue,
+        "shared_signal_event_symbol_index": probeConfig.sharedSignalEventSymbolIndex,
+        "shared_signal_event_type": probeConfig.sharedSignalEventType,
+        "validate_request": true,
+    ]
+    var result: [String: Any] = ["status": resultStatus]
+    for (key, value) in resultMetrics {
+        result[key] = value
+    }
+    if let error {
+        result["error"] = error
+    }
+    summary["result"] = result
+    if let probe {
+        summary["probe"] = chainingProbeJSON(probe)
+    }
+    return summary
+}
+
+func writeChainingPrepareProbeSummary(_ summary: [String: Any], outputDir: String) throws {
+    try FileManager.default.createDirectory(atPath: outputDir, withIntermediateDirectories: true)
+    try RunMetadata.writeJSON(summary, to: "\(outputDir)/summary.json")
+}
 
 if opts.dumpANE {
     _ = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW)
@@ -173,6 +506,87 @@ if opts.dumpANE {
 
 if opts.perfStats {
     setenv("ANE_PERF_STATS", "1", 1)
+}
+
+if opts.probeChainingPrepare {
+    let outputDir = resolveOutputDir(opts)
+    let probeConfig = ChainingPrepareProbeConfig(options: opts)
+    probeConfig.applyEnvironment()
+    let startedSummary = chainingPrepareProbeSummary(
+        options: opts,
+        probeConfig: probeConfig,
+        resultStatus: "started"
+    )
+    try? writeChainingPrepareProbeSummary(startedSummary, outputDir: outputDir)
+    printStderr("chaining-prepare-probe: started")
+    let compileStart = CFAbsoluteTimeGetCurrent()
+    do {
+        let kernel = try makeChainingProbeKernel()
+        let compileElapsedMS = (CFAbsoluteTimeGetCurrent() - compileStart) * 1000.0
+        let kernelCompiledSummary = chainingPrepareProbeSummary(
+            options: opts,
+            probeConfig: probeConfig,
+            resultStatus: "kernel_compiled",
+            resultMetrics: [
+                "compile_elapsed_ms": compileElapsedMS,
+            ]
+        )
+        try? writeChainingPrepareProbeSummary(kernelCompiledSummary, outputDir: outputDir)
+        let probeStart = CFAbsoluteTimeGetCurrent()
+        let probe = kernel.chainingProbe(
+            useRealStatsSurface: probeConfig.useRealStatsSurface,
+            skipPrepare: probeConfig.skipPrepare,
+            validateRequest: true,
+            useScalarLoopbackSymbolIndices: probeConfig.useScalarLoopbackSymbolIndices,
+            callEnqueueSets: probeConfig.callEnqueueSets,
+            callBuffersReady: probeConfig.callBuffersReady,
+            requestProcedureIndex: probeConfig.requestProcedureIndex,
+            requestTransactionHandle: probeConfig.requestTransactionHandle,
+            requestFWEnqueueDelay: probeConfig.requestFWEnqueueDelay,
+            requestMemoryPoolId: probeConfig.requestMemoryPoolId,
+            enqueueProcedureIndex: probeConfig.enqueueProcedureIndex,
+            enqueueSetIndex: probeConfig.enqueueSetIndex,
+            enqueueSignalValue: probeConfig.enqueueSignalValue,
+            enqueueSignalNotRequired: probeConfig.enqueueSignalNotRequired,
+            enqueueOpenLoop: probeConfig.enqueueOpenLoop,
+            readyProcedureIndex: probeConfig.readyProcedureIndex,
+            readyExecutionDelay: probeConfig.readyExecutionDelay,
+            useSharedSignalEvent: probeConfig.useSharedSignalEvent,
+            sharedSignalEventValue: probeConfig.sharedSignalEventValue,
+            sharedSignalEventSymbolIndex: probeConfig.sharedSignalEventSymbolIndex,
+            sharedSignalEventType: probeConfig.sharedSignalEventType
+        )
+        let probeElapsedMS = (CFAbsoluteTimeGetCurrent() - probeStart) * 1000.0
+        let completedSummary = chainingPrepareProbeSummary(
+            options: opts,
+            probeConfig: probeConfig,
+            resultStatus: "completed",
+            resultMetrics: [
+                "compile_elapsed_ms": compileElapsedMS,
+                "probe_elapsed_ms": probeElapsedMS,
+            ],
+            probe: probe
+        )
+        try writeChainingPrepareProbeSummary(completedSummary, outputDir: outputDir)
+        printStderr("chaining-prepare-probe: completed")
+        try printJSONObject(completedSummary)
+        exit(0)
+    } catch {
+        let compileElapsedMS = (CFAbsoluteTimeGetCurrent() - compileStart) * 1000.0
+        let failedSummary = chainingPrepareProbeSummary(
+            options: opts,
+            probeConfig: probeConfig,
+            resultStatus: "failed",
+            resultMetrics: [
+                "compile_elapsed_ms": compileElapsedMS,
+            ],
+            error: String(describing: error)
+        )
+        try? writeChainingPrepareProbeSummary(failedSummary, outputDir: outputDir)
+        printStderr("chaining-prepare-probe: failed: \(error)")
+        try? printJSONObject(failedSummary)
+        exit(1)
+    }
 }
 
 let runner = BenchmarkRunner(warmup: opts.warmup, iterations: opts.iterations)
@@ -233,6 +647,32 @@ func inferenceProfileAverages(_ profile: InferenceKernelProfile) -> [[String: An
             "ffn_io_lock_us": mean.ffnIOLockUS,
             "ffn_io_body_us": mean.ffnIOBodyUS,
             "ffn_io_unlock_us": mean.ffnIOUnlockUS,
+        ] as [String: Any]
+    }
+}
+
+func decodeProfileAverages(_ profile: DecodeKernelProfile) -> [[String: Any]] {
+    func mean(_ values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        return values.reduce(0, +) / Double(values.count)
+    }
+
+    func meanInt(_ values: [Int]) -> Double {
+        guard !values.isEmpty else { return 0 }
+        return Double(values.reduce(0, +)) / Double(values.count)
+    }
+
+    return profile.layers.indices.map { layerIdx in
+        let layer = profile.layers[layerIdx]
+        return [
+            "layer": layerIdx,
+            "samples": layer.attnEvalUS.count,
+            "attn_dispatch_count_avg": meanInt(layer.attnDispatchCount),
+            "ffn_dispatch_count_avg": meanInt(layer.ffnDispatchCount),
+            "chaining_probe_us_avg": mean(layer.chainingProbeUS),
+            "chaining_stage_last": layer.chainingStage.last ?? 0,
+            "chaining_prepare_successes": layer.chainingPrepareSuccessCount.reduce(0, +),
+            "chaining_fallbacks": layer.chainingFallbackCount.reduce(0, +),
         ] as [String: Any]
     }
 }
@@ -334,6 +774,10 @@ if opts.decode {
             ],
             "metrics": benchmarkStats(decodeResult.benchmarkResult),
         ]
+        summaryJSON["decode_chain_mode"] = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_CHAIN_MODE"] ?? "off"
+        if let profile = decodeResult.decodeKernelProfile {
+            summaryJSON["ane_decode_profile"] = decodeProfileAverages(profile)
+        }
         if let coreML = coreMLDecodeResult {
             let entries = coreML.results.map { (label, result) in
                 [

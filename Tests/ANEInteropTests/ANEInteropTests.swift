@@ -82,6 +82,39 @@ private enum ANEBaselineProbe {
     static let status: ANEBaselineStatus = probeANEBaselineStatus()
 }
 
+private func compileMinimalCastKernelHandle() -> OpaquePointer? {
+    let mil = """
+    program(1.3)
+    [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+    {
+        func main<ios18>(tensor<fp32, [1, 1, 1, 1]> x) {
+            string to16 = const()[name=string("to16"), val=string("fp16")];
+            tensor<fp16, [1,1,1,1]> x16 = cast(dtype=to16, x=x)[name=string("x16")];
+            string to32 = const()[name=string("to32"), val=string("fp32")];
+            tensor<fp32, [1,1,1,1]> y = cast(dtype=to32, x=x16)[name=string("y")];
+        } -> (y);
+    }
+    """
+
+    let inputBytes = MemoryLayout<Float>.stride
+    let outputBytes = inputBytes
+    return mil.data(using: .utf8)!.withUnsafeBytes { milBuf in
+        var inSize = inputBytes
+        var outSize = outputBytes
+        return withUnsafeBytes(of: &inSize) { inBuf in
+            withUnsafeBytes(of: &outSize) { outBuf in
+                ane_interop_compile(
+                    milBuf.bindMemory(to: UInt8.self).baseAddress!,
+                    milBuf.count,
+                    nil, nil, nil, 0,
+                    1, inBuf.bindMemory(to: Int.self).baseAddress!,
+                    1, outBuf.bindMemory(to: Int.self).baseAddress!
+                )
+            }
+        }
+    }
+}
+
 private func requireANEAvailable(file: StaticString = #filePath, line: UInt = #line) throws {
     let handle = dlopen("/System/Library/PrivateFrameworks/AppleNeuralEngine.framework/AppleNeuralEngine", RTLD_NOW)
     if handle == nil {
@@ -107,6 +140,30 @@ private func requireANEHardwareTestsEnabled(file: StaticString = #filePath, line
     try requireANEAvailable(file: file, line: line)
 }
 
+private func withEnvironmentValue<T>(
+    key: String,
+    value: String?,
+    file: StaticString = #filePath,
+    line: UInt = #line,
+    _ body: () throws -> T
+) rethrows -> T {
+    let previous = getenv(key)
+    let previousValue = previous.map { String(cString: $0) }
+    if let value {
+        XCTAssertEqual(setenv(key, value, 1), 0, file: file, line: line)
+    } else {
+        XCTAssertEqual(unsetenv(key), 0, file: file, line: line)
+    }
+    defer {
+        if let previousValue {
+            XCTAssertEqual(setenv(key, previousValue, 1), 0, file: file, line: line)
+        } else {
+            XCTAssertEqual(unsetenv(key), 0, file: file, line: line)
+        }
+    }
+    return try body()
+}
+
 final class ANEInteropTests: XCTestCase {
     func test_baseline_classifier_unavailable_when_runtime_is_missing() {
         let status = classifyANEBaseline(runtimeAvailable: false, compileSucceeded: true, evalSucceeded: true)
@@ -121,6 +178,54 @@ final class ANEInteropTests: XCTestCase {
     func test_baseline_classifier_unstable_when_eval_fails() {
         let status = classifyANEBaseline(runtimeAvailable: true, compileSucceeded: true, evalSucceeded: false)
         XCTAssertEqual(status, .unstable)
+    }
+
+    func test_runtime_reports_chaining_support_on_host() throws {
+        try requireANEAvailable()
+        XCTAssertTrue(ane_interop_runtime_has_chaining_request())
+        XCTAssertTrue(ane_interop_runtime_has_prepare_chaining())
+    }
+
+    func test_chaining_probe_stats_surface_mode_defaults_to_scratch() {
+        let key = "ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE"
+        let oldValue = getenv(key).map { String(cString: $0) }
+        defer {
+            if let oldValue {
+                setenv(key, oldValue, 1)
+            } else {
+                unsetenv(key)
+            }
+        }
+
+        unsetenv(key)
+        XCTAssertEqual(
+            ane_interop_chaining_probe_stats_surface_mode(),
+            ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH
+        )
+
+        setenv(key, "null", 1)
+        XCTAssertEqual(
+            ane_interop_chaining_probe_stats_surface_mode(),
+            ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_NULL
+        )
+
+        setenv(key, "output0", 1)
+        XCTAssertEqual(
+            ane_interop_chaining_probe_stats_surface_mode(),
+            ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_OUTPUT0
+        )
+
+        setenv(key, "scratch", 1)
+        XCTAssertEqual(
+            ane_interop_chaining_probe_stats_surface_mode(),
+            ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH
+        )
+
+        setenv(key, "garbage", 1)
+        XCTAssertEqual(
+            ane_interop_chaining_probe_stats_surface_mode(),
+            ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH
+        )
     }
 
     func test_init_idempotent() {
@@ -505,6 +610,66 @@ final class ANEInteropTests: XCTestCase {
             maxAbsDiff = max(maxAbsDiff, abs(output[i] - input[i]))
         }
         XCTAssertLessThanOrEqual(maxAbsDiff, 1e-2)
+    }
+
+    func test_prepare_chaining_probe_identity_kernel_returns_controlled_status() throws {
+        try requireANEHardwareTestsEnabled()
+        guard ane_interop_runtime_has_chaining_request(), ane_interop_runtime_has_prepare_chaining() else {
+            throw XCTSkip("Chaining runtime hooks unavailable on this host")
+        }
+
+        guard let handle = compileMinimalCastKernelHandle() else {
+            XCTFail("ane_interop_compile returned NULL")
+            return
+        }
+        defer { ane_interop_free(handle) }
+
+        var options = ANEInteropChainingProbeOptions(
+            useRealStatsSurface: true,
+            skipPrepare: true,
+            validateRequest: true,
+            useScalarLoopbackSymbolIndices: false,
+            callEnqueueSets: false,
+            callBuffersReady: false,
+            requestProcedureIndex: 0,
+            requestTransactionHandle: 0,
+            requestFWEnqueueDelay: 0,
+            requestMemoryPoolId: 0,
+            enqueueProcedureIndex: 0,
+            enqueueSetIndex: 0,
+            enqueueSignalValue: 0,
+            enqueueSignalNotRequired: true,
+            enqueueOpenLoop: false,
+            readyProcedureIndex: 0,
+            readyExecutionDelay: 0,
+            useSharedSignalEvent: false,
+            sharedSignalEventValue: 1,
+            sharedSignalEventSymbolIndex: 0,
+            sharedSignalEventType: 0
+        )
+        var result = ANEInteropChainingProbeResult()
+        ane_interop_probe_chaining_with_options(handle, &options, &result)
+        XCTAssertNotEqual(result.stage, Int32(ANE_INTEROP_CHAINING_STAGE_EXCEPTION.rawValue))
+        XCTAssertNotEqual(result.stage, Int32(ANE_INTEROP_CHAINING_STAGE_UNAVAILABLE.rawValue))
+
+        if result.hasOutputSetsFactory {
+            XCTAssertTrue(result.builtOutputSet, "expected _ANEIOSurfaceOutputSets builder to succeed when factory is present")
+            XCTAssertNotEqual(
+                result.stage,
+                Int32(ANE_INTEROP_CHAINING_STAGE_OUTPUT_SETS_BUILD_FAILED.rawValue),
+                "probe should advance past the output-set builder stage"
+            )
+        }
+
+        XCTAssertTrue(result.usedRealStatsSurface)
+        XCTAssertTrue(result.builtRequest)
+        XCTAssertTrue(result.requestValidated)
+        XCTAssertTrue(result.requestValid)
+        XCTAssertTrue(
+            result.stage == Int32(ANE_INTEROP_CHAINING_STAGE_PREPARE_SKIPPED.rawValue) ||
+            result.stage == Int32(ANE_INTEROP_CHAINING_STAGE_REQUEST_VALIDATE_FAILED.rawValue),
+            "unexpected chaining probe stage: \(result.stage)"
+        )
     }
 
     func test_compile_count_increments() throws {

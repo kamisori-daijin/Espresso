@@ -52,7 +52,77 @@ Goal: deliver maximum defensible ANE decode throughput and best-justified prefil
     - eval still falls through to `statusType=0x9: Program Inference error`
   - Targeted hardware tests show only the undersized-surface rejection is valid; actual rebinding is unsafe on this host/runtime.
   - Verdict: `ABANDON` this request-rebuild surface-rebinding approach and revert it immediately.
-- [ ] D5: Investigate `_ANEChainingRequest` / `prepareChainingWithModel` as the next decode dispatch-reduction candidate instead of request-level surface rebinding
+- [x] D5: Investigate `_ANEChainingRequest` / `prepareChainingWithModel` as the next decode dispatch-reduction candidate instead of request-level surface rebinding
+  Review:
+  - Added interop-level support probes:
+    - `ane_interop_runtime_has_chaining_request()`
+    - `ane_interop_runtime_has_prepare_chaining()`
+    - `ane_interop_probe_prepare_chaining(...)`
+  - Added TDD first in `ANEInteropTests`:
+    - `test_runtime_reports_chaining_support_on_host`
+    - `test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+  - Probe outcome on this host:
+    - `_ANEChainingRequest` factory exists
+    - `_ANEClient prepareChainingWithModel:options:chainingReq:qos:error:` exists
+    - minimal chaining request builds successfully
+    - retrying with a live `_ANEIOSurfaceOutputSets` object created from the current output surfaces still fails the same way
+    - `prepareChainingWithModel` returns failure immediately with no `NSError`
+  - Evidence:
+    - `ANE_HARDWARE_TESTS=1 swift test --filter ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+    - traced rerun with `ANE_INTEROP_TRACE=1` reports `ANE prepareChaining failed: no error`
+  - Verdict: `ITERATE`. The primitive exists, but naive empty `outputSets` / loopback wiring is insufficient. Do not wire decode to chaining until the correct output-set contract is understood.
+- [ ] D5b: Derive a valid `_ANEIOSurfaceOutputSets` / loopback contract for chaining and only then retry decode dispatch collapse
+  - [ ] D5b.1: Record host-visible builder/type encodings for `_ANEIOSurfaceOutputSets`, `_ANEOutputSetEnqueue`, and `_ANEInputBuffersReady`
+  - [x] D5b.2: Expand the chaining probe to build typed helper objects and report their construction status separately from `_ANEChainingRequest.validate()` and `prepareChainingWithModel`
+    Review:
+    - Probe now builds `_ANEIOSurfaceOutputSets`, `_ANEOutputSetEnqueue`, `_ANEInputBuffersReady`, validates the helper/request objects, and records structured client-call outcomes for `buffersReadyWithModel` and `enqueueSetsWithModel`.
+    - Hardware evidence: `/tmp/decode_d5b_buffers_ready_trace_20260306.txt`, `/tmp/decode_d5b_enqueue_trace_20260306.txt`.
+    - Result: proper typed helper objects removed the earlier raw-array exception path, but both client sequencing calls still fail cleanly with no `NSError`, so the remaining blocker is semantic contract rather than object type.
+  - [x] D5b.3: Move risky `prepareChainingWithModel` experiments behind a timeout-safe isolated probe before reintroducing non-NULL `statsSurRef` in-process
+  Review:
+  - Added isolated `espresso-bench --probe-chaining-prepare` path and used it to keep `prepareChainingWithModel` experiments out of the test harness / decode runtime.
+  - Initial timeouts were a spawned-process reproducibility bug, not a new chaining stage: the external probe process was missing `ESPRESSO_BENCH_SEED=1` and `ANE_COMPILE_CACHE_POLICY=preferCached`, so it could stall before the compile checkpoint.
+  - Deterministic external evidence now shows `/tmp/d5b_probe_prepare_output0_20260306` completes quickly and lands at `PREPARE_FAILED` (`stage=3`) with a fully built/validated request graph.
+  - Verdict: keep all further chaining-contract work isolated; the remaining blocker is the prepare semantic contract, not external harness stability.
+- [x] D5b.4: Run hardware-gated chaining probes and only benchmark decode if the probe reaches a new valid stage beyond the current prepare-failed baseline
+  Review:
+  - Targeted verification:
+    - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_prepare_probe_isolated_from_test_harness`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_buffers_ready_probe_records_controlled_client_call`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_enqueue_sets_probe_records_controlled_client_call`
+    - `swift test --filter ANEInteropTests.ANEChainingProbeConfigTests`
+  - Manual artifact-backed control-plane results with deterministic env:
+    - `/tmp/d5b_probe_prepare_output0_20260306` -> `stage=3` (`PREPARE_FAILED`)
+    - `/tmp/d5b_probe_buffers_ready_output0_20260306` -> `stage=11` (`INPUT_BUFFERS_READY_CALL_FAILED`)
+    - `/tmp/d5b_probe_enqueue_sets_output0_20260306` -> `stage=13` (`ENQUEUE_SETS_CALL_FAILED`)
+  - Attribution:
+    - object construction and request validation now succeed consistently
+    - client sequencing calls fail quickly and cleanly with no `NSError`
+    - no `hwExecutionTime` is available on this host/runtime
+  - Decode before/after metrics: `N/A` for this cycle. No decode benchmark was run because the probe did not advance to a new valid stage beyond the current `PREPARE_FAILED` baseline.
+  - Verdict: `ITERATE`. The remaining D5b unknown is the semantic/ordering contract around loopback ids and `prepareChainingWithModel`, not helper-object typing or external harness isolation.
+- [x] D5b.5: Sweep request/helper metadata and shared signal-event variants before abandoning the current isolated chaining branch
+  Review:
+  - Added probe support and TDD for request metadata overrides, helper metadata overrides, and `_ANESharedSignalEvent` injection backed by `IOSurfaceSharedEvent`.
+  - Verification:
+    - `swift test`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingInteropTests/test_chaining_probe_enqueue_metadata_overrides_return_controlled_status`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingInteropTests/test_external_enqueue_sets_probe_records_metadata_overrides`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingInteropTests/test_chaining_probe_shared_signal_event_enqueue_returns_controlled_status`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingInteropTests/test_external_shared_signal_event_probe_records_metadata_overrides`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests/test_decode_probe_passthrough_4in_3out_eval`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_cache_updates_and_mask_progresses_on_hardware`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_mask_progresses_across_tile_boundaries_on_hardware`
+  - Manual isolated artifacts:
+    - prepare sweep: `/tmp/d5b_prepare_base_output0`, `/tmp/d5b_prepare_base_scratch`, `/tmp/d5b_prepare_req_proc1_output0`, `/tmp/d5b_prepare_req_combo_output0`, `/tmp/d5b_prepare_req_combo_scratch`
+    - helper sweep: `/tmp/d5b_enqueue_base`, `/tmp/d5b_enqueue_sig1_req`, `/tmp/d5b_enqueue_open_loop`, `/tmp/d5b_enqueue_proc1_combo`, `/tmp/d5b_buffers_base`, `/tmp/d5b_buffers_delay1`, `/tmp/d5b_buffers_proc1_delay1`
+    - shared-signal sweep: `/tmp/d5b_prepare_sharedsig_t0`, `/tmp/d5b_prepare_sharedsig_t1`, `/tmp/d5b_prepare_sharedsig_t0_tx1`, `/tmp/d5b_prepare_sharedsig_t1_tx1`, `/tmp/d5b_enqueue_sharedsig_match`
+  - Outcome:
+    - request metadata did not move `prepare` off `stage=3`
+    - helper metadata did not move `enqueueSets` off `stage=13` or `buffersReady` off `stage=11`
+    - `_ANESharedSignalEvent` now builds cleanly, but non-empty `signalEvents` still leave `prepare` at `stage=3` and `enqueueSets` at `stage=13`
+  - Decode before/after metrics: `N/A` because no probe advanced beyond the current prepare-failed baseline.
+  - Verdict: `ABANDON` this isolated D5b metadata/signal-event branch. The next unexplored dispatch-reduction path is `_ANERequest sharedEvents` / `_ANEVirtualClient ... completionEvent:` rather than more chaining metadata tweaks.
 - [ ] D6: Re-run decode tiling/contract expansion probes only after the best dispatch-reduction path is stable
 
 ### Decode Boundary + Contract Follow-Ups (2026-03-06)
@@ -845,3 +915,122 @@ Goal: maximize advantage vs Core ML by eliminating structural overhead (dispatch
 ### Next up
 - [ ] Build a minimal `_ANEChainingRequest` proof-of-life in the interop layer.
 - [ ] Only if the primitive works on hardware, thread it into decode behind a flag and benchmark.
+
+## 2026-03-06 D5b.1 checkpoint
+- [x] Measure decode baseline first and save it to Wax (`/tmp/decode_d5b_baseline_quick_20260306`)
+- [x] Add guarded chaining probe instrumentation and per-layer decode telemetry
+- [x] Add targeted chaining hardware tests and preserve decode parity in probe mode
+- [x] Run required test gates
+- [x] Run quick probe benchmark (`/tmp/decode_d5b_probe_quick_20260306`)
+- [x] Record verdict and artifacts in Wax
+- [ ] Derive the valid `_ANEIOSurfaceOutputSets` builder contract; current path fails at stage 1 (`OUTPUT_SETS_BUILD_FAILED`)
+- [ ] Derive and test `_ANEOutputSetEnqueue` + `_ANEInputBuffersReady` construction using traced selectors and type encodings
+- [ ] Re-benchmark only after prepare/enqueue/buffers-ready succeeds without changing decode outputs
+
+### Review
+- Probe mode is safe and measurable but not a performance win.
+- The current builder path regresses median decode latency by `+4.95%` and throughput by `-4.72%` vs baseline.
+- Dispatch counts remain `1/1` per layer and no chaining prepare succeeds, so this cycle is pure contract discovery, not dispatch reduction.
+
+## 2026-03-06 D5b.2 plan
+- [x] Adopt external object-only probe evidence:
+  - `_ANEIOSurfaceOutputSets.objectWithstatsSurRef:outputBuffer:` requires a non-`NULL` `statsSurRef`
+  - `_ANEChainingRequest` can already be built with wrapped input/output objects and boxed-zero metadata
+- [ ] Add a safe hardware test for real-`statsSurRef` output-set construction without calling `prepareChainingWithModel`
+- [ ] Add a timeout-safe external prepare probe path so risky chaining prepare calls run outside `xctest`
+- [ ] Keep the in-process decode probe on the current safe contract by default
+- [ ] Run targeted tests for the object-only path and the external probe harness before any benchmark work
+
+### D5b.2 review
+- Object construction is no longer the blind spot; the remaining unknown is whether `prepareChainingWithModel` can return a controlled status once a real `statsSurRef` is supplied, or whether the single-procedure/loopback semantics still wedge the runtime.
+- The next cycle must preserve test determinism. Any active prepare attempt belongs in an external process with a hard timeout, not in the normal hardware test path.
+
+## 2026-03-06 D5b.2 stats-surref builder probe
+- [ ] Record the direct runtime builder evidence in Wax and the decision log
+- [ ] Tighten chaining hardware tests so `_ANEIOSurfaceOutputSets` must build and the probe must advance beyond `OUTPUT_SETS_BUILD_FAILED`
+- [ ] Change only the probe path to allocate a non-null scratch `statsSurRef` for `_ANEIOSurfaceOutputSets`
+- [ ] Run required test gates
+- [ ] Run one sequential quick decode benchmark with `ESPRESSO_DECODE_CHAIN_MODE=probe`
+- [ ] Classify `SHIP` / `ITERATE` / `ABANDON`, update docs/Wax, and only benchmark further if prepare advances cleanly
+
+### Why
+- Runtime property introspection on this host shows `_ANEIOSurfaceOutputSets.outputBuffer` is typed as `NSArray`, so the current wrapped-output array shape is plausible.
+- A direct out-of-repo runtime probe showed `objectWithstatsSurRef:outputBuffer:` returns `nil` with `statsSurRef=NULL` and succeeds with a non-null scratch IOSurface while keeping the same `NSArray` output buffer.
+
+## 2026-03-06 D5b.2 checkpoint
+- [x] Pull external ANE reverse-engineering ground truth (`/tmp/ANE`, `/tmp/ANEgpt`) and compare chaining/runtime signatures
+- [x] Standalone runtime probe confirms `_ANEIOSurfaceOutputSets.objectWithstatsSurRef:outputBuffer:` returns `nil` when `statsSurRef == NULL`
+- [x] Record the builder-contract finding in Wax session memory
+- [x] Narrow next hypothesis: provide a non-null `statsSurRef` in the chaining probe and measure whether the stage advances beyond `OUTPUT_SETS_BUILD_FAILED`
+- [x] Add targeted tests first for the non-null `statsSurRef` builder path
+- [x] Attempt probe-only `statsSurRef` wiring with chaining still disabled by default
+- [x] Abort and roll back the in-process `statsSurRef` prepare attempt after it wedges the hardware harness
+- [x] Preserve external object-only artifacts:
+  - `/tmp/decode_d5b_object_probe_20260306.txt`
+  - `/tmp/decode_d5b_request_probe_20260306.txt`
+- [ ] Add failing tests for a timeout-safe isolated prepare probe and safe probe invariants
+- [ ] Implement isolated `prepareChainingWithModel` probe plumbing so the risky call runs out-of-process
+- [ ] Run required test gates on the isolated probe path
+- [ ] Update decision log, review notes, and Wax with verdict/artifacts
+
+### Why
+- The current D5b blocker is no longer “chaining exists?” but the narrower `_ANEIOSurfaceOutputSets` construction contract.
+- Standalone object-only probes proved the missing precondition (`statsSurRef != NULL`) and also showed that `_ANEInputBuffersReady`, `_ANEOutputSetEnqueue`, and `_ANEChainingRequest` can all be constructed on this host.
+- The direct in-process follow-on step is unsafe on this runtime because `prepareChainingWithModel` can wedge xctest when given a partially valid object graph.
+- The smallest defensible next step is therefore an isolated probe that can fail or time out without contaminating the main test process.
+
+## 2026-03-06 D5b.3 isolated sequencing checkpoint
+- [x] Confirm the isolated external `prepareChainingWithModel` path with deterministic seed and preserved artifact
+- [x] Expose isolated bench flags for `buffersReadyWithModel` and `enqueueSetsWithModel`
+- [x] Add hardware-gated external tests for both isolated sequencing calls
+- [x] Repair the in-process identity test so it explicitly requests the `NULL` stats-surface safety path instead of depending on the runtime default
+- [x] Run targeted hardware verification:
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_prepare_probe_isolated_from_test_harness`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_buffers_ready_probe_records_controlled_client_call`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_enqueue_sets_probe_records_controlled_client_call`
+  - `swift test --filter ANEInteropTests.ANEChainingProbeConfigTests`
+- [ ] Restore a reliable full-class `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests` gate
+- [x] Capture deterministic external artifacts:
+  - `/tmp/d5b_probe_prepare_output0_20260306`
+  - `/tmp/d5b_probe_buffers_ready_output0_20260306`
+  - `/tmp/d5b_probe_enqueue_sets_output0_20260306`
+- [ ] Externalize scalar loopback-id variants so the next iteration can compare array vs scalar loopback semantics out of process
+- [ ] Retry the isolated prepare path with the best next loopback/sequence variant only after the external scalar artifact exists
+
+### D5b.3 review
+- `prepareChainingWithModel` is now a fast, controlled external failure rather than a harness timeout:
+  - `/tmp/d5b_probe_prepare_output0_20260306`
+  - compile `21.105 ms`, probe `0.589 ms`, `stage=3` (`PREPARE_FAILED`)
+- `buffersReadyWithModel` fails quickly with a typed helper object instead of throwing selector/array-shape exceptions:
+  - `/tmp/d5b_probe_buffers_ready_output0_20260306`
+  - compile `30.979 ms`, probe `0.075 ms`, `stage=11` (`INPUT_BUFFERS_READY_CALL_FAILED`)
+- `enqueueSetsWithModel` also fails quickly with the typed helper object:
+  - `/tmp/d5b_probe_enqueue_sets_output0_20260306`
+  - compile `30.816 ms`, probe `0.066 ms`, `stage=13` (`ENQUEUE_SETS_CALL_FAILED`)
+- Attribution:
+  - Builder/object typing is no longer the primary D5b blocker on this host.
+  - The remaining gap is semantic: loopback symbol ids, call ordering, and/or additional contract state expected by the runtime.
+  - `hwExecutionTime` remains unavailable for this probe path.
+- Verification note:
+  - A fresh full-class rerun of `ANERuntimeTests.DecodeChainingInteropTests` still wedges in the in-process hardware path and had to be terminated. The reliable gate for this cycle is the targeted external-process tests above, not the full class.
+- Verdict: `ITERATE`
+- Rollback status: not needed; all new behavior is isolated behind explicit `espresso-bench` probe flags and targeted tests.
+
+## 2026-03-06 D5b.3 external control-plane checkpoint
+- [x] Propagate deterministic spawned-process env into isolated probe tests (`ESPRESSO_BENCH_SEED=1`, `ANE_COMPILE_CACHE_POLICY=preferCached`)
+- [x] Re-run the external prepare probe under deterministic settings
+- [x] Re-run the external `buffersReadyWithModel` probe under deterministic settings
+- [x] Re-run the external `enqueueSetsWithModel` probe under deterministic settings
+- [x] Record manual artifact dirs and controlled stages in Wax
+- [x] Skip decode benchmarking because no probe advanced past the current prepare-failed baseline
+
+### Review
+- What changed:
+  - The external probe harness now runs spawned `espresso-bench` processes with the same deterministic seed/cache policy used for benchmark work.
+- What worked:
+  - Deterministic spawned-process env removed the false timeout signal and made all three external probes finish quickly with machine-readable summaries.
+- What did not work:
+  - `prepareChainingWithModel` still failed (`stage=3`), `buffersReadyWithModel` still failed (`stage=11`), and `enqueueSetsWithModel` still failed (`stage=13`) despite valid helper objects and request validation.
+- Why:
+  - The previous timeout was compile-policy noise in the spawned process, not proof of a runtime wedge in the sequencing calls.
+  - With compile jitter removed, the failure frontier is now clearly inside the private chaining semantics rather than object construction.

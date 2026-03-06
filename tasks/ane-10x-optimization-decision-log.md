@@ -1,9 +1,9 @@
 # ANE 10x Optimization Decision Log
 
 Date: 2026-03-06  
-Repo/worktree: `/private/tmp/espresso-mainworktree-clean`  
-Branch: `feat/ane-10x-max`  
-Latest commit at time of this document: `13d21df`
+Repo/worktree: `/private/tmp/espresso-ane-max-20260306`  
+Branch: `feat/ane-10x-max-iter-20260306`  
+Latest commit at time of this document: `4a0a6fb`
 
 ---
 
@@ -61,6 +61,11 @@ Main benchmark commands used:
 | A19 | Direct decode boundary spatial-slice I/O (`attnIn` write + final `ffnOut` read) | Remove the extra `tokenScratch` boundary hops while keeping the proven two-kernel decode contract unchanged | `/tmp/decode_boundary_before_max128_confirm_r{1,2,3}_20260306`, `/tmp/decode_boundary_after_max128_confirm_r{1,2,3}_20260306` | Small but repeatable decode gain at `maxSeq=128`: median-of-medians `0.485209 -> 0.483041 ms/token` (`-0.45%`), throughput `2042.7 -> 2052.3 tok/s`, p95 slightly better, p99 effectively flat. Attribution is I/O-only: surface I/O `0.031336 -> 0.029447 ms/token`, ANE kernel time essentially flat. | **SHIP** |
 | A20 | Lane-spatial sweep re-check at `maxSeq=128` (`32`, `64`, `128`) | Test whether wider lane windows reduce enough tile-sync overhead to outweigh the extra surface footprint | `/tmp/decode_lane_sweep_max128_l32_quick_20260306`, `/tmp/decode_lane_sweep_max128_l64_quick_20260306`, `/tmp/decode_lane_sweep_max128_l128_quick_20260306` | Current decode contract still prefers `laneSpatial=32`. Wider lanes regressed median (`0.493250 -> 0.499916 -> 0.505333 ms`) and throughput (`1991.6 -> 1962.7 -> 1957.4 tok/s`). | **ABANDON** |
 | A21 | Decode mask-collapse probe (`dense mask` channels `768 -> 1`) | Reduce mask bandwidth and surface footprint on every token/layer update | Hardware tests + reverted local probe; no benchmark artifact shipped because eval failed before perf measurement | One-channel decode mask variants fail on this host/runtime with the same `statusType=0x9` ANE inference error family already seen in unsupported probe shapes. The dense 768-channel mask remains the stable contract. | **ABANDON** |
+| A22 | `_ANEChainingRequest` / `prepareChainingWithModel` proof-of-life probe | The remaining high-ROI decode lever is dispatch collapse, so first prove whether the private chaining primitive is callable on this host before attempting decode integration | Targeted tests: `ANEInteropTests/test_runtime_reports_chaining_support_on_host`, `ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`; traced reruns with `ANE_INTEROP_TRACE=1`; live runtime dump of `_ANEIOSurfaceOutputSets` | Runtime hooks are present and a minimal chaining request can be constructed, but `prepareChainingWithModel` immediately returns failure with no `NSError` on a minimal compiled kernel. Retrying with a live `_ANEIOSurfaceOutputSets` object created from the current output surfaces still fails identically. The primitive exists, but naive output-set and loopback wiring is insufficient. | **ITERATE** |
+| A23 | Output-set contract refinement for chaining probe (`statsSurRef=output0`) + isolated external prepare probe | Determine whether the missing D5b contract is in output-set construction or deeper in `prepareChainingWithModel` sequencing | `/tmp/decode_d5b_output0_smoke_20260306`, `/tmp/d5b_probe_prepare_output0_20260306`, `/tmp/decode_d5b_object_probe_20260306.txt`, `/tmp/decode_d5b_request_probe_20260306.txt`, `/tmp/decode_d5b_signature_trace_20260306.txt` | Using `output0` as the stats surface moves the probe cleanly past builder validation and into a fast external `prepareChainingWithModel` failure. Latest isolated artifact `/tmp/d5b_probe_prepare_output0_20260306` completed without hang: compile `21.105 ms`, probe `0.589 ms`, `built_output_set=true`, `built_request=true`, `request_valid=true`, `prepared=false`, `stage=3` (`PREPARE_FAILED`). This removes harness timeout as the primary blocker; the remaining unknown is the semantic contract that `prepareChainingWithModel` expects after a valid request graph is built. | **ITERATE** |
+| A24 | Typed client sequencing probes for `buffersReadyWithModel` and `enqueueSetsWithModel` | Determine whether the remaining D5b blocker is still object-shape mismatch or a deeper loopback / prepare semantic contract | `/tmp/decode_d5b_buffers_ready_trace_20260306.txt`, `/tmp/decode_d5b_enqueue_trace_20260306.txt`, `/tmp/d5b_probe_buffers_ready_output0_20260306`, `/tmp/d5b_probe_enqueue_sets_output0_20260306` | Both client sequencing calls now have isolated bench artifacts and return fast controlled failures rather than selector/array-shape exceptions. Latest `buffersReadyWithModel` artifact `/tmp/d5b_probe_buffers_ready_output0_20260306`: compile `30.979 ms`, probe `0.075 ms`, `called_buffers_ready=true`, `buffers_ready_succeeded=false`, `stage=11` (`INPUT_BUFFERS_READY_CALL_FAILED`). Latest `enqueueSetsWithModel` artifact `/tmp/d5b_probe_enqueue_sets_output0_20260306`: compile `30.816 ms`, probe `0.066 ms`, `called_enqueue_sets=true`, `enqueue_sets_succeeded=false`, `stage=13` (`ENQUEUE_SETS_CALL_FAILED`). Object typing is no longer the blocker; the remaining gap is the deeper loopback symbol / sequencing semantic contract. | **ITERATE** |
+| A25 | Deterministic spawned-process env propagation for isolated chaining probes | External hardware-gated probe tests were reporting false timeouts because the spawned `espresso-bench` process was not inheriting the required deterministic seed/cache policy, so compile jitter could mask the real chaining stage | `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_prepare_probe_isolated_from_test_harness`, `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_buffers_ready_probe_records_controlled_client_call`, `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests.DecodeChainingInteropTests/test_external_enqueue_sets_probe_records_controlled_client_call`, `swift test --filter ANEInteropTests.ANEChainingProbeConfigTests`, `/tmp/d5b_probe_prepare_output0_20260306`, `/tmp/d5b_probe_buffers_ready_output0_20260306`, `/tmp/d5b_probe_enqueue_sets_output0_20260306` | After forcing spawned probe processes to run with `ESPRESSO_BENCH_SEED=1` and `ANE_COMPILE_CACHE_POLICY=preferCached`, all isolated external probes completed quickly and reproducibly. Latest manual artifacts: prepare compile/probe `21.105/0.589 ms` at `stage=3`, buffersReady compile/probe `30.979/0.075 ms` at `stage=11`, enqueueSets compile/probe `30.816/0.066 ms` at `stage=13`. All helper objects and request validation remained green; `hwExecutionTime` stayed unavailable. Decode before/after metrics are `N/A` for this cycle because no probe advanced beyond the current prepare-failed baseline, so no decode benchmark was justified. | **ITERATE** |
+| A26 | D5b metadata sweep + shared-signal-event injection on isolated chaining probe | Exhaust the obvious semantic knobs before abandoning the current D5b contract branch: request metadata (`procedureIndex`, `transactionHandle`, `fwEnqueueDelay`, `memoryPoolId`), helper metadata (`enqueueSets`, `buffersReady`), and non-empty `signalEvents` via `_ANESharedSignalEvent` + `IOSurfaceSharedEvent` | `/tmp/d5b_prepare_base_output0`, `/tmp/d5b_prepare_base_scratch`, `/tmp/d5b_prepare_req_proc1_output0`, `/tmp/d5b_prepare_req_combo_output0`, `/tmp/d5b_prepare_req_combo_scratch`, `/tmp/d5b_enqueue_base`, `/tmp/d5b_enqueue_sig1_req`, `/tmp/d5b_enqueue_open_loop`, `/tmp/d5b_enqueue_proc1_combo`, `/tmp/d5b_buffers_base`, `/tmp/d5b_buffers_delay1`, `/tmp/d5b_buffers_proc1_delay1`, `/tmp/d5b_prepare_sharedsig_t0`, `/tmp/d5b_prepare_sharedsig_t1`, `/tmp/d5b_prepare_sharedsig_t0_tx1`, `/tmp/d5b_prepare_sharedsig_t1_tx1`, `/tmp/d5b_enqueue_sharedsig_match` | Every new probe preserved object construction and request validity, but the runtime stayed on the same failure stages: `prepareChainingWithModel` remained `stage=3`, `enqueueSetsWithModel` remained `stage=13`, and `buffersReadyWithModel` remained `stage=11`. Shared signal-event construction now works (`built_shared_signal_event=true`, class present), but non-empty `signalEvents` still do not change the contract outcome. Decode before/after metrics are `N/A` because no probe advanced past the existing prepare-failed baseline. This strongly suggests the missing D5b contract is deeper than simple metadata or signal-event presence. | **ABANDON** (for this D5b branch) |
 
 ---
 
@@ -126,6 +131,24 @@ Interpretation:
 - This is a real but small decode improvement.
 - The gain comes from boundary I/O reduction only; it does not materially change ANE eval cost.
 - That makes it worth shipping, but it also reinforces that boundary-copy trimming alone will not get decode anywhere near the 6x target.
+
+5) Chaining proof-of-life probe (`_ANEChainingRequest`, 2026-03-06):
+- Tests:
+  - `swift test --filter ANEInteropTests/test_runtime_reports_chaining_support_on_host`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+  - traced rerun: `ANE_HARDWARE_TESTS=1 ANE_INTEROP_TRACE=1 swift test --filter ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+- Outcome:
+  - runtime support checks return true for both:
+    - `_ANEChainingRequest` factory
+    - `_ANEClient prepareChainingWithModel:options:chainingReq:qos:error:`
+  - probe status: `ANE_INTEROP_CHAINING_PROBE_PREPARE_FAILED`
+  - traced error: `ANE prepareChaining failed: no error`
+  - live runtime introspection found `_ANEIOSurfaceOutputSets.objectWithstatsSurRef:outputBuffer:`
+  - retrying the probe with a real `_ANEIOSurfaceOutputSets` object still returns `ANE_INTEROP_CHAINING_PROBE_PREPARE_FAILED`
+Interpretation:
+- The chaining primitive is present and the request factory is callable on this host.
+- A naive request with empty `outputSets` / loopback metadata is not enough to prepare chaining successfully, and simply attaching the current outputs via `_ANEIOSurfaceOutputSets` is still insufficient.
+- This is progress because it narrows the next task from “does chaining exist?” to “what exact output-set/loopback contract does the runtime expect?”
 
 4) Strict fairness snapshot after A13 (`maxSeq=128`):
 - Artifact: `/tmp/decode_syncopt_coreml_max128_20260305`
@@ -352,6 +375,18 @@ Prefill profile run:
   - Interpretation:
     - the dense-mask contract is not just conservative; it is currently the stable decode contract on this host/runtime
   - Decision: `ABANDON`.
+- Chaining proof-of-life did not yield an immediately usable dispatch-collapse path:
+  - Evidence:
+    - `swift test --filter ANEInteropTests/test_runtime_reports_chaining_support_on_host`
+    - `ANE_HARDWARE_TESTS=1 swift test --filter ANEInteropTests/test_prepare_chaining_probe_identity_kernel_returns_controlled_status`
+  - Outcome:
+    - support hooks are present
+    - request creation succeeds
+    - `prepareChainingWithModel` fails immediately with no `NSError`
+  - Interpretation:
+    - the chaining path is not dead, but the runtime contract is stricter than a naive empty `outputSets` / loopback request
+    - the next step is contract discovery, not decode integration
+  - Decision: `ITERATE`.
 - Decode compile-time external surface aliasing was discarded before benchmarking:
   - Scope attempted:
     - added a surface-aware compile path so kernels could be built against externally supplied IOSurfaces
@@ -400,4 +435,53 @@ Inference: strict decode/prefill regression assessment must be done against the 
 - Prefill large multi-x gains are unlikely on this host path without a meaningful reduction in host eval overhead; short-term expectation is parity-to-modest gains, not 3–6x.
 
 ### Next queued experiment
-- Build a minimal `_ANEChainingRequest` / `prepareChainingWithModel` proof-of-life in the interop layer and validate it on hardware before touching decode hot-path code again.
+- Discover a valid `_ANEIOSurfaceOutputSets` / loopback contract for `_ANEChainingRequest`, then retry `prepareChainingWithModel` before attempting any decode hot-path integration.
+
+## 2026-03-06 D5b.1 chaining probe instrumentation and output-set contract probe
+- What changed: added guarded chaining probe interop for `_ANEChainingRequest`, `_ANEIOSurfaceOutputSets`, `_ANEOutputSetEnqueue`, `_ANEInputBuffersReady`, decode chain mode parsing (`off|probe|active`), cached per-layer chaining telemetry, and hardware-gated probe/parity tests.
+- Why: remaining decode headroom is structural dispatch overhead; before attempting active chaining, the runtime contract had to be proven on-host with exact failure-stage attribution.
+- Baseline artifact: `/tmp/decode_d5b_baseline_quick_20260306`
+  - mean `0.49792389636718942 ms/token`
+  - median `0.491 ms/token`
+  - p95 `0.55779310000000004 ms`
+  - p99 `0.7090016699999997 ms`
+  - throughput `2008.3390399535256 tok/s`
+  - attribution: ANE `0.40413455078124882 ms/token`, I/O `0.029949075520833195 ms/token`, `hwExecutionTime` unavailable
+- Candidate artifact: `/tmp/decode_d5b_probe_quick_20260306`
+  - mean `0.52260036476562888 ms/token`
+  - median `0.51529199999999997 ms/token`
+  - p95 `0.57737704999999995 ms`
+  - p99 `0.71475041999999989 ms`
+  - throughput `1913.5080406009113 tok/s`
+  - attribution: ANE `0.40506215657552191 ms/token`, I/O `0.028672052408853656 ms/token`, `hwExecutionTime` unavailable
+- Delta vs baseline:
+  - mean `+4.95%`
+  - median `+4.95%`
+  - p95 `+3.51%`
+  - p99 `+0.81%`
+  - throughput `-4.72%`
+- Probe telemetry:
+  - artifact: `/tmp/decode_d5b_probe_quick_20260306/summary.json`
+  - `decode_chain_mode=probe`
+  - layer 0 `attn_dispatch_count_avg=1`
+  - layer 0 `ffn_dispatch_count_avg=1`
+  - layer 0 `chaining_probe_us_avg=0.073626302083339507`
+  - layer 0 `chaining_stage_last=1`
+  - layer 0 `chaining_prepare_successes=0`
+  - layer 0 `chaining_fallbacks=0`
+  - stage `1` maps to `ANE_INTEROP_CHAINING_STAGE_OUTPUT_SETS_BUILD_FAILED`
+- Additional discovery artifacts:
+  - `/tmp/decode_d5b_probe_trace_20260306.txt`
+  - `/tmp/decode_d5b_client_trace_20260306.txt`
+  - `/tmp/decode_d5b_signature_trace_20260306.txt`
+- Tests:
+  - `swift test`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingInteropTests/test_chaining_probe_identity_kernel_returns_controlled_status`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingTests/test_decode_probe_mode_preserves_two_layer_outputs_on_hardware`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter ANERuntimeTests/test_decode_probe_passthrough_4in_3out_eval`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_cache_updates_and_mask_progresses_on_hardware`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter InferenceOptimizationTests/test_decode_kv_mask_progresses_across_tile_boundaries_on_hardware`
+- Verdict: `ABANDON` for the current `_ANEIOSurfaceOutputSets.objectWithstatsSurRef:outputBuffer:` builder path. `ITERATE` on D5b overall.
+- Commit SHA: none yet; no confirmed gain to ship.
+- Rollback status: no rollback needed; chaining remains disabled by default behind `ESPRESSO_DECODE_CHAIN_MODE`.
+- Next step: derive the real `_ANEIOSurfaceOutputSets` / `_ANEOutputSetEnqueue` / `_ANEInputBuffersReady` object contract from the traced method names and type encodings before trying active chaining.

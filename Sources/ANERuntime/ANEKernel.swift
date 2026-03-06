@@ -2,6 +2,33 @@ import Foundation
 import ANEInterop
 import IOSurface
 
+public struct ANEChainingProbe: Sendable {
+    public let hasChainingRequestClass: Bool
+    public let hasPrepareSelector: Bool
+    public let hasOutputSetsClass: Bool
+    public let hasOutputSetsFactory: Bool
+    public let hasOutputSetEnqueueClass: Bool
+    public let hasInputBuffersReadyClass: Bool
+    public let hasSharedSignalEventClass: Bool
+    public let builtOutputSet: Bool
+    public let builtOutputSetEnqueue: Bool
+    public let builtInputBuffersReady: Bool
+    public let builtSharedSignalEvent: Bool
+    public let builtRequest: Bool
+    public let usedArrayLoopbackSymbolIndices: Bool
+    public let usedRealStatsSurface: Bool
+    public let requestValidated: Bool
+    public let requestValid: Bool
+    public let requestValidationFailed: Bool
+    public let inputBuffersReadyValidationFailed: Bool
+    public let calledEnqueueSets: Bool
+    public let enqueueSetsSucceeded: Bool
+    public let calledBuffersReady: Bool
+    public let buffersReadySucceeded: Bool
+    public let prepared: Bool
+    public let stage: Int
+}
+
 public struct ANEKernel: ~Copyable {
     private enum CompileGate {
         static let lock = NSLock()
@@ -178,6 +205,82 @@ public struct ANEKernel: ~Copyable {
     /// Returns `0` when perf stats are disabled (default) or unsupported on this host.
     public func lastHWExecutionTimeNS() -> UInt64 {
         ane_interop_last_hw_execution_time_ns(handle)
+    }
+
+    public func chainingProbe(
+        useRealStatsSurface: Bool = false,
+        skipPrepare: Bool = false,
+        validateRequest: Bool = true,
+        useScalarLoopbackSymbolIndices: Bool = false,
+        callEnqueueSets: Bool = false,
+        callBuffersReady: Bool = false,
+        requestProcedureIndex: UInt32 = 0,
+        requestTransactionHandle: UInt64 = 0,
+        requestFWEnqueueDelay: UInt64 = 0,
+        requestMemoryPoolId: UInt64 = 0,
+        enqueueProcedureIndex: UInt32 = 0,
+        enqueueSetIndex: UInt32 = 0,
+        enqueueSignalValue: UInt64 = 0,
+        enqueueSignalNotRequired: Bool = true,
+        enqueueOpenLoop: Bool = false,
+        readyProcedureIndex: UInt32 = 0,
+        readyExecutionDelay: UInt64 = 0,
+        useSharedSignalEvent: Bool = false,
+        sharedSignalEventValue: UInt64 = 1,
+        sharedSignalEventSymbolIndex: UInt32 = 0,
+        sharedSignalEventType: Int64 = 0
+    ) -> ANEChainingProbe {
+        var options = ANEInteropChainingProbeOptions(
+            useRealStatsSurface: useRealStatsSurface,
+            skipPrepare: skipPrepare,
+            validateRequest: validateRequest,
+            useScalarLoopbackSymbolIndices: useScalarLoopbackSymbolIndices,
+            callEnqueueSets: callEnqueueSets,
+            callBuffersReady: callBuffersReady,
+            requestProcedureIndex: requestProcedureIndex,
+            requestTransactionHandle: requestTransactionHandle,
+            requestFWEnqueueDelay: requestFWEnqueueDelay,
+            requestMemoryPoolId: requestMemoryPoolId,
+            enqueueProcedureIndex: enqueueProcedureIndex,
+            enqueueSetIndex: enqueueSetIndex,
+            enqueueSignalValue: enqueueSignalValue,
+            enqueueSignalNotRequired: enqueueSignalNotRequired,
+            enqueueOpenLoop: enqueueOpenLoop,
+            readyProcedureIndex: readyProcedureIndex,
+            readyExecutionDelay: readyExecutionDelay,
+            useSharedSignalEvent: useSharedSignalEvent,
+            sharedSignalEventValue: sharedSignalEventValue,
+            sharedSignalEventSymbolIndex: sharedSignalEventSymbolIndex,
+            sharedSignalEventType: sharedSignalEventType
+        )
+        var raw = ANEInteropChainingProbeResult()
+        ane_interop_probe_chaining_with_options(handle, &options, &raw)
+        return ANEChainingProbe(
+            hasChainingRequestClass: raw.hasChainingRequestClass,
+            hasPrepareSelector: raw.hasPrepareSelector,
+            hasOutputSetsClass: raw.hasOutputSetsClass,
+            hasOutputSetsFactory: raw.hasOutputSetsFactory,
+            hasOutputSetEnqueueClass: raw.hasOutputSetEnqueueClass,
+            hasInputBuffersReadyClass: raw.hasInputBuffersReadyClass,
+            hasSharedSignalEventClass: raw.hasSharedSignalEventClass,
+            builtOutputSet: raw.builtOutputSet,
+            builtOutputSetEnqueue: raw.builtOutputSetEnqueue,
+            builtInputBuffersReady: raw.builtInputBuffersReady,
+            builtSharedSignalEvent: raw.builtSharedSignalEvent,
+            builtRequest: raw.builtRequest,
+            usedArrayLoopbackSymbolIndices: raw.usedArrayLoopbackSymbolIndices,
+            usedRealStatsSurface: raw.usedRealStatsSurface,
+            requestValidated: raw.requestValidated,
+            requestValid: raw.requestValid,
+            requestValidationFailed: raw.requestValidationFailed,
+            inputBuffersReadyValidationFailed: raw.inputBuffersReadyValidationFailed,
+            calledEnqueueSets: raw.calledEnqueueSets,
+            enqueueSetsSucceeded: raw.enqueueSetsSucceeded,
+            calledBuffersReady: raw.calledBuffersReady,
+            buffersReadySucceeded: raw.buffersReadySucceeded,
+            prepared: raw.prepared,
+            stage: Int(raw.stage)
+        )
     }
 
     /// Access input IOSurface (retained; safe to hold independently of kernel lifetime).

@@ -38,6 +38,30 @@ static int g_last_compile_error = ANE_INTEROP_COMPILE_ERROR_NONE;
 static int g_force_eval_failure = 0;
 static int g_live_handle_count = 0;
 
+static bool ane_interop_trace_enabled(void);
+
+static void ane_interop_trace_methods(Class cls, const char *label) {
+    if (!ane_interop_trace_enabled() || !cls) return;
+
+    unsigned int classMethodCount = 0;
+    Method *classMethods = class_copyMethodList(object_getClass(cls), &classMethodCount);
+    fprintf(stderr, "ANE trace class %s class-methods=%u\n", label, classMethodCount);
+    for (unsigned int i = 0; i < classMethodCount; i++) {
+        SEL sel = method_getName(classMethods[i]);
+        fprintf(stderr, "  + %s\n", sel_getName(sel));
+    }
+    free(classMethods);
+
+    unsigned int instanceMethodCount = 0;
+    Method *instanceMethods = class_copyMethodList(cls, &instanceMethodCount);
+    fprintf(stderr, "ANE trace class %s instance-methods=%u\n", label, instanceMethodCount);
+    for (unsigned int i = 0; i < instanceMethodCount; i++) {
+        SEL sel = method_getName(instanceMethods[i]);
+        fprintf(stderr, "  - %s\n", sel_getName(sel));
+    }
+    free(instanceMethods);
+}
+
 static bool ane_interop_trace_enabled(void) {
     static int cached = -1;
     if (cached == -1) {
@@ -136,6 +160,411 @@ void ane_interop_init(void) {
         g_ANEIO = NSClassFromString(@"_ANEIOSurfaceObject");
         g_ane_loaded = true;
     });
+}
+
+bool ane_interop_runtime_has_chaining_request(void) {
+    ane_interop_init();
+    Class chainingReq = NSClassFromString(@"_ANEChainingRequest");
+    SEL factorySel = NSSelectorFromString(@"chainingRequestWithInputs:outputSets:lbInputSymbolId:lbOutputSymbolId:procedureIndex:signalEvents:transactionHandle:fwEnqueueDelay:memoryPoolId:");
+    return chainingReq && [chainingReq respondsToSelector:factorySel];
+}
+
+bool ane_interop_runtime_has_prepare_chaining(void) {
+    ane_interop_init();
+    Class clientCls = NSClassFromString(@"_ANEClient");
+    SEL prepareSel = @selector(prepareChainingWithModel:options:chainingReq:qos:error:);
+    return clientCls && [clientCls instancesRespondToSelector:prepareSel];
+}
+
+int ane_interop_probe_prepare_chaining(ANEHandle *handle) {
+    ANEInteropChainingProbeResult result;
+    memset(&result, 0, sizeof(result));
+    ane_interop_probe_chaining(handle, &result);
+
+    switch (result.stage) {
+    case ANE_INTEROP_CHAINING_STAGE_REQUEST_BUILD_FAILED:
+        return ANE_INTEROP_CHAINING_PROBE_REQUEST_BUILD_FAILED;
+    case ANE_INTEROP_CHAINING_STAGE_PREPARE_SUCCEEDED:
+        return ANE_INTEROP_CHAINING_PROBE_PREPARE_SUCCEEDED;
+    case ANE_INTEROP_CHAINING_STAGE_EXCEPTION:
+        return ANE_INTEROP_CHAINING_PROBE_EXCEPTION;
+    case ANE_INTEROP_CHAINING_STAGE_OUTPUT_SET_ENQUEUE_BUILD_FAILED:
+    case ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_BUILD_FAILED:
+    case ANE_INTEROP_CHAINING_STAGE_REQUEST_VALIDATE_FAILED:
+    case ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_VALIDATE_FAILED:
+    case ANE_INTEROP_CHAINING_STAGE_OUTPUT_SETS_BUILD_FAILED:
+    case ANE_INTEROP_CHAINING_STAGE_PREPARE_FAILED:
+        return ANE_INTEROP_CHAINING_PROBE_PREPARE_FAILED;
+    default:
+        return ANE_INTEROP_CHAINING_PROBE_UNAVAILABLE;
+    }
+}
+
+ANEInteropChainingProbeStatsSurfaceMode ane_interop_chaining_probe_stats_surface_mode(void) {
+    const char *value = getenv("ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE");
+    if (value == NULL) {
+        return ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH;
+    }
+    if (strcmp(value, "null") == 0) {
+        return ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_NULL;
+    }
+    if (strcmp(value, "output0") == 0) {
+        return ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_OUTPUT0;
+    }
+    if (strcmp(value, "scratch") == 0) {
+        return ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH;
+    }
+    return ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH;
+}
+
+void ane_interop_probe_chaining_with_options(ANEHandle *handle,
+                                             const ANEInteropChainingProbeOptions *options,
+                                             ANEInteropChainingProbeResult *result) {
+    @autoreleasepool {
+        if (!result) return;
+        memset(result, 0, sizeof(*result));
+        result->stage = ANE_INTEROP_CHAINING_STAGE_UNAVAILABLE;
+        ANEInteropChainingProbeOptions effectiveOptions = {0};
+        if (options) {
+            effectiveOptions = *options;
+        }
+
+        ane_interop_init();
+
+        Class chainingReq = NSClassFromString(@"_ANEChainingRequest");
+        Class bufferCls = NSClassFromString(@"_ANEBuffer");
+        Class outputSetsCls = NSClassFromString(@"_ANEIOSurfaceOutputSets");
+        Class outputSetEnqueueCls = NSClassFromString(@"_ANEOutputSetEnqueue");
+        Class inputBuffersReadyCls = NSClassFromString(@"_ANEInputBuffersReady");
+        Class sharedSignalEventCls = NSClassFromString(@"_ANESharedSignalEvent");
+        Class ioSurfaceSharedEventCls = NSClassFromString(@"IOSurfaceSharedEvent");
+        Class clientCls = NSClassFromString(@"_ANEClient");
+        SEL factorySel = NSSelectorFromString(@"chainingRequestWithInputs:outputSets:lbInputSymbolId:lbOutputSymbolId:procedureIndex:signalEvents:transactionHandle:fwEnqueueDelay:memoryPoolId:");
+        SEL bufferFactorySel = NSSelectorFromString(@"bufferWithIOSurfaceObject:symbolIndex:source:");
+        SEL outputSetFactorySel = NSSelectorFromString(@"objectWithstatsSurRef:outputBuffer:");
+        SEL outputSetEnqueueFactorySel = NSSelectorFromString(@"outputSetWithProcedureIndex:setIndex:signalValue:signalNotRequired:isOpenLoop:");
+        SEL inputBuffersReadyFactorySel = NSSelectorFromString(@"inputBuffersWithProcedureIndex:inputBufferInfoIndex:inputFreeValue:executionDelay:");
+        SEL sharedSignalEventFactorySel = NSSelectorFromString(@"signalEventWithValue:symbolIndex:eventType:sharedEvent:");
+        SEL validateSel = @selector(validate);
+        SEL prepareSel = @selector(prepareChainingWithModel:options:chainingReq:qos:error:);
+        SEL enqueueSetsSel = @selector(enqueueSetsWithModel:outputSet:options:qos:error:);
+        SEL buffersReadySel = @selector(buffersReadyWithModel:inputBuffers:options:qos:error:);
+
+        result->hasChainingRequestClass = (chainingReq != Nil) && [chainingReq respondsToSelector:factorySel];
+        result->hasPrepareSelector = (clientCls != Nil) && [clientCls instancesRespondToSelector:prepareSel];
+        result->hasOutputSetsClass = (outputSetsCls != Nil);
+        result->hasOutputSetsFactory = (outputSetsCls != Nil) && [outputSetsCls respondsToSelector:outputSetFactorySel];
+        result->hasOutputSetEnqueueClass = (outputSetEnqueueCls != Nil);
+        result->hasInputBuffersReadyClass = (inputBuffersReadyCls != Nil);
+        result->hasSharedSignalEventClass =
+            (sharedSignalEventCls != Nil) &&
+            (ioSurfaceSharedEventCls != Nil) &&
+            [sharedSignalEventCls respondsToSelector:sharedSignalEventFactorySel];
+
+        if (ane_interop_trace_enabled()) {
+            ane_interop_trace_methods(chainingReq, "_ANEChainingRequest");
+            ane_interop_trace_methods(bufferCls, "_ANEBuffer");
+            ane_interop_trace_methods(outputSetsCls, "_ANEIOSurfaceOutputSets");
+            ane_interop_trace_methods(outputSetEnqueueCls, "_ANEOutputSetEnqueue");
+            ane_interop_trace_methods(inputBuffersReadyCls, "_ANEInputBuffersReady");
+            ane_interop_trace_methods(sharedSignalEventCls, "_ANESharedSignalEvent");
+        }
+
+        if (!handle || !handle->client || !handle->clientModel) return;
+        if (!result->hasChainingRequestClass || !result->hasPrepareSelector) return;
+
+        IOSurfaceRef statsSurRef = NULL;
+        ANEInteropChainingProbeStatsSurfaceMode statsSurfaceMode =
+            effectiveOptions.useRealStatsSurface
+                ? ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_OUTPUT0
+                : ane_interop_chaining_probe_stats_surface_mode();
+        @try {
+            NSMutableArray *inputs = [NSMutableArray array];
+            NSMutableArray *inputBufferInfoIndex = [NSMutableArray array];
+            NSMutableArray *inputFreeValue = [NSMutableArray array];
+            if (handle->ioInputs && g_ANEIO) {
+                for (int i = 0; i < handle->nInputs; i++) {
+                    IOSurfaceRef ioIn = handle->ioInputs[i];
+                    if (!ioIn) continue;
+                    id wrapped = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                        g_ANEIO, @selector(objectWithIOSurface:), ioIn);
+                    if (!wrapped) continue;
+                    id chainingInput = wrapped;
+                    if (bufferCls && [bufferCls respondsToSelector:bufferFactorySel]) {
+                        id candidate = ((id(*)(Class,SEL,id,id,long long))objc_msgSend)(
+                            bufferCls, bufferFactorySel, wrapped, @(i), 0LL);
+                        if (candidate) {
+                            chainingInput = candidate;
+                        }
+                    }
+                    [inputs addObject:chainingInput];
+                    [inputBufferInfoIndex addObject:@(i)];
+                    [inputFreeValue addObject:@0];
+                }
+            }
+
+            NSMutableArray *outputBuffers = [NSMutableArray array];
+            if (handle->ioOutputs && g_ANEIO) {
+                for (int i = 0; i < handle->nOutputs; i++) {
+                    IOSurfaceRef ioOut = handle->ioOutputs[i];
+                    if (!ioOut) continue;
+                    id wrapped = ((id(*)(Class,SEL,IOSurfaceRef))objc_msgSend)(
+                        g_ANEIO, @selector(objectWithIOSurface:), ioOut);
+                    if (!wrapped) continue;
+                    id chainingOutput = wrapped;
+                    if (bufferCls && [bufferCls respondsToSelector:bufferFactorySel]) {
+                        id candidate = ((id(*)(Class,SEL,id,id,long long))objc_msgSend)(
+                            bufferCls, bufferFactorySel, wrapped, @(i), 0LL);
+                        if (candidate) {
+                            chainingOutput = candidate;
+                        }
+                    }
+                    [outputBuffers addObject:chainingOutput];
+                }
+            }
+
+            id outputSet = nil;
+            if (result->hasOutputSetsFactory) {
+                if (statsSurfaceMode == ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_OUTPUT0 &&
+                    handle->ioOutputs && handle->nOutputs > 0) {
+                    statsSurRef = (IOSurfaceRef)CFRetain(handle->ioOutputs[0]);
+                } else if (statsSurfaceMode == ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH) {
+                    statsSurRef = ane_interop_create_surface(256);
+                }
+                result->usedRealStatsSurface = (
+                    statsSurfaceMode == ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_OUTPUT0 &&
+                    statsSurRef != NULL
+                );
+                outputSet = ((id(*)(Class,SEL,IOSurfaceRef,id))objc_msgSend)(
+                    outputSetsCls, outputSetFactorySel, statsSurRef, outputBuffers);
+                result->builtOutputSet = (outputSet != nil);
+                if (!outputSet) {
+                    result->stage = ANE_INTEROP_CHAINING_STAGE_OUTPUT_SETS_BUILD_FAILED;
+                    return;
+                }
+            }
+            id outputSets = outputSet ? @[outputSet] : @[];
+
+            id outputSetEnqueue = nil;
+            if (result->hasOutputSetEnqueueClass && [outputSetEnqueueCls respondsToSelector:outputSetEnqueueFactorySel]) {
+                outputSetEnqueue = ((id(*)(Class,SEL,unsigned int,unsigned int,unsigned long long,BOOL,BOOL))objc_msgSend)(
+                outputSetEnqueueCls,
+                outputSetEnqueueFactorySel,
+                    effectiveOptions.enqueueProcedureIndex,
+                    effectiveOptions.enqueueSetIndex,
+                    effectiveOptions.enqueueSignalValue,
+                    effectiveOptions.enqueueSignalNotRequired ? YES : NO,
+                    effectiveOptions.enqueueOpenLoop ? YES : NO);
+                result->builtOutputSetEnqueue = (outputSetEnqueue != nil);
+                if (!outputSetEnqueue) {
+                    result->stage = ANE_INTEROP_CHAINING_STAGE_OUTPUT_SET_ENQUEUE_BUILD_FAILED;
+                    return;
+                }
+            }
+
+            id inputBuffersReady = nil;
+            if (result->hasInputBuffersReadyClass && [inputBuffersReadyCls respondsToSelector:inputBuffersReadyFactorySel]) {
+                inputBuffersReady = ((id(*)(Class,SEL,unsigned int,id,id,unsigned long long))objc_msgSend)(
+                    inputBuffersReadyCls,
+                    inputBuffersReadyFactorySel,
+                    effectiveOptions.readyProcedureIndex,
+                    inputBufferInfoIndex,
+                    inputFreeValue,
+                    effectiveOptions.readyExecutionDelay);
+                result->builtInputBuffersReady = (inputBuffersReady != nil);
+                if (!inputBuffersReady) {
+                    result->stage = ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_BUILD_FAILED;
+                    return;
+                }
+                if ([inputBuffersReady respondsToSelector:validateSel]) {
+                    @try {
+                        BOOL validInputBuffersReady = ((BOOL(*)(id,SEL))objc_msgSend)(inputBuffersReady, validateSel);
+                        result->inputBuffersReadyValidationFailed = !validInputBuffersReady;
+                        if (!validInputBuffersReady) {
+                            result->stage = ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_VALIDATE_FAILED;
+                            return;
+                        }
+                    } @catch (NSException *exception) {
+                        (void)exception;
+                        result->inputBuffersReadyValidationFailed = true;
+                        result->stage = ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_VALIDATE_FAILED;
+                        return;
+                    }
+                }
+            }
+
+            NSMutableArray *loopbackInputSymbolIndices = [NSMutableArray array];
+            NSMutableArray *loopbackOutputSymbolIndices = [NSMutableArray array];
+            if ([inputs count] > 0) {
+                [loopbackInputSymbolIndices addObject:@0];
+            }
+            if ([outputBuffers count] > 0) {
+                [loopbackOutputSymbolIndices addObject:@0];
+            }
+            id loopbackInputSymbolIds = loopbackInputSymbolIndices;
+            id loopbackOutputSymbolIds = loopbackOutputSymbolIndices;
+            result->usedArrayLoopbackSymbolIndices = true;
+            if (effectiveOptions.useScalarLoopbackSymbolIndices) {
+                loopbackInputSymbolIds = [inputs count] > 0 ? @0 : nil;
+                loopbackOutputSymbolIds = [outputBuffers count] > 0 ? @0 : nil;
+                result->usedArrayLoopbackSymbolIndices = false;
+            }
+            id signalEvents = @[];
+            if (effectiveOptions.useSharedSignalEvent) {
+                if (!result->hasSharedSignalEventClass) {
+                    result->stage = ANE_INTEROP_CHAINING_STAGE_SIGNAL_EVENT_BUILD_FAILED;
+                    return;
+                }
+                id sharedEvent = ((id(*)(Class,SEL))objc_msgSend)(
+                    ioSurfaceSharedEventCls,
+                    @selector(new));
+                id sharedSignalEvent = ((id(*)(Class,SEL,unsigned long long,unsigned int,long long,id))objc_msgSend)(
+                    sharedSignalEventCls,
+                    sharedSignalEventFactorySel,
+                    effectiveOptions.sharedSignalEventValue,
+                    effectiveOptions.sharedSignalEventSymbolIndex,
+                    (long long)effectiveOptions.sharedSignalEventType,
+                    sharedEvent);
+                result->builtSharedSignalEvent = (sharedSignalEvent != nil);
+                if (!sharedSignalEvent) {
+                    result->stage = ANE_INTEROP_CHAINING_STAGE_SIGNAL_EVENT_BUILD_FAILED;
+                    return;
+                }
+                signalEvents = @[sharedSignalEvent];
+            }
+            id req = ((id(*)(Class,SEL,id,id,id,id,id,id,id,id,id))objc_msgSend)(
+                chainingReq,
+                factorySel,
+                inputs,
+                outputSets,
+                loopbackInputSymbolIds,
+                loopbackOutputSymbolIds,
+                @(effectiveOptions.requestProcedureIndex),
+                signalEvents,
+                @((unsigned long long)effectiveOptions.requestTransactionHandle),
+                @((unsigned long long)effectiveOptions.requestFWEnqueueDelay),
+                @((unsigned long long)effectiveOptions.requestMemoryPoolId));
+            if (!req) {
+                result->stage = ANE_INTEROP_CHAINING_STAGE_REQUEST_BUILD_FAILED;
+                return;
+            }
+            result->builtRequest = true;
+            if (effectiveOptions.validateRequest && [req respondsToSelector:validateSel]) {
+                @try {
+                    BOOL validRequest = ((BOOL(*)(id,SEL))objc_msgSend)(req, validateSel);
+                    result->requestValidated = true;
+                    result->requestValid = validRequest ? true : false;
+                    result->requestValidationFailed = !validRequest;
+                    if (!validRequest) {
+                        result->stage = ANE_INTEROP_CHAINING_STAGE_REQUEST_VALIDATE_FAILED;
+                        return;
+                    }
+                } @catch (NSException *exception) {
+                    (void)exception;
+                    result->requestValidated = true;
+                    result->requestValid = false;
+                    result->requestValidationFailed = true;
+                    result->stage = ANE_INTEROP_CHAINING_STAGE_REQUEST_VALIDATE_FAILED;
+                    return;
+                }
+            }
+
+            id client = (__bridge id)handle->client;
+            id modelObj = (__bridge id)handle->clientModel;
+            id options = handle->evalOptions ? (__bridge id)handle->evalOptions : @{};
+
+            if (effectiveOptions.callEnqueueSets && outputSetEnqueue && [client respondsToSelector:enqueueSetsSel]) {
+                NSError *enqueueError = nil;
+                BOOL enqueueOK = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                    client,
+                    enqueueSetsSel,
+                    modelObj,
+                    outputSetEnqueue,
+                    options,
+                    21,
+                    &enqueueError
+                );
+                if (!enqueueOK && ane_interop_trace_enabled()) {
+                    fprintf(
+                        stderr,
+                        "ANE enqueueSetsWithModel failed: %s\n",
+                        enqueueError ? [[enqueueError description] UTF8String] : "no error"
+                    );
+                }
+                result->calledEnqueueSets = true;
+                result->enqueueSetsSucceeded = enqueueOK ? true : false;
+                result->stage = enqueueOK
+                    ? ANE_INTEROP_CHAINING_STAGE_ENQUEUE_SETS_CALL_SUCCEEDED
+                    : ANE_INTEROP_CHAINING_STAGE_ENQUEUE_SETS_CALL_FAILED;
+                if (!enqueueOK) {
+                    return;
+                }
+            }
+
+            if (effectiveOptions.callBuffersReady && inputBuffersReady && [client respondsToSelector:buffersReadySel]) {
+                NSError *buffersReadyError = nil;
+                BOOL buffersReadyOK = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                    client,
+                    buffersReadySel,
+                    modelObj,
+                    inputBuffersReady,
+                    options,
+                    21,
+                    &buffersReadyError
+                );
+                if (!buffersReadyOK && ane_interop_trace_enabled()) {
+                    fprintf(
+                        stderr,
+                        "ANE buffersReadyWithModel failed: %s\n",
+                        buffersReadyError ? [[buffersReadyError description] UTF8String] : "no error"
+                    );
+                }
+                result->calledBuffersReady = true;
+                result->buffersReadySucceeded = buffersReadyOK ? true : false;
+                result->stage = buffersReadyOK
+                    ? ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_CALL_SUCCEEDED
+                    : ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_CALL_FAILED;
+                if (!buffersReadyOK) {
+                    return;
+                }
+            }
+
+            if (effectiveOptions.skipPrepare) {
+                result->stage = ANE_INTEROP_CHAINING_STAGE_PREPARE_SKIPPED;
+                return;
+            }
+
+            NSError *e = nil;
+            BOOL ok = ((BOOL(*)(id,SEL,id,id,id,unsigned int,NSError**))objc_msgSend)(
+                client, prepareSel, modelObj, options, req, 21, &e);
+            if (ok && ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE prepareChaining succeeded (outputSets=%lu, outputs=%lu)\n",
+                        (unsigned long)[outputSets count], (unsigned long)[outputBuffers count]);
+            }
+            if (!ok && ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE prepareChaining failed: %s\n", e ? [[e description] UTF8String] : "no error");
+            }
+            result->prepared = ok ? true : false;
+            result->stage = ok ? ANE_INTEROP_CHAINING_STAGE_PREPARE_SUCCEEDED
+                               : ANE_INTEROP_CHAINING_STAGE_PREPARE_FAILED;
+        } @catch (NSException *exception) {
+            if (ane_interop_trace_enabled()) {
+                fprintf(stderr, "ANE prepareChaining exception: %s\n", [[exception description] UTF8String]);
+            }
+            result->stage = ANE_INTEROP_CHAINING_STAGE_EXCEPTION;
+        } @finally {
+            if (statsSurRef) {
+                CFRelease(statsSurRef);
+            }
+        }
+    }
+}
+
+void ane_interop_probe_chaining(ANEHandle *handle, ANEInteropChainingProbeResult *result) {
+    ANEInteropChainingProbeOptions options;
+    memset(&options, 0, sizeof(options));
+    options.validateRequest = true;
+    ane_interop_probe_chaining_with_options(handle, &options, result);
 }
 
 IOSurfaceRef ane_interop_create_surface(size_t bytes) {

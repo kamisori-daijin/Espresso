@@ -42,6 +42,97 @@ int ane_interop_live_handle_count(void);
 uint64_t ane_interop_last_hw_execution_time_ns(ANEHandle *handle);
 bool ane_interop_has_perf_stats(ANEHandle *handle);
 
+#define ANE_INTEROP_CHAINING_PROBE_UNAVAILABLE 0
+#define ANE_INTEROP_CHAINING_PROBE_REQUEST_BUILD_FAILED 1
+#define ANE_INTEROP_CHAINING_PROBE_PREPARE_FAILED 2
+#define ANE_INTEROP_CHAINING_PROBE_PREPARE_SUCCEEDED 3
+#define ANE_INTEROP_CHAINING_PROBE_EXCEPTION 4
+
+typedef enum {
+    ANE_INTEROP_CHAINING_STAGE_UNAVAILABLE = 0,
+    ANE_INTEROP_CHAINING_STAGE_OUTPUT_SETS_BUILD_FAILED = 1,
+    ANE_INTEROP_CHAINING_STAGE_REQUEST_BUILD_FAILED = 2,
+    ANE_INTEROP_CHAINING_STAGE_PREPARE_FAILED = 3,
+    ANE_INTEROP_CHAINING_STAGE_PREPARE_SUCCEEDED = 4,
+    ANE_INTEROP_CHAINING_STAGE_EXCEPTION = 5,
+    ANE_INTEROP_CHAINING_STAGE_PREPARE_SKIPPED = 6,
+    ANE_INTEROP_CHAINING_STAGE_OUTPUT_SET_ENQUEUE_BUILD_FAILED = 7,
+    ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_BUILD_FAILED = 8,
+    ANE_INTEROP_CHAINING_STAGE_REQUEST_VALIDATE_FAILED = 9,
+    ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_VALIDATE_FAILED = 10,
+    ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_CALL_FAILED = 11,
+    ANE_INTEROP_CHAINING_STAGE_INPUT_BUFFERS_READY_CALL_SUCCEEDED = 12,
+    ANE_INTEROP_CHAINING_STAGE_ENQUEUE_SETS_CALL_FAILED = 13,
+    ANE_INTEROP_CHAINING_STAGE_ENQUEUE_SETS_CALL_SUCCEEDED = 14,
+    ANE_INTEROP_CHAINING_STAGE_SIGNAL_EVENT_BUILD_FAILED = 15,
+} ANEInteropChainingStage;
+
+typedef struct {
+    bool useRealStatsSurface;
+    bool skipPrepare;
+    bool validateRequest;
+    bool useScalarLoopbackSymbolIndices;
+    bool callEnqueueSets;
+    bool callBuffersReady;
+    uint32_t requestProcedureIndex;
+    uint64_t requestTransactionHandle;
+    uint64_t requestFWEnqueueDelay;
+    uint64_t requestMemoryPoolId;
+    uint32_t enqueueProcedureIndex;
+    uint32_t enqueueSetIndex;
+    uint64_t enqueueSignalValue;
+    bool enqueueSignalNotRequired;
+    bool enqueueOpenLoop;
+    uint32_t readyProcedureIndex;
+    uint64_t readyExecutionDelay;
+    bool useSharedSignalEvent;
+    uint64_t sharedSignalEventValue;
+    uint32_t sharedSignalEventSymbolIndex;
+    int64_t sharedSignalEventType;
+} ANEInteropChainingProbeOptions;
+
+typedef enum {
+    ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_NULL = 0,
+    ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_OUTPUT0 = 1,
+    ANE_INTEROP_CHAINING_PROBE_STATS_SURFACE_SCRATCH = 2,
+} ANEInteropChainingProbeStatsSurfaceMode;
+
+typedef struct {
+    bool hasChainingRequestClass;
+    bool hasPrepareSelector;
+    bool hasOutputSetsClass;
+    bool hasOutputSetsFactory;
+    bool hasOutputSetEnqueueClass;
+    bool hasInputBuffersReadyClass;
+    bool hasSharedSignalEventClass;
+    bool builtOutputSet;
+    bool builtOutputSetEnqueue;
+    bool builtInputBuffersReady;
+    bool builtSharedSignalEvent;
+    bool builtRequest;
+    bool usedArrayLoopbackSymbolIndices;
+    bool usedRealStatsSurface;
+    bool requestValidated;
+    bool requestValid;
+    bool requestValidationFailed;
+    bool inputBuffersReadyValidationFailed;
+    bool calledEnqueueSets;
+    bool enqueueSetsSucceeded;
+    bool calledBuffersReady;
+    bool buffersReadySucceeded;
+    bool prepared;
+    int stage;
+} ANEInteropChainingProbeResult;
+
+bool ane_interop_runtime_has_chaining_request(void);
+bool ane_interop_runtime_has_prepare_chaining(void);
+ANEInteropChainingProbeStatsSurfaceMode ane_interop_chaining_probe_stats_surface_mode(void);
+void ane_interop_probe_chaining_with_options(ANEHandle *handle,
+                                             const ANEInteropChainingProbeOptions *options,
+                                             ANEInteropChainingProbeResult *result);
+void ane_interop_probe_chaining(ANEHandle *handle, ANEInteropChainingProbeResult *result);
+int ane_interop_probe_prepare_chaining(ANEHandle *handle);
+
 void ane_interop_cvt_f32_to_f16(void *dst, const float *src, int count);
 void ane_interop_cvt_f16_to_f32(float *dst, const void *src, int count);
 
