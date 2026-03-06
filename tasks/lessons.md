@@ -53,3 +53,8 @@
 - Every tuning cycle must document three things explicitly: what was tried, what worked, and what did not work.
 - Always explain why a change is believed to have helped, regressed, or failed to confirm; artifact-backed attribution is part of the deliverable, not optional commentary.
 - Do not discard confirmed sub-1% performance improvements as “too small” without documenting them. If a small gain survives repeated confirmation and tails stay flat, commit it, document it, and then continue iterating from the improved baseline.
+
+## 2026-03-06 — Breakthrough-Only Tuning
+- When the user allows more tuning time, treat that as conditional, not open-ended: spend extra cycles only when the current evidence suggests a real architectural or scaling breakthrough rather than local noise.
+- Before extending an experiment, state the breakthrough hypothesis, the concrete metric that would validate it, and the stop condition that ends the tuning loop.
+- Use a scientific-critique frame for performance claims: reject time sinks driven by anecdote, uncontrolled comparisons, or metrics that cannot distinguish a real scaling advantage from benchmark variance.

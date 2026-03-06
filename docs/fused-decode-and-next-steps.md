@@ -605,3 +605,107 @@ Conclusion:
 - The next serious direction should shift to:
   - RWKV-style recurrent decode, or
   - a fundamentally different speculative verifier that reuses caches/state instead of replaying and then re-advancing.
+
+## 14. RWKV-Style Recurrent Decode Prototype (2026-03-06)
+
+Status: implemented and benchmarked. Promising enough to keep as the secondary architecture bet, but not yet strong enough to replace the current roadmap without a depth-matched follow-up.
+
+What changed:
+- Added a minimal recurrent step path:
+  - `RWKVStyleRecurrentWeights`
+  - `RWKVStyleRecurrentStepGenerator`
+  - `RWKVStyleRecurrentKernelSet`
+  - `RWKVStyleRecurrentSession`
+  - `RWKVStyleRecurrentBench`
+- The recurrent MIL uses only already-proven ops on this branch:
+  - `conv`
+  - `add`
+  - `mul`
+  - `sigmoid`
+  - `reduce_sum`
+  - `pow`
+- The step contract is:
+  - inputs: `x_t`, `state_in`
+  - outputs: `x_next`, `state_out`
+  - both state and token lanes are fixed-size `[1, dim, 1, laneSpatial]`
+
+Why this shape:
+- The goal here was not faithful RWKV semantics yet.
+- The goal was to answer the first-order systems question with minimal compiler risk:
+  - can a constant-state recurrent step compile on ANE,
+  - run repeatedly,
+  - and stay flat as effective context grows?
+
+Hardware compile behavior:
+- `ANE_HARDWARE_TESTS=1 swift test --filter RWKVStyleRecurrentKernelSetTests`
+- Result:
+  - compile succeeded
+  - eval succeeded
+  - input/output surfaces were accessible
+- Important downside:
+  - first hardware compile for the recurrent kernel took `131.362 s`
+- Interpretation:
+  - runtime execution is viable
+  - iteration speed for new recurrent kernel shapes is currently poor
+
+Benchmark method:
+- Command:
+  - `ANE_HARDWARE_TESTS=1 swift test --filter RWKVStyleRecurrentPrototypeHardwareTests`
+- Timing:
+  - `mach_absolute_time()` / `mach_timebase_info`
+- Protocol:
+  - `3` warmup steps
+  - `20` timed tail steps
+  - measure tail-step latency at effective contexts `32`, `256`, `1024`, `4096`
+- Comparison:
+  - recurrent prototype under the same tail-step protocol
+  - current 6-layer transformer decode control under the same tail-step protocol
+
+Recurrent results:
+- Run 1:
+  - `32`: `0.314125 ms/token` (`3183 tok/s`)
+  - `256`: `0.215125 ms/token` (`4648 tok/s`)
+  - `1024`: `0.205854 ms/token` (`4858 tok/s`)
+  - `4096`: `0.217500 ms/token` (`4598 tok/s`)
+- Run 2:
+  - `32`: `0.315563 ms/token` (`3169 tok/s`)
+  - `256`: `0.217896 ms/token` (`4589 tok/s`)
+  - `1024`: `0.216958 ms/token` (`4609 tok/s`)
+  - `4096`: `0.200625 ms/token` (`4984 tok/s`)
+
+Transformer control results under the same tail-step protocol:
+- Run 1:
+  - `32`: `2.907875 ms/token`
+  - `256`: `4.055500 ms/token`
+  - `1024`: `3.924917 ms/token`
+  - `4096`: `2.868458 ms/token`
+- Run 2:
+  - `32`: `2.954167 ms/token`
+  - `256`: `2.872583 ms/token`
+  - `1024`: `2.847708 ms/token`
+  - `4096`: `2.923729 ms/token`
+
+Interpretation:
+- The narrow recurrent question came back positive:
+  - the recurrent step stayed effectively flat through `4096`.
+- The stronger hoped-for transformer comparison came back weaker than expected:
+  - the current transformer control did not show clean context-length growth on this graph.
+  - the existing tiled decode path keeps tail-step latency roughly flat, with some noise.
+- That means:
+  - recurrent decode is still interesting,
+  - but not because it clearly beats an O(context) tail-latency curve in the current implementation.
+
+Scientific validity / caveats:
+- This is not an apples-to-apples throughput comparison:
+  - the recurrent prototype is a single recurrent layer
+  - the transformer control is a 6-layer decode path
+- The useful claim that *is* supported:
+  - a constant-state recurrent ANE step is mechanically viable and shows stable flat tail-step latency at long effective contexts.
+- The useful claim that is *not yet* supported:
+  - a realistic recurrent model stack will outperform the optimized tiled transformer end-to-end on this hardware.
+
+Decision:
+- Keep RWKV-style recurrent decode alive as a credible long-term architecture path.
+- Do not spend more time on speculative draft tuning for the current verifier design.
+- Do not over-claim the recurrent result yet.
+- The next recurrent step worth doing is a more depth-matched stacked recurrent benchmark, but only if the compile-time iteration cost is acceptable.

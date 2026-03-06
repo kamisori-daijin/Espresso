@@ -1,64 +1,74 @@
-# Generation Harness + Speculative Decode (2026-03-06)
+# RWKV-Style Recurrent Decode Prototype (2026-03-06)
 
 ## Plan
-- [x] Re-read the required docs, project memory, and current decode/bench/runtime code before changing anything.
-- [x] Pressure-test the direction: speculative decoding stays primary; RWKV-style recurrent decode stays secondary until the harness exists or speculative work fails honestly.
-- [x] Record reproducible pre-change baselines and harness prerequisites:
-  - [x] Re-run the current direct ANE decode baseline that will remain the control.
-  - [x] Confirm that no local `stories110M.bin` / `STORIES_MODEL_PATH` is currently available for a semantic real-model benchmark.
-  - [x] Note the existing full-hardware-suite blocker at `ANEInteropTests.test_compile_count_increments`.
-- [x] Add failing tests first for a real token-generation harness:
-  - [x] Token ids -> embedding lookup for decode/prompt seeding.
-  - [x] Autoregressive decode loop advances state and appends generated tokens.
-  - [x] Final RMSNorm + classifier produces last-token logits from decode output.
-  - [x] Argmax selection produces deterministic next-token choices under test fixtures.
-  - [x] Benchmark/accounting surfaces token latency, tokens/sec, and generated token counts.
-- [x] Implement the real generation harness with minimal new surface area:
-  - [x] Load model weights through `ModelWeightLoader` into a reusable generation-weight container.
-  - [x] Build a reusable generation context around the existing decode path.
-  - [x] Accept token ids as input instead of pre-generated hidden states.
-  - [x] Run multiple decode steps autoregressively and surface logits plus chosen token per step.
-  - [x] Support argmax as the first honest selection path.
-- [x] Add failing tests first for speculative decoding control flow and accounting.
-- [x] Implement speculative decoding experiments in priority order:
-  - [x] Draft/full speculative control flow using the same autoregressive model protocol.
-  - [x] Benchmark `k=2` in a hardware-gated upper-bound experiment.
-  - [x] Benchmark `k=4` in a hardware-gated upper-bound experiment.
-  - [ ] Benchmark `k=8` only if earlier results justify it.
-  - [x] Track acceptance rate, accepted-prefix distribution, verifier cost, and end-to-end throughput.
-- [x] Apply kill criteria immediately:
-  - [x] Stop speculative decoding if verification cost erases gains, even under forced perfect acceptance.
-  - [x] Conclude that the current verifier/state-sync design is structurally non-viable for throughput wins.
-- [ ] Only if speculative decoding is structurally blocked or fails the above gates, prototype the RWKV-style recurrent path:
-  - [ ] Minimal single-layer recurrent step: `x_t, state_in -> x_next, state_out`.
-  - [ ] Compile once and benchmark repeated stepping at contexts `32`, `256`, `1024`, and `4096`.
-  - [ ] Continue only if latency stays effectively flat while transformer decode grows with context.
-- [ ] Append findings to `docs/fused-decode-and-next-steps.md`.
-- [ ] Update project memory with durable findings.
-- [ ] Fill this review section with measured results and commit atomically.
+- [x] Re-read the latest decode/speculative findings, project memory, and the current decode/runtime code before changing direction.
+- [x] Reconfirm the gating conclusion from the generation harness:
+  - [x] Direct ANE decode remains the transformer control at `2.894 ms/token`.
+  - [x] The real token-generation harness exists and is no longer the blocker.
+  - [x] The current speculative verifier/state-sync design is structurally dead even under forced perfect acceptance.
+- [x] Rewrite the task plan around the next architecture bet:
+  - [x] Primary next step is a minimal recurrent decode-step prototype.
+  - [x] Retain speculative decoding only as documented negative evidence, not an active branch.
+  - [x] Defer RetNet/Mamba unless the recurrent path hits a fundamental wall after honest benchmarking.
+- [x] Record the comparison controls before implementation:
+  - [x] Keep the refreshed transformer control run on hand: `2.894 ms/token` at `--decode-max-seq 32`.
+  - [x] Re-run transformer decode controls at effective contexts `32`, `256`, `1024`, and `4096` using the same tail-step protocol as the recurrent benchmark.
+  - [x] Transformer controls beyond `256` remained runnable and therefore credible on this tiled graph.
+- [x] Add failing tests first for the recurrent prototype:
+  - [x] MIL generator contract for a 2-input / 2-output recurrent step kernel.
+  - [x] Kernel wrapper contract and weight-blob mapping.
+  - [x] Repeated-step loop accounting and state advance semantics.
+  - [x] Hardware-gated compile/eval smoke coverage.
+- [x] Implement the minimal recurrent prototype with minimal surface area:
+  - [x] Add a recurrent MIL generator using only already-proven ops (`conv`, `add`, `mul`, `sigmoid`, `reduce_sum`, `pow`).
+  - [x] Add a runtime kernel set for `x_t, state_in -> x_next, state_out`.
+  - [x] Add a simple repeated-step harness that compiles once and reuses surfaces across all steps.
+  - [x] Keep state size constant across all effective contexts so the benchmark answers the real scaling question.
+- [x] Benchmark the recurrent step honestly:
+  - [x] Use `mach_absolute_time()` / `mach_timebase_info`.
+  - [x] Use at least `3` warmup iterations.
+  - [x] Use at least `20` timed iterations.
+  - [x] Report median latency and effective tokens/sec for effective contexts `32`, `256`, `1024`, and `4096`.
+  - [x] Compare against transformer decode controls at the same effective contexts where available.
+- [x] Apply the RWKV continuation gate immediately:
+  - [x] The recurrent step stayed effectively flat across `32 -> 4096`.
+  - [x] Deeper recurrent tuning is deferred for now because the current tiled transformer control also stayed roughly flat and the prototype is not yet depth-matched to the 6-layer transformer.
+- [x] Append findings to `docs/fused-decode-and-next-steps.md`.
+- [x] Update project memory with durable recurrent findings.
+- [x] Fill in this review section with measured results and commit atomically.
 
 ## Review
-- Status: in progress.
-- Current control numbers:
-  - Direct ANE decode median at session start: `2.872 ms/token`.
-  - Direct ANE decode median on refreshed control run: `2.894 ms/token`.
+- Status: in progress; implementation and benchmarks complete, documentation/memory/commit pending.
+- Transformer control carried forward from the completed generation/speculative pass:
+  - Direct ANE decode median: `2.894 ms/token` (`--decode --ane-only --layers 6 --warmup 3 --iterations 20 --decode-steps 32 --decode-max-seq 32 --profile-kernels`).
   - Direct attention stage: `209.383 us/layer`.
   - Direct FFN stage: `210.511 us/layer`.
   - CoreML `.cpuAndNeuralEngine` median: `3.007 ms/token`.
-- New generation-harness results:
-  - Added `AutoregressiveLanguageModel`, `AutoregressiveGenerationHarness`, `SpeculativeGenerationHarness`, `GenerationWeights`, and `ANEDirectGenerationModel`.
-  - Added non-hardware TDD coverage in `GenerationHarnessTests`.
-  - Added hardware-gated integration/benchmark coverage in `GenerationHarnessHardwareTests`.
-  - Real pretrained-weight loading is supported, but there is no local `stories110M.bin` / `STORIES_MODEL_PATH`, so no semantic acceptance benchmark was possible in this session.
-- Best-case speculative upper-bound benchmark (forced `100%` agreement via synthetic echo weights, `ANE_HARDWARE_TESTS=1`, prompt=`[0]`, generate=`8`, warmup=`3`, iterations=`20`):
+- Completed prerequisite from the last step:
+  - Real token-generation harness exists and supports token ids, embedding lookup, ANE decode stepping, final RMSNorm/classifier logits, argmax, and batched verification.
+- Negative evidence that now gates the next move:
+  - Best-case speculative upper bound was still worse than direct generation even at forced `100%` agreement.
   - Direct generation harness, 6-layer full model: `6.110643 ms/token`, `163.65 tok/s`.
-  - Speculative `k=2`, draft=2 layers / full=6 layers: `38.032148 ms/token`, `26.29 tok/s`, acceptance=`1.0`.
-  - Speculative `k=4`, draft=2 layers / full=6 layers: `28.609625 ms/token`, `34.95 tok/s`, acceptance=`1.0`.
-- Confirmed dead ends:
-  - Hybrid ANE+Metal decode is slower (`4.665979 ms/token`) and has no meaningful overlap window.
-  - More private API / async / overlap probing is not the next-best use of time.
-  - The previous speculative avenue was blocked by missing infrastructure; that infrastructure now exists.
-  - The current speculative implementation is still a dead end because full-sequence verification plus sequential full-model state advance is too expensive even with perfect acceptance.
-- Dialectic synthesis:
-  - The generation harness was the correct gating deliverable because it converted speculative decoding from conjecture into measurable throughput.
-  - With the harness in place, the verifier architecture failed an upper-bound test. The next serious path should move to RWKV-style recurrent decode or a fundamentally different verifier/state-reuse design, not more draft tuning on the current speculative stack.
+  - Speculative `k=2`, draft=2 / full=6: `38.032148 ms/token`, `26.29 tok/s`, acceptance=`1.0`.
+  - Speculative `k=4`, draft=2 / full=6: `28.609625 ms/token`, `34.95 tok/s`, acceptance=`1.0`.
+- Current thesis for this pass:
+  - Do not spend more time tuning the current speculative stack.
+  - The next serious question is whether a constant-state recurrent step can hold near-flat latency while the transformer control accumulates context-management cost.
+- Recurrent prototype delivered:
+  - Added `RWKVStyleRecurrentWeights`, `RWKVStyleRecurrentStepGenerator`, `RWKVStyleRecurrentKernelSet`, `RWKVStyleRecurrentSession`, and `RWKVStyleRecurrentBench`.
+  - Added non-hardware TDD coverage for the recurrent MIL contract and kernel compile-spec surface.
+  - Added hardware-gated compile/eval coverage plus a repeated context-scaling benchmark.
+- Hardware findings:
+  - First recurrent hardware compile succeeded but was very slow: `131.362 s` for `test_recurrent_kernel_compiles_on_hardware`.
+  - Recurrent step eval succeeded after compile and surfaces were accessible.
+  - Two replicated context-scaling runs (`ANE_HARDWARE_TESTS=1 swift test --filter RWKVStyleRecurrentPrototypeHardwareTests`) showed recurrent tail-step medians staying effectively flat:
+    - Run 1 recurrent medians: `0.314`, `0.215`, `0.206`, `0.218 ms/token` at contexts `32`, `256`, `1024`, `4096`.
+    - Run 2 recurrent medians: `0.316`, `0.218`, `0.217`, `0.201 ms/token` at the same contexts.
+  - The transformer control on this graph did not show monotonic context growth under the same tail-step protocol because the current decode path is tiled:
+    - Run 1 transformer medians: `2.908`, `4.056`, `3.925`, `2.868 ms/token`.
+    - Run 2 transformer medians: `2.954`, `2.873`, `2.848`, `2.924 ms/token`.
+- Scientific-critique conclusion:
+  - The recurrent prototype passed the narrow scaling question: constant-state recurrent stepping stayed flat through `4096`.
+  - The current transformer control also stayed roughly flat on this graph, so the result is not evidence that recurrent decode uniquely solves a context-scaling bottleneck in the existing implementation.
+  - Absolute throughput comparisons are not apples-to-apples yet because this is a single recurrent layer against a 6-layer transformer control.
+  - This is still a credible architecture signal because the recurrent step is fast, stable, and hardware-runnable; the next meaningful recurrent experiment would be a depth-matched multi-layer stack, not more speculative work on the current transformer verifier.
