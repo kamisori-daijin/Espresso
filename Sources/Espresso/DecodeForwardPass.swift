@@ -254,6 +254,79 @@ public final class DecodeKernelProfiler: @unchecked Sendable {
     }
 }
 
+/// Decode surfaces for one layer using the fused (attn + FFN) kernel.
+///
+/// The fused kernel has 4 inputs and 3 outputs:
+/// - Inputs:  x (0), kCache (1), vCache (2), maskCache (3)
+/// - Outputs: xNext (0), kOut (1), vOut (2)
+///
+/// No separate FFN surfaces are needed — the attn→FFN copy is eliminated.
+public struct FusedDecodeSurfaceHandles {
+    public let fusedIn: IOSurfaceRef       // x input [1, dim, 1, laneSpatial]
+    public let kCache: IOSurfaceRef        // k cache input [1, dim, 1, kernelMaxSeq]
+    public let vCache: IOSurfaceRef        // v cache input [1, dim, 1, kernelMaxSeq]
+    public let maskCache: IOSurfaceRef     // mask cache input [1, dim, 1, kernelMaxSeq]
+    public let kCacheFull: IOSurfaceRef    // full k cache [1, dim, 1, maxSeq]
+    public let vCacheFull: IOSurfaceRef    // full v cache [1, dim, 1, maxSeq]
+    public let maskCacheFull: IOSurfaceRef // full mask cache [1, dim, 1, maxSeq]
+    public let xNextOut: IOSurfaceRef      // fused output 0 [1, dim, 1, laneSpatial]
+    public let kOut: IOSurfaceRef          // fused output 1 [1, dim, 1, laneSpatial]
+    public let vOut: IOSurfaceRef          // fused output 2 [1, dim, 1, laneSpatial]
+    public let zeroLane: IOSurfaceRef
+    public let maskedLane: IOSurfaceRef
+    public let tokenScratch: IOSurfaceRef
+    public let maxSeq: Int
+    public let kernelMaxSeq: Int
+    public let laneSpatial: Int
+
+    public init(kernels: borrowing FusedDecodeKernelSet, logicalMaxSeq: Int? = nil) throws(ANEError) {
+        self.fusedIn = try kernels.fusedLayer.inputSurface(at: 0)
+        self.kCache = try kernels.fusedLayer.inputSurface(at: 1)
+        self.vCache = try kernels.fusedLayer.inputSurface(at: 2)
+        self.maskCache = try kernels.fusedLayer.inputSurface(at: 3)
+        self.xNextOut = try kernels.fusedLayer.outputSurface(at: 0)
+        self.kOut = try kernels.fusedLayer.outputSurface(at: 1)
+        self.vOut = try kernels.fusedLayer.outputSurface(at: 2)
+        self.maxSeq = logicalMaxSeq ?? kernels.maxSeq
+        self.kernelMaxSeq = kernels.kernelMaxSeq
+        self.laneSpatial = kernels.laneSpatial
+
+        guard let zeroLane = ane_interop_create_surface(ModelConfig.dim * kernels.laneSpatial * 2),
+              let maskedLane = ane_interop_create_surface(ModelConfig.dim * kernels.laneSpatial * 2),
+              let tokenScratch = ane_interop_create_surface(ModelConfig.dim * 2) else {
+            throw .surfaceAllocationFailed
+        }
+        self.zeroLane = zeroLane
+        self.maskedLane = maskedLane
+        self.tokenScratch = tokenScratch
+
+        if self.maxSeq == self.kernelMaxSeq {
+            self.kCacheFull = self.kCache
+            self.vCacheFull = self.vCache
+            self.maskCacheFull = self.maskCache
+        } else {
+            guard let kCacheFull = ane_interop_create_surface(ModelConfig.dim * self.maxSeq * 2),
+                  let vCacheFull = ane_interop_create_surface(ModelConfig.dim * self.maxSeq * 2),
+                  let maskCacheFull = ane_interop_create_surface(ModelConfig.dim * self.maxSeq * 2) else {
+                throw .surfaceAllocationFailed
+            }
+            self.kCacheFull = kCacheFull
+            self.vCacheFull = vCacheFull
+            self.maskCacheFull = maskCacheFull
+        }
+
+        let zeroLaneValues = Array(repeating: Float(0), count: ModelConfig.dim * kernels.laneSpatial)
+        let maskFill: Float = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_MASK_INIT_ZERO"] == "1" ? 0 : -1e4
+        let maskedLaneValues = Array(repeating: maskFill, count: ModelConfig.dim * kernels.laneSpatial)
+        zeroLaneValues.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: zeroLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        }
+        maskedLaneValues.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: maskedLane, data: src, channels: ModelConfig.dim, spatial: kernels.laneSpatial)
+        }
+    }
+}
+
 public extension ForwardPass {
     private static func synchronizeDecodeWindowCaches(
         handles: DecodeSurfaceHandles,
@@ -694,6 +767,329 @@ public extension ForwardPass {
             }
         } catch {
             throw .invalidArguments("final decode lane unpack failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        try decodeState.commitTokenStep(expectedIndex: tokenIndex)
+    }
+
+    // MARK: - Fused decode path
+
+    private static func synchronizeFusedDecodeWindowCaches(
+        handles: FusedDecodeSurfaceHandles,
+        windowBase: Int,
+        dim: Int
+    ) throws(ANEError) {
+        let windowSpatial = handles.kernelMaxSeq
+        for windowIndex in 0..<windowSpatial {
+            let globalIndex = windowBase + windowIndex
+            if globalIndex < handles.maxSeq {
+                do {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.kCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowIndex, dstSpatial: windowSpatial,
+                        src: handles.kCacheFull, srcChannelOffset: 0,
+                        srcSpatialIndex: globalIndex, srcSpatial: handles.maxSeq,
+                        channels: dim
+                    )
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.vCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowIndex, dstSpatial: windowSpatial,
+                        src: handles.vCacheFull, srcChannelOffset: 0,
+                        srcSpatialIndex: globalIndex, srcSpatial: handles.maxSeq,
+                        channels: dim
+                    )
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.maskCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowIndex, dstSpatial: windowSpatial,
+                        src: handles.maskCacheFull, srcChannelOffset: 0,
+                        srcSpatialIndex: globalIndex, srcSpatial: handles.maxSeq,
+                        channels: dim
+                    )
+                } catch {
+                    throw .invalidArguments("fused decode cache window sync failed at globalIndex=\(globalIndex): \(error)")
+                }
+            } else {
+                do {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.kCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowIndex, dstSpatial: windowSpatial,
+                        src: handles.zeroLane, srcChannelOffset: 0,
+                        srcSpatialIndex: 0, srcSpatial: handles.laneSpatial,
+                        channels: dim
+                    )
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.vCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowIndex, dstSpatial: windowSpatial,
+                        src: handles.zeroLane, srcChannelOffset: 0,
+                        srcSpatialIndex: 0, srcSpatial: handles.laneSpatial,
+                        channels: dim
+                    )
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.maskCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowIndex, dstSpatial: windowSpatial,
+                        src: handles.maskedLane, srcChannelOffset: 0,
+                        srcSpatialIndex: 0, srcSpatial: handles.laneSpatial,
+                        channels: dim
+                    )
+                } catch {
+                    throw .invalidArguments("fused decode padded-window fill failed at windowIndex=\(windowIndex): \(error)")
+                }
+            }
+        }
+    }
+
+    static func initializeFusedDecodeCachesAndMask(
+        surfaceHandles: [FusedDecodeSurfaceHandles],
+        dim: Int = ModelConfig.dim
+    ) {
+        precondition(dim > 0)
+        guard let first = surfaceHandles.first else { return }
+        let maxSeq = first.maxSeq
+        precondition(maxSeq > 0)
+
+        let zeroCache = Array(repeating: Float(0), count: dim * maxSeq)
+        let maskFill: Float = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_MASK_INIT_ZERO"] == "1" ? 0 : -1e4
+        let masked = Array(repeating: maskFill, count: dim * maxSeq)
+
+        for handles in surfaceHandles {
+            precondition(handles.maxSeq == maxSeq)
+            zeroCache.withUnsafeBufferPointer { src in
+                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: dim, spatial: maxSeq)
+                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: dim, spatial: maxSeq)
+            }
+            masked.withUnsafeBufferPointer { src in
+                SurfaceIO.writeFP16(to: handles.maskCacheFull, data: src, channels: dim, spatial: maxSeq)
+            }
+            if handles.maxSeq != handles.kernelMaxSeq {
+                do {
+                    try synchronizeFusedDecodeWindowCaches(handles: handles, windowBase: 0, dim: dim)
+                } catch {
+                    preconditionFailure("fused decode window init failed: \(error)")
+                }
+            }
+            do {
+                try SurfaceIO.copyFP16(
+                    dst: handles.fusedIn, dstChannelOffset: 0,
+                    src: handles.zeroLane, srcChannelOffset: 0,
+                    channels: dim, spatial: handles.laneSpatial
+                )
+            } catch {
+                preconditionFailure("fused decode lane zero-init failed: \(error)")
+            }
+        }
+    }
+
+    /// Fused decode loop: one dispatch per layer instead of two.
+    ///
+    /// Per layer: eval(fused) → K/V/mask cache update → chain xNext to next layer.
+    /// Eliminates the attn→FFN surface copy and one dispatch overhead per layer.
+    static func runFusedDecodeTimed(
+        xCur: borrowing TensorBuffer,
+        kernels: borrowing LayerStorage<FusedDecodeKernelSet>,
+        surfaceHandles: [FusedDecodeSurfaceHandles],
+        decodeState: inout DecodeState,
+        dim: Int = ModelConfig.dim,
+        timings: inout StepTimingBreakdown,
+        profiler: DecodeKernelProfiler? = nil
+    ) throws(ANEError) {
+        precondition(kernels.count > 0)
+        precondition(surfaceHandles.count == kernels.count)
+        precondition(dim > 0)
+        precondition(xCur.count == dim)
+        let maxSeq = decodeState.maxSeq
+        for handles in surfaceHandles {
+            precondition(handles.maxSeq == maxSeq)
+        }
+
+        let tokenIndex = try decodeState.beginTokenStep()
+        let laneSpatial = surfaceHandles[0].laneSpatial
+        let kernelMaxSeq = surfaceHandles[0].kernelMaxSeq
+        let forceFullWindowSync = DecodeRuntimeOptions.forceFullWindowSync
+        precondition(laneSpatial > 0)
+        for handles in surfaceHandles {
+            precondition(handles.laneSpatial == laneSpatial)
+            precondition(handles.kernelMaxSeq == kernelMaxSeq)
+        }
+        let windowBase = DecodeTiling.windowBase(for: tokenIndex, laneSpatial: kernelMaxSeq)
+        let windowLocalIndex = DecodeTiling.localIndex(for: tokenIndex, laneSpatial: kernelMaxSeq)
+
+        // CPU touch at decode boundary: write current token into fused input lane 0.
+        var t0 = RuntimeClock.now()
+        do {
+            try xCur.withUnsafeBufferPointer { xBuf in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: surfaceHandles[0].fusedIn,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    data: xBuf,
+                    channels: dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused decode token lane write failed: \(error)")
+        }
+        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+        for L in 0..<kernels.count {
+            let handles = surfaceHandles[L]
+
+            if handles.maxSeq != handles.kernelMaxSeq {
+                if forceFullWindowSync || DecodeTiling.shouldSyncWindow(for: tokenIndex, laneSpatial: kernelMaxSeq) {
+                    t0 = RuntimeClock.now()
+                    try synchronizeFusedDecodeWindowCaches(handles: handles, windowBase: windowBase, dim: dim)
+                    let windowSyncDelta = RuntimeClock.now() - t0
+                    timings.tIO += RuntimeClock.ms(windowSyncDelta)
+                }
+            }
+
+            // Single fused eval: attention + FFN in one dispatch.
+            t0 = RuntimeClock.now()
+            do {
+                try kernels[L].fusedLayer.eval()
+            } catch {
+                throw .invalidArguments("fusedDecodeLayer eval failed at layer \(L), token \(tokenIndex): \(error)")
+            }
+            let fusedEvalDelta = RuntimeClock.now() - t0
+            timings.tAne += RuntimeClock.ms(fusedEvalDelta)
+            let fusedEvalUS = RuntimeClock.us(fusedEvalDelta)
+            let fusedHwNS = kernels[L].fusedLayer.lastHWExecutionTimeNS()
+            let fusedHostOverheadUS = max(0, fusedEvalUS - Double(fusedHwNS) / 1_000.0)
+
+            // Update K cache from fused kernel K output.
+            t0 = RuntimeClock.now()
+            do {
+                try SurfaceIO.copyFP16SpatialSlice(
+                    dst: handles.kCacheFull, dstChannelOffset: 0,
+                    dstSpatialIndex: tokenIndex, dstSpatial: maxSeq,
+                    src: handles.kOut, srcChannelOffset: 0,
+                    srcSpatialIndex: 0, srcSpatial: laneSpatial,
+                    channels: dim
+                )
+                if handles.maxSeq != handles.kernelMaxSeq && !forceFullWindowSync {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.kCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowLocalIndex, dstSpatial: kernelMaxSeq,
+                        src: handles.kOut, srcChannelOffset: 0,
+                        srcSpatialIndex: 0, srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                }
+            } catch {
+                throw .invalidArguments("fused k-cache slice copy failed: \(error)")
+            }
+            let kUpdateDelta = RuntimeClock.now() - t0
+            timings.tIO += RuntimeClock.ms(kUpdateDelta)
+            let kUpdateUS = RuntimeClock.us(kUpdateDelta)
+
+            // Update V cache from fused kernel V output.
+            t0 = RuntimeClock.now()
+            do {
+                try SurfaceIO.copyFP16SpatialSlice(
+                    dst: handles.vCacheFull, dstChannelOffset: 0,
+                    dstSpatialIndex: tokenIndex, dstSpatial: maxSeq,
+                    src: handles.vOut, srcChannelOffset: 0,
+                    srcSpatialIndex: 0, srcSpatial: laneSpatial,
+                    channels: dim
+                )
+                if handles.maxSeq != handles.kernelMaxSeq && !forceFullWindowSync {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.vCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowLocalIndex, dstSpatial: kernelMaxSeq,
+                        src: handles.vOut, srcChannelOffset: 0,
+                        srcSpatialIndex: 0, srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                }
+            } catch {
+                throw .invalidArguments("fused v-cache slice copy failed: \(error)")
+            }
+            let vUpdateDelta = RuntimeClock.now() - t0
+            timings.tIO += RuntimeClock.ms(vUpdateDelta)
+            let vUpdateUS = RuntimeClock.us(vUpdateDelta)
+
+            // Flip mask at token index.
+            t0 = RuntimeClock.now()
+            do {
+                try SurfaceIO.copyFP16SpatialSlice(
+                    dst: handles.maskCacheFull, dstChannelOffset: 0,
+                    dstSpatialIndex: tokenIndex, dstSpatial: maxSeq,
+                    src: handles.zeroLane, srcChannelOffset: 0,
+                    srcSpatialIndex: 0, srcSpatial: laneSpatial,
+                    channels: dim
+                )
+                if handles.maxSeq != handles.kernelMaxSeq && !forceFullWindowSync {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: handles.maskCache, dstChannelOffset: 0,
+                        dstSpatialIndex: windowLocalIndex, dstSpatial: kernelMaxSeq,
+                        src: handles.zeroLane, srcChannelOffset: 0,
+                        srcSpatialIndex: 0, srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                }
+            } catch {
+                throw .invalidArguments("fused mask flip slice copy failed: \(error)")
+            }
+            let maskDelta = RuntimeClock.now() - t0
+            timings.tIO += RuntimeClock.ms(maskDelta)
+            let maskUpdateUS = RuntimeClock.us(maskDelta)
+
+            // Chain xNext output to next layer's fused input.
+            var chainToNextUS: Double = 0
+            if L + 1 < kernels.count {
+                t0 = RuntimeClock.now()
+                do {
+                    try SurfaceIO.copyFP16SpatialSlice(
+                        dst: surfaceHandles[L + 1].fusedIn, dstChannelOffset: 0,
+                        dstSpatialIndex: 0, dstSpatial: laneSpatial,
+                        src: handles.xNextOut, srcChannelOffset: 0,
+                        srcSpatialIndex: 0, srcSpatial: laneSpatial,
+                        channels: dim
+                    )
+                } catch {
+                    throw .invalidArguments("fused->next-layer chain failed: \(error)")
+                }
+                let nextCopyDelta = RuntimeClock.now() - t0
+                timings.tIO += RuntimeClock.ms(nextCopyDelta)
+                chainToNextUS = RuntimeClock.us(nextCopyDelta)
+            }
+
+            // Record profiling using the existing profiler (fused eval goes into attn slot,
+            // FFN fields are zero since there's no separate FFN dispatch).
+            profiler?.record(
+                layerIndex: L,
+                attnEvalUS: fusedEvalUS,
+                attnHwNS: fusedHwNS,
+                attnHostOverheadUS: fusedHostOverheadUS,
+                selfMaskUpdateUS: 0,
+                kCacheUpdateUS: kUpdateUS,
+                vCacheUpdateUS: vUpdateUS,
+                maskUpdateUS: maskUpdateUS,
+                x2ToFfnCopyUS: 0,
+                ffnEvalUS: 0,
+                ffnHwNS: 0,
+                ffnHostOverheadUS: 0,
+                ffnToNextAttnCopyUS: chainToNextUS
+            )
+        }
+
+        // CPU touch at decode boundary: read final xNext output.
+        let finalHandles = surfaceHandles[kernels.count - 1]
+        t0 = RuntimeClock.now()
+        do {
+            try xCur.withUnsafeMutableBufferPointer { out in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: finalHandles.xNextOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: laneSpatial,
+                    into: out,
+                    channels: dim
+                )
+            }
+        } catch {
+            throw .invalidArguments("fused final decode lane unpack failed: \(error)")
         }
         timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
 
