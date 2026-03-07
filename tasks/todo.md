@@ -186,3 +186,16 @@
   - smoke test reverted
   - keep committed scaffolding as reference only
   - pivot to a narrower direct-select-only final-triplet fusion
+## Review - 2026-03-08 blocked direct-select-only final-triplet fusion
+
+- Attempted:
+  - narrower final-triplet fusion for direct-select only
+  - outputs `stateOut0/stateOut1/stateOut2/logits`
+  - no `xNext` output on the final fused block
+- Findings:
+  - contract tests passed
+  - hardware compile smoke still failed with `InvalidMILProgram`
+- Decision:
+  - treat this as the same compiler wall class as the blocked full fused session
+  - revert the direct-select-only fusion scaffolding
+  - pivot away from classifier-attached recurrent-triplet fusion for now

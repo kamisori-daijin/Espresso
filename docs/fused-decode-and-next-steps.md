@@ -1323,3 +1323,31 @@ Decision:
     - direct-select-only final-triplet fusion
     - omit `xNext` on the last fused block
     - return only recurrent carry state plus logits
+## 2026-03-08 - Blocked direct-select-only final-triplet fusion
+
+- Goal:
+  - try a materially different narrower fusion after the blocked full-session path
+  - final fused triplet returns only:
+    - `stateOut0`
+    - `stateOut1`
+    - `stateOut2`
+    - `logits`
+  - intentionally omit `xNext` on the last fused block for the direct-select path
+- Why:
+  - lower output arity than the blocked `5`-output fused session
+  - better performance shape even if it compiled, because it would remove the final hidden-state readback
+- What was built:
+  - direct-select-only generator and kernelset contract tests
+  - direct-select-only generator and kernelset implementation
+  - hardware compile smoke for the new kernelset
+- Result:
+  - compile-spec tests passed
+  - hardware compile still failed with:
+    - `_ANECompiler : ANECCompile() FAILED`
+    - `InvalidMILProgram`
+- Interpretation:
+  - inference: appending the full vocab head to the fused recurrent triplet appears structurally blocked on the current ANE compiler path, not just because of the extra `xNext` output
+  - this materially lowers confidence in further "triplet + 32k classifier" full fusion variants
+- Decision:
+  - roll back the direct-select-only fusion scaffolding
+  - move on to a different class of avenue rather than spending more time on the same compiler wall
