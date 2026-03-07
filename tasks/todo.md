@@ -199,3 +199,13 @@
   - treat this as the same compiler wall class as the blocked full fused session
   - revert the direct-select-only fusion scaffolding
   - pivot away from classifier-attached recurrent-triplet fusion for now
+
+## 2026-03-08 - Exact sharded head avenue
+- [ ] Add contract tests for an exact sharded ANE RMSNorm+classifier head that preserves current token parity.
+- [ ] Implement a phase-1 sharded head by reusing `GenerationRMSNormClassifierKernelSet` per shard and merging top-1 by score.
+- [ ] Keep weight schema unchanged in phase 1 by deriving classifier source from `embedding` when `sharedClassifier == true`.
+- [ ] Benchmark sharded head against current saved best `2.129125 ms/token` with the existing fused-triplet direct-select harness.
+- [ ] Revert immediately if median latency regresses or parity breaks.
+- [ ] Append attempt rationale and measured result to `docs/fused-decode-and-next-steps.md`.
+- [x] Measure exact sharded ANE RMSNorm+classifier head (`16384/8192/4096`) against the saved best path.
+- [x] Reject the sharded-head avenue: all measured shard sizes regressed and the regression worsened with shard count.

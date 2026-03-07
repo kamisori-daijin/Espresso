@@ -1351,3 +1351,28 @@ Decision:
 - Decision:
   - roll back the direct-select-only fusion scaffolding
   - move on to a different class of avenue rather than spending more time on the same compiler wall
+
+## 2026-03-08 - Rejected exact sharded RMSNorm+classifier head
+
+Why tried:
+- Cheapest exact staged-head probe after the triplet+head fusion wall.
+- Reused the existing `GenerationRMSNormClassifierKernelSet` with smaller vocab shards and merged top-1 by score.
+- Goal was to see whether smaller classifier convs beat the current monolithic head despite extra dispatches.
+
+Method:
+- Added an opt-in `ANE_RMS_HEAD_SHARD_VOCAB` gate for the ANE RMSNorm+classifier output head.
+- Kept the recurrent fused-triplet direct-select trunk unchanged.
+- Benchmarked `6` layers, prompt `[0]`, `8` generated tokens, `3` warmups, `20` timed iterations, median `ms/token`.
+- Verified parity against the baseline path in the same hardware test.
+
+Results:
+- Baseline: compile `4189.8249166666665 ms`, runtime `2.2191796875 ms/token`, `450.6169579834891 tok/s`
+- Sharded `16384` (2 shards): compile `4218.095541666667 ms`, runtime `2.4288697916666666 ms/token`, `411.7141245821209 tok/s`
+- Sharded `8192` (4 shards): compile `4254.90175 ms`, runtime `2.6128776041666666 ms/token`, `382.7198022614355 tok/s`
+- Sharded `4096` (8 shards): compile `4445.996916666667 ms`, runtime `3.6560390624999997 ms/token`, `273.5200535073605 tok/s`
+
+Interpretation:
+- Strong negative result.
+- Inference: dispatch and repeated surface I/O dominate any benefit from smaller classifier shards.
+- The regression increases with shard count, so this is not a near-miss tuning issue.
+- Reverted the implementation and tests after measurement.
