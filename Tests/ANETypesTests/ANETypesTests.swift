@@ -686,6 +686,64 @@ final class ANETypesTests: XCTestCase {
         XCTAssertEqual(argmax.value, expectedValue, accuracy: 1e-2)
     }
 
+    func test_surface_argmax_fp16_spatial_slice_prefers_first_max_across_unrolled_groups() throws {
+        let totalChannels = 12
+        let channelOffset = 1
+        let channels = 10
+        let spatial = 2
+        let surface = makeSurface(bytes: totalChannels * spatial * 2)
+
+        let input: [Float] = [
+            -9.0, -8.0,
+            0.5, 0.0,
+            8.0, -1.0,
+            -3.0, -2.0,
+            1.0, 1.5,
+            8.0, 2.0,
+            2.0, 3.0,
+            8.0, 4.0,
+            0.0, 5.0,
+            -1.0, 6.0,
+            8.0, 7.0,
+            9.0, 10.0,
+        ]
+        input.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: surface, data: src, channels: totalChannels, spatial: spatial)
+        }
+
+        var lane = Array(repeating: Float.nan, count: channels)
+        try lane.withUnsafeMutableBufferPointer { dst in
+            try SurfaceIO.readFP16SpatialSlice(
+                from: surface,
+                channelOffset: channelOffset,
+                spatialIndex: 0,
+                spatial: spatial,
+                into: dst,
+                channels: channels
+            )
+        }
+
+        var expectedIndex = 0
+        var expectedValue = lane[0]
+        for idx in 1..<lane.count where lane[idx] > expectedValue {
+            expectedIndex = idx
+            expectedValue = lane[idx]
+        }
+
+        let argmax = try SurfaceIO.argmaxFP16SpatialSlice(
+            from: surface,
+            channelOffset: channelOffset,
+            spatialIndex: 0,
+            spatial: spatial,
+            channels: channels
+        )
+
+        XCTAssertEqual(expectedIndex, 1)
+        XCTAssertEqual(expectedValue, 8.0, accuracy: 1e-2)
+        XCTAssertEqual(argmax.index, expectedIndex)
+        XCTAssertEqual(argmax.value, expectedValue, accuracy: 1e-2)
+    }
+
     func test_surface_write_fp16_spatial_slice_can_overwrite_lane_without_rezeroing_full_surface() throws {
         let channels = 4
         let spatial = 3
