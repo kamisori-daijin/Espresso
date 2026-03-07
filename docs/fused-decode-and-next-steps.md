@@ -1237,3 +1237,30 @@ Decision:
 - Interpretation:
   - measured win is small but positive and above the immediate regression/no-regression threshold for this avenue
   - most of the remaining single-stream budget is still in trunk + output-head boundaries, so this is a saved micro-gain rather than a path-changing breakthrough
+## 2026-03-08 - Direct-select argmax ILP widening
+
+- Change: widened `ane_interop_io_argmax_fp16_spatial_slice` to keep `8` independent maxima in flight before a stable first-max reduction
+  - goal: reduce loop-carried dependency in the `32_000`-channel, stride-`32` scan used by the current best direct-select head
+  - preserved first-max semantics explicitly during the final reduction
+- Guard tests:
+  - `swift test --filter ANETypesTests`
+  - added `ANETypesTests/test_surface_argmax_fp16_spatial_slice_prefers_first_max_across_unrolled_groups`
+- Control before this change:
+  - median from the previous saved argmax optimization: `2.159026041666667 ms/token`
+- Post-change repeated runs:
+  - `2.129125 ms/token`, `469.67654812253164 tok/s`
+  - `2.1766796875 ms/token`, `459.42070485198116 tok/s`
+  - `2.1179270833333335 ms/token`, `472.15979807418256 tok/s`
+- Post-change median across the three repeated runs:
+  - `2.129125 ms/token`, `469.67654812253164 tok/s`
+- Delta versus the prior control:
+  - `0.02990104166666683 ms/token` faster
+  - about `1.38%` lower latency
+- Cumulative direct-select argmax savings from the fresh `2026-03-08` pre-optimization baseline:
+  - baseline `2.2018489583333336 ms/token`
+  - current `2.129125 ms/token`
+  - cumulative saved `0.07272395833333361 ms/token`
+  - cumulative reduction about `3.30%`
+- Interpretation:
+  - another real but still small micro-gain
+  - this confirms the output-surface argmax path is movable, but not enough by itself to close the remaining gap to `6x`

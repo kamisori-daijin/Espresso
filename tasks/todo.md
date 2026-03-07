@@ -134,3 +134,22 @@
 - Next:
   - probe explicit lock-amortized or unlocked direct-select path to remove per-token IOSurface lock overhead
   - if that stalls, move to fused recurrent-triplet + output-head compile path
+## Review - 2026-03-08 direct-select argmax ILP widening
+
+- Added guard test: `ANETypesTests/test_surface_argmax_fp16_spatial_slice_prefers_first_max_across_unrolled_groups`
+- Kept implementation win:
+  - `perf(ane): widen fp16 argmax reduction`
+  - prior control median: `2.159026041666667 ms/token`
+  - repeated post-change runs: `2.129125`, `2.1766796875`, `2.1179270833333335 ms/token`
+  - post-change median: `2.129125 ms/token`
+  - saved: `0.02990104166666683 ms/token` (`~1.38%`)
+- Cumulative direct-select argmax savings on 2026-03-08:
+  - fresh pre-optimization baseline: `2.2018489583333336 ms/token`
+  - current best after two saved argmax changes: `2.129125 ms/token`
+  - total saved: `0.07272395833333361 ms/token` (`~3.30%`)
+- Verification:
+  - `swift test --filter ANETypesTests`
+  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_recurrent_generation_fused_triplet_direct_select_reports_comparison_on_hardware`
+- Next:
+  - move off pure argmax ILP unless a more layout-specific specialization appears
+  - inspect recurrent-step state/input synchronization for batched or unlocked copy reductions
