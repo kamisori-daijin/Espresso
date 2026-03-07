@@ -291,30 +291,128 @@ bool ane_interop_io_argmax_fp16_spatial_slice(IOSurfaceRef surface,
     int c = 1;
     const _Float16 *cursor = srcF16 + baseIdx + stride;
 
-    for (; c + 3 < channels; c += 4) {
-        _Float16 value0 = cursor[0];
-        _Float16 value1 = cursor[stride];
-        _Float16 value2 = cursor[stride * 2];
-        _Float16 value3 = cursor[stride * 3];
+    if (channels >= 8) {
+        _Float16 bestValue0 = srcF16[baseIdx];
+        _Float16 bestValue1 = srcF16[baseIdx + stride];
+        _Float16 bestValue2 = srcF16[baseIdx + stride * 2];
+        _Float16 bestValue3 = srcF16[baseIdx + stride * 3];
+        _Float16 bestValue4 = srcF16[baseIdx + stride * 4];
+        _Float16 bestValue5 = srcF16[baseIdx + stride * 5];
+        _Float16 bestValue6 = srcF16[baseIdx + stride * 6];
+        _Float16 bestValue7 = srcF16[baseIdx + stride * 7];
+        int bestIndex0 = 0;
+        int bestIndex1 = 1;
+        int bestIndex2 = 2;
+        int bestIndex3 = 3;
+        int bestIndex4 = 4;
+        int bestIndex5 = 5;
+        int bestIndex6 = 6;
+        int bestIndex7 = 7;
 
-        if (value0 > bestValue) {
-            bestValue = value0;
-            bestIndex = c;
-        }
-        if (value1 > bestValue) {
-            bestValue = value1;
-            bestIndex = c + 1;
-        }
-        if (value2 > bestValue) {
-            bestValue = value2;
-            bestIndex = c + 2;
-        }
-        if (value3 > bestValue) {
-            bestValue = value3;
-            bestIndex = c + 3;
+        c = 8;
+        cursor = srcF16 + baseIdx + stride * 8;
+        for (; c + 7 < channels; c += 8) {
+            _Float16 value0 = cursor[0];
+            _Float16 value1 = cursor[stride];
+            _Float16 value2 = cursor[stride * 2];
+            _Float16 value3 = cursor[stride * 3];
+            _Float16 value4 = cursor[stride * 4];
+            _Float16 value5 = cursor[stride * 5];
+            _Float16 value6 = cursor[stride * 6];
+            _Float16 value7 = cursor[stride * 7];
+
+            if (value0 > bestValue0) {
+                bestValue0 = value0;
+                bestIndex0 = c;
+            }
+            if (value1 > bestValue1) {
+                bestValue1 = value1;
+                bestIndex1 = c + 1;
+            }
+            if (value2 > bestValue2) {
+                bestValue2 = value2;
+                bestIndex2 = c + 2;
+            }
+            if (value3 > bestValue3) {
+                bestValue3 = value3;
+                bestIndex3 = c + 3;
+            }
+            if (value4 > bestValue4) {
+                bestValue4 = value4;
+                bestIndex4 = c + 4;
+            }
+            if (value5 > bestValue5) {
+                bestValue5 = value5;
+                bestIndex5 = c + 5;
+            }
+            if (value6 > bestValue6) {
+                bestValue6 = value6;
+                bestIndex6 = c + 6;
+            }
+            if (value7 > bestValue7) {
+                bestValue7 = value7;
+                bestIndex7 = c + 7;
+            }
+
+            cursor += stride * 8;
         }
 
-        cursor += stride * 4;
+        bestValue = bestValue0;
+        bestIndex = bestIndex0;
+        if (bestValue1 > bestValue || (bestValue1 == bestValue && bestIndex1 < bestIndex)) {
+            bestValue = bestValue1;
+            bestIndex = bestIndex1;
+        }
+        if (bestValue2 > bestValue || (bestValue2 == bestValue && bestIndex2 < bestIndex)) {
+            bestValue = bestValue2;
+            bestIndex = bestIndex2;
+        }
+        if (bestValue3 > bestValue || (bestValue3 == bestValue && bestIndex3 < bestIndex)) {
+            bestValue = bestValue3;
+            bestIndex = bestIndex3;
+        }
+        if (bestValue4 > bestValue || (bestValue4 == bestValue && bestIndex4 < bestIndex)) {
+            bestValue = bestValue4;
+            bestIndex = bestIndex4;
+        }
+        if (bestValue5 > bestValue || (bestValue5 == bestValue && bestIndex5 < bestIndex)) {
+            bestValue = bestValue5;
+            bestIndex = bestIndex5;
+        }
+        if (bestValue6 > bestValue || (bestValue6 == bestValue && bestIndex6 < bestIndex)) {
+            bestValue = bestValue6;
+            bestIndex = bestIndex6;
+        }
+        if (bestValue7 > bestValue || (bestValue7 == bestValue && bestIndex7 < bestIndex)) {
+            bestValue = bestValue7;
+            bestIndex = bestIndex7;
+        }
+    } else {
+        for (; c + 3 < channels; c += 4) {
+            _Float16 value0 = cursor[0];
+            _Float16 value1 = cursor[stride];
+            _Float16 value2 = cursor[stride * 2];
+            _Float16 value3 = cursor[stride * 3];
+
+            if (value0 > bestValue) {
+                bestValue = value0;
+                bestIndex = c;
+            }
+            if (value1 > bestValue) {
+                bestValue = value1;
+                bestIndex = c + 1;
+            }
+            if (value2 > bestValue) {
+                bestValue = value2;
+                bestIndex = c + 2;
+            }
+            if (value3 > bestValue) {
+                bestValue = value3;
+                bestIndex = c + 3;
+            }
+
+            cursor += stride * 4;
+        }
     }
 
     for (; c < channels; c++, cursor += stride) {
