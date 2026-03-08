@@ -319,3 +319,21 @@
 - Conclusion:
   - revert the packed-state generator/kernelset/session/backend
   - treat the current packed-state topology as blocked
+
+## Next Probe - 2026-03-08 extend matched concurrent serving beyond 4 streams
+- [ ] Extend the matched concurrent ANE/CoreML serving benchmark beyond `4` streams.
+- [ ] Measure whether the matched aggregate ratio crosses `6x` at `5+` streams.
+- [ ] Keep only benchmark/doc updates unless the harness itself needs correction.
+
+## Review - 2026-03-08 matched concurrent serving crosses 6x
+- Tried:
+  - extended the matched concurrent ANE/CoreML serving benchmark from `1/2/3/4` to `1/2/3/4/5/6` streams
+  - repeated the benchmark twice for stability
+- Result:
+  - run 1 cleared `6x` at `1/2/3` streams and reached `5.77x` at `4`
+  - run 2 cleared `6x` at `1/2/3/4` streams
+  - ratio fell below `6x` at `5` and `6` streams in both runs
+- Conclusion:
+  - matched concurrent serving has now produced a repeated `6x` breakthrough on this branch
+  - best operating range is `2-4` streams, with the strongest aggregate ratio around `2-4`
+  - keep the extended concurrent benchmark coverage

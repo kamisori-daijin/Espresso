@@ -1172,7 +1172,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let warmup = 3
         let iterations = 20
         let maxNewTokens = 8
-        let streamCounts = [1, 2, 3, 4]
+        let streamCounts = [1, 2, 3, 4, 5, 6]
         let modelPath = "benchmarks/models/transformer_6layer.mlpackage"
 
         let ane = try benchmarkConcurrentRecurrentEchoGeneration(

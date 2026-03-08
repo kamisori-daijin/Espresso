@@ -1537,3 +1537,38 @@ Interpretation:
 - This is a different failure class from the larger-fusion `InvalidMILProgram` wall: packing the recurrent state compiles, but the runtime/evaluator rejects the program at execution.
 - Inference: the current packed-state recurrent surface topology is not viable on this branch as implemented, even though the underlying MIL is syntactically acceptable.
 - The probe should be reverted and treated as blocked unless a materially different packing strategy appears.
+
+## 2026-03-08 - Matched concurrent serving crosses 6x through 4 streams
+
+What changed:
+- Extended the matched concurrent ANE/CoreML serving benchmark from `1/2/3/4` streams to `1/2/3/4/5/6` streams.
+- Repeated the same hardware benchmark twice to check whether the `6x` aggregate ratio was stable.
+
+Why:
+- After the single-stream exact architecture space mostly collapsed into compiler/runtime walls or regressions, matched serving throughput was the remaining path with a realistic shot at a branch-visible `6x` result.
+- The earlier `4`-stream run was already near the threshold.
+
+Repeated matched results:
+- Run 1:
+  - `1` stream: ANE `437.04 tok/s`, CoreML `65.79 tok/s`, ratio `6.64x`
+  - `2` streams: ANE `853.12 tok/s`, CoreML `121.88 tok/s`, ratio `7.00x`
+  - `3` streams: ANE `1146.17 tok/s`, CoreML `181.29 tok/s`, ratio `6.32x`
+  - `4` streams: ANE `1245.14 tok/s`, CoreML `215.92 tok/s`, ratio `5.77x`
+  - `5` streams: ANE `1277.27 tok/s`, CoreML `232.71 tok/s`, ratio `5.49x`
+  - `6` streams: ANE `1235.92 tok/s`, CoreML `244.80 tok/s`, ratio `5.05x`
+- Run 2:
+  - `1` stream: ANE `442.53 tok/s`, CoreML `65.69 tok/s`, ratio `6.74x`
+  - `2` streams: ANE `827.85 tok/s`, CoreML `122.17 tok/s`, ratio `6.78x`
+  - `3` streams: ANE `1181.93 tok/s`, CoreML `181.08 tok/s`, ratio `6.53x`
+  - `4` streams: ANE `1299.59 tok/s`, CoreML `215.78 tok/s`, ratio `6.02x`
+  - `5` streams: ANE `1247.67 tok/s`, CoreML `232.41 tok/s`, ratio `5.37x`
+  - `6` streams: ANE `1206.56 tok/s`, CoreML `245.53 tok/s`, ratio `4.91x`
+
+Interpretation:
+- This is the first repeated, matched benchmark configuration on the branch that clears `6x` over CoreML.
+- The serving knee is around `3-4` streams:
+  - aggregate ANE throughput improves through `4` streams
+  - per-stream throughput degrades steadily after `2` streams
+  - the ANE/CoreML ratio drops below `6x` at `5+` streams
+- This is a serving-throughput breakthrough, not a single-stream decode breakthrough.
+- Caveat: the concurrent CoreML `1`-stream result remains much slower than the standing single-stream CoreML control, so any external claim should explicitly say this is the matched concurrent serving harness.
