@@ -1496,3 +1496,24 @@ Interpretation:
 - Larger recurrent lanes make the fused-triplet trunk slower end-to-end, even when logits time holds roughly flat.
 - Inference: `32` is also the best lane geometry for the current fused-triplet recurrent trunk on this branch.
 - Combined with the larger output-head lane sweep, this largely closes the remaining low-cost lane-geometry space for the current exact architecture.
+
+## 2026-03-08 - Metal argmax over ANE output-head surface regresses badly
+
+What was tried:
+- Added a `MetalFP16ArgmaxKernel` that binds the ANE output-head IOSurface as a shared Metal buffer and performs an exact FP16 argmax reduction on the GPU.
+- Wired it behind an opt-in `ANE_DIRECT_SELECT_METAL_ARGMAX=1` path in the existing direct-select output head.
+- Added synthetic parity tests for spatial-slice correctness and first-max tie behavior, plus a fused-triplet hardware comparison benchmark.
+
+Why:
+- The remaining exact selection question was whether the final host-side argmax reduction could be moved off the CPU without changing the ANE graph.
+
+Measured results:
+- Synthetic parity tests passed.
+- Hardware parity matched token outputs on fused-triplet direct-select.
+- Baseline direct-select: `2.2768203125 ms/token`, `439.20912074503667 tok/s`, compile `507.5502916666667 ms`, trunk `1.1505390625`, logits `1.1085625000000001`
+- Metal argmax: `2.7085859374999997 ms/token`, `369.2032609704555 tok/s`, compile `514.7445833333334 ms`, trunk `1.0979609375`, logits `1.6178229166666667`
+
+Interpretation:
+- The GPU reduction preserved exactness but added too much per-token dispatch/synchronization overhead.
+- The extra cost landed almost entirely in the logits/selection budget, which grew by about `0.509 ms/token`.
+- Inference: a standalone Metal reduction is not a viable replacement for the current host argmax on this branch.

@@ -276,3 +276,23 @@
 - Conclusion:
   - revert the test-only sweep
   - treat `32` as the best lane geometry for the existing fused-triplet recurrent trunk
+
+## Next Probe - 2026-03-08 Metal argmax over ANE output-head IOSurface
+- [ ] Add failing parity tests for a Metal FP16 argmax reducer over an IOSurface lane slice.
+- [ ] Add a hardware benchmark comparing current direct-select argmax vs env-gated Metal argmax on fused-triplet direct-select.
+- [ ] Implement the Metal reducer and wire it behind an opt-in output-head selection path.
+- [ ] Keep only a stable runtime win; otherwise revert code/tests and retain docs.
+
+## Review - 2026-03-08 Metal argmax over ANE output-head surface regresses
+- Tried:
+  - exact Metal FP16 argmax reducer over the ANE output-head IOSurface
+  - env-gated direct-select integration on fused-triplet direct-select
+- Why:
+  - materially different exact selection path after geometry and fusion avenues stalled
+- Result:
+  - synthetic parity passed and hardware token parity held
+  - runtime regressed from `2.2768203125` to `2.7085859374999997 ms/token`
+  - logits/selection time regressed from `1.1085625000000001` to `1.6178229166666667 ms/token`
+- Conclusion:
+  - revert the Metal reducer and tests
+  - do not spend more time on standalone GPU argmax for this branch
