@@ -20,6 +20,7 @@ enum EspressoTrainMain {
         var checkpointPath: String = defaultCheckpointPath
         var modelPath: String = defaultModelPath
         var dataPath: String = defaultDataPath
+        var twoStepStudentSidecarPath: String?
     }
 
     private enum TrainExit {
@@ -60,6 +61,8 @@ enum EspressoTrainMain {
                 if i + 1 < argv.count { a.modelPath = argv[i + 1]; i += 1 }
             case "--data":
                 if i + 1 < argv.count { a.dataPath = argv[i + 1]; i += 1 }
+            case "--export-two-step-student":
+                if i + 1 < argv.count { a.twoStepStudentSidecarPath = argv[i + 1]; i += 1 }
             default:
                 break
             }
@@ -283,6 +286,22 @@ enum EspressoTrainMain {
                     for i in 0..<(vocab * dim) { ptr[i] = randSymmetric(scale: escaleD) }
                 }
             }
+        }
+
+        if let sidecarPath = args.twoStepStudentSidecarPath {
+            let emptyClassifier = TensorBuffer(count: 0, zeroed: true)
+            let sidecar = try TwoStepStudentCheckpoint.seedFromTeacher(
+                dim: dim,
+                vocabSize: vocab,
+                layerCount: nLayers,
+                teacherRMS: rmsFinal,
+                teacherEmbedding: embed,
+                teacherClassifier: emptyClassifier,
+                teacherClassifierWasShared: true
+            )
+            try TwoStepStudentCheckpoint.save(path: sidecarPath, sidecar: sidecar)
+            print("[exported two-step student sidecar: \(sidecarPath)]")
+            return .finished
         }
 
         // mmap token data.

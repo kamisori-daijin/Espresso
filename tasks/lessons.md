@@ -77,3 +77,7 @@
 - Keep SwiftPM test-target dependencies aligned with actual test imports; stale dependency lists can create false `no such module` failures and block focused verification of unrelated ANE work.
 - For hardware-gated generation tests, run the committed XCTest seam with `ANE_HARDWARE_TESTS=1` before trusting any disposable probe; if the run stalls, sample the test process and record the exact compile stack instead of inferring the blocker.
 - When hardware truth is blocked before first output, split the seam into compile/init-only control and compile/init-only candidate tests before touching runtime metrics; this cleanly separates ANE compile stalls from decode/runtime regressions.
+
+## 2026-03-10 — Student Pivot Packaging
+- When a new decode contract needs trainable artifacts but runtime truth is blocked, add a separate sidecar format instead of extending the base checkpoint/resume blob; future-head artifacts should version independently from optimizer-resume state.
+- Seed new auxiliary heads from the teacher weights that already define the contract entrypoint (`rmsFinal` and classifier/embedding) so export produces a recoverable training start, not an empty placeholder.

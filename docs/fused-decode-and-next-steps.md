@@ -394,6 +394,59 @@ Hard gate result:
 - do not start future-head work on this checkpoint family
 - pivot next to a student trained for the two-step exact contract unless a future host/session can make the compile/init seam reach first output quickly
 
+## 2026-03-10 — Student pivot: added two-step future-head sidecar and export seam
+
+### Why this pivot is the correct next move
+
+Measured blocker from the bounded hardware pass:
+
+- both the control and the two-step compile/init-only seams stalled before first output in `_ANEClient compileModel`
+- this blocks same-session runtime truth for the current checkpoint family
+
+Inference from the code structure:
+
+- the two-step branch-state-promotion architecture remains a valid reference contract for accepted-work reuse
+- the next productive step is to make that contract trainable and serializable without reopening the blocked runtime path
+
+### Implementation
+
+Added a separate sidecar artifact for the exact two-step contract instead of extending the base checkpoint format:
+
+- new file format: `TwoStepStudentCheckpoint`
+- strict contract metadata: `dim`, `vocabSize`, `layerCount`, `horizon=2`, exact prefix-only, prepared-state promotion, and whether the teacher classifier was shared
+- stored weights: one future-head RMS vector and one full `vocab x dim` future classifier matrix
+- seeding path: copy the teacher `rmsFinal`, then copy either the shared embedding matrix or the explicit classifier matrix into the future classifier seed
+
+This keeps `Checkpoint.save/load` and training-resume compatibility unchanged while allowing the student future-head contract to version independently.
+
+### Verification
+
+- `swift test --filter TwoStepStudentCheckpointTests`
+- `swift build --build-tests`
+- `swift run espresso-train --model /does/not/exist --export-two-step-student /tmp/espresso-two-step-student-sidecar.bin`
+
+Observed result:
+
+- the focused sidecar test suite passed `4/4`
+- the package built successfully with tests enabled
+- the CLI export seam succeeded even with a missing pretrained model because it falls back to deterministic random init and exits immediately after writing the sidecar
+
+### Artifact footprint
+
+For the current `ModelConfig` (`dim=768`, `vocab=32000`, `layers=12`), the exported sidecar written by the CLI seam was:
+
+- `/tmp/espresso-two-step-student-sidecar.bin`
+- `98307104` bytes on disk
+
+That size matches the intended artifact shape: one `768`-float RMS vector, one full `32000 x 768` float classifier matrix, and a small binary header.
+
+### Decision
+
+- keep `3e6cced` as the architectural reference for the exact two-step contract
+- keep `2e49cab` as the hardware compile/init gate result
+- use the new sidecar/export seam as the student-route starting point
+- do not start runtime future-head integration on this checkpoint family until a future host/session can produce honest same-session hardware medians
+
 ## 2026-03-10 — Rejected clustered exact CPU staged head
 
 ### Attempt
