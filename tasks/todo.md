@@ -4,8 +4,9 @@
 - [x] Re-run hardware truth with longer-budget standalone or release probes before declaring the compile path permanently blocked; log control compile/init time, two-step compile/init time, committed exact tokens/pass, effective `ms/token`, and exact parity status if the run clears first output.
 - [x] Add the smallest direct compile/init instrumentation seam needed to distinguish very long ANE compile latency from a true deadlock or shared-gate stall.
 - [x] Commit `espresso-multitoken-probe` as the low-overhead exact hardware truth seam and keep its repeated 1-layer/2-layer/3-layer/6-layer results recoverable in docs and Wax.
-- [ ] Commit the fused-pair two-step trunk breakthrough and keep the repeated 2-layer/4-layer wins recoverable in docs and Wax.
-- [ ] Attack the next measured bottleneck with one hypothesis: extend fused two-step trunk reuse from pairs to triplets and rerun the 6-layer exact comparison before touching future-head training.
+- [x] Commit the fused-pair two-step trunk breakthrough and keep the repeated 2-layer/4-layer wins recoverable in docs and Wax.
+- [ ] Commit the fused-triplet two-step trunk breakthrough and keep the repeated 6-layer exact wins recoverable in docs and Wax.
+- [ ] Attack the next measured bottleneck with one hypothesis: measure whether the current fused-triplet exact path can be pushed below the standing single-stream best with head batching or candidate-specific lane sweeps before touching future-head training.
 - [ ] If fused two-step trunk work still fails to produce a broader exact win, batch both prepared activations through one verifier-head eval and rerun the same matched-control ladder.
 - [ ] Keep attempt logging exhaustive in `docs/fused-decode-and-next-steps.md`, update review notes below after every major result, write Wax session + durable notes after each confirmed result, and flush immediately.
 
@@ -21,3 +22,4 @@
 - Fusing the exact two-step trunk into pair sessions materially changed the ceiling: repeated 2-layer fused-pair runs now favored exact two-step (`1.534096`, `1.556641 ms/token`) over the matched fused-pair control (`2.124839`, `1.679589 ms/token`) with exact parity and `2.0` committed exact tokens/pass.
 - The pair-fused win extends through 4 layers: control `2.195484`, `2.334737 ms/token` versus fused-pair two-step `2.149909`, `2.234477 ms/token`.
 - The 6-layer gap narrowed sharply but did not close yet: fused-triplet control `2.146151`, `2.293576 ms/token` versus 6-layer two-step built from fused pairs `2.317794`, `2.529677 ms/token`.
+- Extending the same idea to fused triplets closed that remaining gap: repeated 6-layer exact runs now favored fused-triplet two-step (`2.197565`, `2.176102 ms/token`) over the strong fused-triplet control (`2.616013`, `2.397878 ms/token`) with exact parity and `2.0` committed exact tokens/pass.

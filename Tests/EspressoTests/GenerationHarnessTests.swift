@@ -630,22 +630,22 @@ final class GenerationHarnessTests: XCTestCase {
         }
     }
 
-    func test_exact_two_token_branch_state_promotion_rejects_unimplemented_fused_triplet_backend() {
-        let weights = makeGenerationTestRecurrentWeights(layerCount: 3)
+    func test_exact_two_token_branch_state_promotion_rejects_non_multiple_of_three_for_fused_triplet_backend() {
+        let weights = makeGenerationTestRecurrentWeights(layerCount: 5)
 
         do {
             _ = try ANEExactTwoTokenBranchStatePromotionModel(
                 weights: weights,
-                layerCount: 3,
+                layerCount: 5,
                 maxSequenceTokens: 32,
                 outputHeadBackend: .cpu,
                 trunkBackend: .fusedThreeLayerTriplets
             )
-            XCTFail("Expected fused-triplet exact two-token backend to throw")
+            XCTFail("Expected non-multiple-of-three fused-triplet exact two-token backend to throw")
         } catch {
             XCTAssertEqual(
                 error,
-                .invalidArguments("exact two-token fused three-layer trunk backend is not implemented")
+                .invalidArguments("exact two-token fused three-layer trunk backend requires a layerCount that is a multiple of 3")
             )
         }
     }

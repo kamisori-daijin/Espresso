@@ -611,6 +611,69 @@ Measured limit:
 - keep the fused-pair two-step trunk as the new best exact multi-token path on this branch
 - next hypothesis should extend fused verifier reuse to triplets before falling back to batched verifier heads or future-head training
 
+## 2026-03-10 — Fused triplet two-step trunk wins the strong 6-layer exact control
+
+### Hypothesis
+
+Pair fusion proved that the exact two-step path only started scaling once its verifier trunk mirrored the control path's own fusion pattern. The next step was to extend that same idea to triplets and measure it directly against the strong 6-layer fused-triplet control.
+
+### Implementation
+
+Added a triplet-fused exact two-step stack:
+
+- new MIL generator: `RWKVStyleFusedThreeLayerTwoStepGenerator`
+- new runtime kernel wrapper: `RWKVStyleFusedThreeLayerTwoStepKernelSet`
+- new exact recurrent session: `RWKVStyleFusedThreeLayerTwoStepSession`
+- extended `ANEExactTwoTokenBranchStatePromotionModel` to support `.fusedThreeLayerTriplets`
+
+The probe surface already supported `--two-step-backend`, so the only runtime change needed after the backend implementation was to point the exact path at the new fused-triplet trunk.
+
+### Verification
+
+- `swift test --filter RWKVStyleFusedThreeLayerTwoStepGeneratorTests`
+- `swift test --filter GenerationHarnessTests`
+- `swift build --product espresso-multitoken-probe`
+- `swift build -c release --product espresso-multitoken-probe --scratch-path /tmp/espresso-ane-multitoken-release`
+
+### Measurements
+
+6-layer compile/init-only sanity check:
+
+- control fused-triplet: `519.468417 ms`
+- two-step fused-triplet: `632.644375 ms`
+
+Repeated 6-layer exact comparison:
+
+| Run | Control `ms/token` | Two-step `ms/token` | Control `tok/s` | Two-step `tok/s` | Verdict |
+|---|---:|---:|---:|---:|---|
+| 1 | `2.616013` | `2.197565` | `382.31` | `455.05` | exact two-step win |
+| 2 | `2.397878` | `2.176102` | `417.04` | `459.54` | exact two-step win |
+
+Exactness contract on both runs:
+
+- parity status: `match`
+- committed exact tokens/pass: `2.0`
+- accepted future tokens/pass: `1.0`
+
+### Interpretation
+
+Measured result:
+
+- this is a real recurrent-native exact multi-token throughput win against the strongest current 6-layer single-stream recurrent control on this branch
+- one expensive recurrent pass now yields more than one exact committed token on average
+- the win comes from verifier trunk reuse, not from proposal quality or an apples-to-oranges control
+
+Measured bottleneck after the win:
+
+- proposer cost is still effectively zero on the echo checkpoint family
+- state advancement remains negligible
+- the remaining cost is still verifier-side, with trunk and logits now close enough that head batching or lane sweeps are the next honest levers
+
+### Decision
+
+- keep the fused-triplet exact two-step trunk as the current best exact multi-token architecture on this branch
+- next work should try to push this path below the standing single-stream best before reopening trained future-head work
+
 ## 2026-03-10 — Rejected clustered exact CPU staged head
 
 ### Attempt
