@@ -84,6 +84,44 @@ public struct AutoregressiveGenerationTrace: Sendable {
     }
 }
 
+public struct TwoTokenBranchCommitResult: Sendable, Equatable {
+    public let acceptedPrefixLength: Int
+    public let committedTokens: [UInt16]
+
+    public init(acceptedPrefixLength: Int, committedTokens: [UInt16]) {
+        self.acceptedPrefixLength = acceptedPrefixLength
+        self.committedTokens = committedTokens
+    }
+}
+
+public struct TwoTokenBranchCommitTrace: Sendable, Equatable {
+    public let promptTokens: [UInt16]
+    public let generatedTokens: [UInt16]
+    public let acceptedPrefixLengths: [Int]
+}
+
+public protocol TwoTokenDraftingLanguageModel: ~Copyable {
+    mutating func reset() throws(GenerationError)
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16
+    mutating func proposeTwoTokens(strategy: TokenSelectionStrategy) throws(GenerationError) -> [UInt16]
+    mutating func commit(tokens: [UInt16]) throws(GenerationError)
+}
+
+public protocol TwoTokenBranchVerifyingLanguageModel: ~Copyable {
+    mutating func reset() throws(GenerationError)
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16
+    mutating func verifyAndCommit(
+        proposedTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> TwoTokenBranchCommitResult
+}
+
 public struct SpeculativeGenerationTrace: Sendable {
     public let promptTokens: [UInt16]
     public let generatedTokens: [UInt16]
@@ -356,6 +394,88 @@ where Model: ~Copyable {
             generatedTokens: generatedTokens,
             prefillLatencyMs: prefillLatencyMs,
             decodeLatenciesMs: decodeLatenciesMs
+        )
+    }
+}
+
+public struct TwoTokenBranchCommitGenerationHarness<
+    DraftModel: TwoTokenDraftingLanguageModel,
+    FullModel: TwoTokenBranchVerifyingLanguageModel
+>: ~Copyable where DraftModel: ~Copyable, FullModel: ~Copyable {
+    public var draftModel: DraftModel
+    public var fullModel: FullModel
+    public let strategy: TokenSelectionStrategy
+
+    public init(
+        draftModel: consuming DraftModel,
+        fullModel: consuming FullModel,
+        strategy: TokenSelectionStrategy = .argmax
+    ) {
+        self.draftModel = draftModel
+        self.fullModel = fullModel
+        self.strategy = strategy
+    }
+
+    public mutating func generate(
+        promptTokens: [UInt16],
+        maxNewTokens: Int
+    ) throws(GenerationError) -> TwoTokenBranchCommitTrace {
+        guard !promptTokens.isEmpty else {
+            throw .invalidArguments("promptTokens must not be empty")
+        }
+        guard maxNewTokens > 0 else {
+            throw .invalidArguments("maxNewTokens must be > 0")
+        }
+
+        try draftModel.reset()
+        _ = try draftModel.prefillSelectedToken(promptTokens: promptTokens, strategy: strategy)
+
+        try fullModel.reset()
+        let firstToken = try fullModel.prefillSelectedToken(promptTokens: promptTokens, strategy: strategy)
+
+        var generatedTokens: [UInt16] = [firstToken]
+        var acceptedPrefixLengths: [Int] = []
+        generatedTokens.reserveCapacity(maxNewTokens)
+        acceptedPrefixLengths.reserveCapacity(maxNewTokens)
+
+        if maxNewTokens == 1 {
+            return TwoTokenBranchCommitTrace(
+                promptTokens: promptTokens,
+                generatedTokens: generatedTokens,
+                acceptedPrefixLengths: acceptedPrefixLengths
+            )
+        }
+
+        try draftModel.commit(tokens: [firstToken])
+
+        while generatedTokens.count < maxNewTokens {
+            let proposedTokens = try draftModel.proposeTwoTokens(strategy: strategy)
+            guard proposedTokens.count == 2 else {
+                throw .runtimeFailure("two-token branch commit requires exactly 2 proposed tokens per round")
+            }
+
+            let result = try fullModel.verifyAndCommit(
+                proposedTokens: proposedTokens,
+                strategy: strategy
+            )
+            guard (0...2).contains(result.acceptedPrefixLength) else {
+                throw .runtimeFailure("accepted prefix length \(result.acceptedPrefixLength) must be in 0...2")
+            }
+            guard !result.committedTokens.isEmpty else {
+                throw .runtimeFailure("branch commit must produce at least one committed token")
+            }
+            acceptedPrefixLengths.append(result.acceptedPrefixLength)
+
+            let remaining = maxNewTokens - generatedTokens.count
+            let committed = Array(result.committedTokens.prefix(remaining))
+            generatedTokens.append(contentsOf: committed)
+            try draftModel.commit(tokens: committed)
+        }
+
+        return TwoTokenBranchCommitTrace(
+            promptTokens: promptTokens,
+            generatedTokens: generatedTokens,
+            acceptedPrefixLengths: acceptedPrefixLengths
         )
     }
 }

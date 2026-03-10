@@ -148,6 +148,72 @@ private struct FakeFastSelectionModel: DirectTokenSelectingLanguageModel {
     }
 }
 
+private struct FakeTwoTokenDraftModel: TwoTokenDraftingLanguageModel {
+    var selectedPrefillToken: UInt16
+    var proposalQueue: [[UInt16]]
+
+    private(set) var resetCount: Int = 0
+    private(set) var prefillSelectedCalls: [[UInt16]] = []
+    private(set) var commitCalls: [[UInt16]] = []
+
+    mutating func reset() throws(GenerationError) {
+        resetCount += 1
+    }
+
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        prefillSelectedCalls.append(promptTokens)
+        return selectedPrefillToken
+    }
+
+    mutating func proposeTwoTokens(strategy: TokenSelectionStrategy) throws(GenerationError) -> [UInt16] {
+        guard !proposalQueue.isEmpty else {
+            throw .invalidArguments("missing fake two-token proposal")
+        }
+        return proposalQueue.removeFirst()
+    }
+
+    mutating func commit(tokens: [UInt16]) throws(GenerationError) {
+        commitCalls.append(tokens)
+    }
+}
+
+private struct FakeTwoTokenVerifierModel: TwoTokenBranchVerifyingLanguageModel {
+    var selectedPrefillToken: UInt16
+    var verificationQueue: [(proposed: [UInt16], result: TwoTokenBranchCommitResult)]
+
+    private(set) var resetCount: Int = 0
+    private(set) var prefillSelectedCalls: [[UInt16]] = []
+    private(set) var verifyCalls: [[UInt16]] = []
+
+    mutating func reset() throws(GenerationError) {
+        resetCount += 1
+    }
+
+    mutating func prefillSelectedToken(
+        promptTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> UInt16 {
+        prefillSelectedCalls.append(promptTokens)
+        return selectedPrefillToken
+    }
+
+    mutating func verifyAndCommit(
+        proposedTokens: [UInt16],
+        strategy: TokenSelectionStrategy
+    ) throws(GenerationError) -> TwoTokenBranchCommitResult {
+        verifyCalls.append(proposedTokens)
+        guard !verificationQueue.isEmpty else {
+            throw .invalidArguments("missing fake verification result")
+        }
+        let next = verificationQueue.removeFirst()
+        XCTAssertEqual(next.proposed, proposedTokens)
+        return next.result
+    }
+}
+
 final class GenerationHarnessTests: XCTestCase {
     func test_generation_performance_snapshot_reports_total_runtime() {
         let snapshot = GenerationPerformanceSnapshot(
@@ -288,6 +354,74 @@ final class GenerationHarnessTests: XCTestCase {
         XCTAssertEqual(harness.model.decodeCalls, [1, 0])
         XCTAssertTrue(harness.model.prefillSelectedCalls.isEmpty)
         XCTAssertTrue(harness.model.decodeSelectedCalls.isEmpty)
+    }
+
+    func test_two_token_branch_commit_harness_commits_without_draft_reset_or_prefill_replay() throws {
+        let draft = FakeTwoTokenDraftModel(
+            selectedPrefillToken: 1,
+            proposalQueue: [[2, 3]]
+        )
+        let full = FakeTwoTokenVerifierModel(
+            selectedPrefillToken: 1,
+            verificationQueue: [
+                (
+                    proposed: [2, 3],
+                    result: TwoTokenBranchCommitResult(
+                        acceptedPrefixLength: 1,
+                        committedTokens: [2, 4]
+                    )
+                ),
+            ]
+        )
+
+        var harness = TwoTokenBranchCommitGenerationHarness(
+            draftModel: draft,
+            fullModel: full,
+            strategy: .argmax
+        )
+
+        let trace = try harness.generate(promptTokens: [9], maxNewTokens: 3)
+
+        XCTAssertEqual(trace.generatedTokens, [1, 2, 4])
+        XCTAssertEqual(trace.acceptedPrefixLengths, [1])
+        XCTAssertEqual(harness.draftModel.resetCount, 1)
+        XCTAssertEqual(harness.draftModel.prefillSelectedCalls, [[9]])
+        XCTAssertEqual(harness.draftModel.commitCalls, [[1], [2, 4]])
+        XCTAssertEqual(harness.fullModel.resetCount, 1)
+        XCTAssertEqual(harness.fullModel.prefillSelectedCalls, [[9]])
+        XCTAssertEqual(harness.fullModel.verifyCalls, [[2, 3]])
+    }
+
+    func test_two_token_branch_commit_harness_records_two_token_acceptance() throws {
+        let draft = FakeTwoTokenDraftModel(
+            selectedPrefillToken: 7,
+            proposalQueue: [[8, 9]]
+        )
+        let full = FakeTwoTokenVerifierModel(
+            selectedPrefillToken: 7,
+            verificationQueue: [
+                (
+                    proposed: [8, 9],
+                    result: TwoTokenBranchCommitResult(
+                        acceptedPrefixLength: 2,
+                        committedTokens: [8, 9]
+                    )
+                ),
+            ]
+        )
+
+        var harness = TwoTokenBranchCommitGenerationHarness(
+            draftModel: draft,
+            fullModel: full,
+            strategy: .argmax
+        )
+
+        let trace = try harness.generate(promptTokens: [4], maxNewTokens: 3)
+
+        XCTAssertEqual(trace.generatedTokens, [7, 8, 9])
+        XCTAssertEqual(trace.acceptedPrefixLengths, [2])
+        XCTAssertEqual(harness.draftModel.commitCalls, [[7], [8, 9]])
+        XCTAssertEqual(harness.fullModel.verifyCalls, [[8, 9]])
     }
 
     func test_recurrent_generation_rejects_odd_layer_count_for_fused_pair_backend() {

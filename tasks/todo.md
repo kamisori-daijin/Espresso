@@ -78,7 +78,8 @@
   - [x] require exact prefix acceptance and real state reuse
   - [x] do not reuse the current speculative verifier design
   - [x] choose the first bounded design: `k=2` recurrent branch/commit verification
-  - [ ] add failing tests for branch/commit state reuse semantics
+  - [x] add and pass unit tests for branch/commit state reuse semantics
+  - [x] add a generic `k=2` branch/commit harness seam that commits accepted tokens without draft reset+prefill replay
   - [ ] implement a dedicated recurrent-native verifier substrate:
     - [ ] draft `2`-layer recurrent proposer
     - [ ] full `6`-layer fused-triplet verifier with direct state checkpoints for step-1 / step-2
@@ -120,5 +121,6 @@
   - the rejection is architectural: contiguous shard bounds are too loose to make branch-and-bound useful here
   - clustered exact CPU staged head improved the geometry but still lost badly at `7.072252604166667 ms/token`
   - the next best move is a recurrent-native `k=2` branch/commit verifier, not more staged exact-head tuning
+  - the `k=2` branch/commit path now has a passing unit-test seam proving direct commit semantics without draft replay
 - Completion gate for this avenue:
   - either produce a new exact single-stream best over `2.129125 ms/token`, or produce a strong measured negative result showing the shard bounds are too loose or too expensive to help
