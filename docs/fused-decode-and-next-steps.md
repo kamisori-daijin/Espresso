@@ -2470,3 +2470,62 @@ Interpretation:
   - the exact two-step path is now publishably `>= 3x` over matched CoreML on this non-echo artifact family
   - but it is still slower than the one-token ANE identity control because proposer cost remains CPU-side
   - so this closes the public `>= 3x` ANE/CoreML decode claim on a non-echo artifact, not the broader “multi-token already wins every exact control” claim
+
+## 2026-03-11 — ANE future proposer makes the non-echo exact two-step path the fastest identity-zero-trunk ANE decode
+
+What was done:
+- Replaced the CPU future proposer on the exact non-echo `identity-zero-trunk` path with an ANE head compiled from the saved `futureRMS` and `futureClassifier`.
+- Kept the exact contract unchanged:
+  - same local bigram recurrent artifact
+  - same `identity-zero-trunk` backends
+  - same offline gate
+  - same matched recurrent-checkpoint/CoreML release harness
+  - same parity requirement
+- Tried two bounded proposer-only lane reductions after the first ANE win:
+  - `laneSpatial=1`
+  - `laneSpatial=8`
+- Reverted both smaller-lane attempts after they hit the same ANE eval wall:
+  - `statusType=0x9`
+  - so the kept proposer head stays at the working lane setting
+
+Focused verification:
+- Unit parity after the proposer change:
+  - `swift test --filter GenerationHarnessTests`
+  - passed `24/24`
+- Focused hardware parity after the proposer change:
+  - `ANE_HARDWARE_TESTS=1 swift test --filter GenerationHarnessHardwareTests/test_identity_zero_trunk_local_bigram_exact_two_token_generation_matches_cpu_teacher_on_hardware`
+  - passed
+
+Matched release wrapper result (`results/non-echo-identity-ane-proposer-20260311/public-harness/summary.txt`):
+- exact two-step median: `1.0806302083333332 ms/token`
+- exact one-token ANE control median: `1.0957500000000002 ms/token`
+- matched zero-weight `6`-layer CoreML median: `5.085307291666668 ms/token`
+- exact two-step speedup vs CoreML: `4.7583224488025415x`
+- exact one-token ANE control speedup vs CoreML: `4.640428016426192x`
+- parity: `match`
+- committed exact tokens/pass: `2`
+- accepted future tokens/pass: `1`
+
+Representative per-run sample (`run-3.json`):
+- exact two-step: `1.0607916666666668 ms/token`
+- exact one-token ANE control: `1.0760208333333334 ms/token`
+- proposer: `0.9317604166666666 ms/pass`
+- verifier logits: `0.9893697916666667 ms/pass`
+- verifier trunk: `0.000010416666666666666 ms/pass`
+- parity: `match`
+
+Comparison against the previous CPU-proposer non-echo wrapper:
+- previous exact two-step median: `1.2012578125 ms/token`
+- current exact two-step median: `1.0806302083333332 ms/token`
+- improvement: about `10.0%`
+- previous public limitation:
+  - exact two-step beat CoreML but not the one-token ANE control
+- current public result:
+  - exact two-step beats both matched CoreML and the one-token ANE identity control on the same non-echo artifact family
+
+Interpretation:
+- Moving the proposer off CPU was enough to close the last gap on this explicit non-echo artifact contract.
+- The remaining exact two-step cost center is now verifier-side logits, not proposer selection or state advance.
+- The generic RWKV-style recurrent ANE cell remains a separate negative result for non-echo work:
+  - this win still depends on the explicit `identity-zero-trunk` backend
+  - it does not rehabilitate the broken generic recurrent kernel

@@ -845,6 +845,8 @@ public struct ANEExactTwoTokenUpperBoundGenerationModel: ~Copyable, ExactTwoToke
 }
 
 public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoTokenGeneratingLanguageModel {
+    private static let futureProposerOutputHeadLaneSpatial = 32
+
     public let vocabSize: Int
     public let layerCount: Int
     public let maxSequenceTokens: Int
@@ -869,9 +871,12 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
     private let stepRMSWorkspace: RMSNorm.Workspace
     private let futureRMSWorkspace: RMSNorm.Workspace
     private let outputHeadBackend: GenerationOutputHeadBackend
+    private let futureOutputHeadBackend: GenerationOutputHeadBackend
     private let trunkBackend: RecurrentGenerationTrunkBackend
     private let aneClassifierHead: ANEGenerationClassifierHead?
     private let aneRMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+    private let futureANEClassifierHead: ANEGenerationClassifierHead?
+    private let futureANERMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
     private var twoStepSessions: LayerStorage<RWKVStyleTwoStepRecurrentSession>
     private var fusedPairTwoStepSessions: LayerStorage<RWKVStyleFusedTwoLayerTwoStepSession>
     private var fusedTripletTwoStepSessions: LayerStorage<RWKVStyleFusedThreeLayerTwoStepSession>
@@ -1103,6 +1108,41 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
             aneRMSNormClassifierHead = nil
         }
 
+        let futureOutputHeadBackend: GenerationOutputHeadBackend = hasFutureProposer ? outputHeadBackend : .cpu
+
+        let futureANEClassifierHead: ANEGenerationClassifierHead?
+        switch futureOutputHeadBackend {
+        case .aneClassifier:
+            do {
+                futureANEClassifierHead = try ANEGenerationClassifierHead(
+                    classifierWeights: futureClassifier,
+                    vocabSize: vocabSize,
+                    laneSpatial: Self.futureProposerOutputHeadLaneSpatial
+                )
+            } catch {
+                throw .runtimeFailure("two-step ANE future proposer setup failed: \(error)")
+            }
+        default:
+            futureANEClassifierHead = nil
+        }
+
+        let futureANERMSNormClassifierHead: ANEGenerationRMSNormClassifierHead?
+        switch futureOutputHeadBackend {
+        case .aneRMSNormClassifier:
+            do {
+                futureANERMSNormClassifierHead = try ANEGenerationRMSNormClassifierHead(
+                    rmsFinal: futureRMS,
+                    classifierWeights: futureClassifier,
+                    vocabSize: vocabSize,
+                    laneSpatial: Self.futureProposerOutputHeadLaneSpatial
+                )
+            } catch {
+                throw .runtimeFailure("two-step ANE future proposer setup failed: \(error)")
+            }
+        default:
+            futureANERMSNormClassifierHead = nil
+        }
+
         self.vocabSize = vocabSize
         self.layerCount = layerCount
         self.maxSequenceTokens = maxSequenceTokens
@@ -1126,9 +1166,12 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         self.stepRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.futureRMSWorkspace = RMSNorm.Workspace(seqLen: 1)
         self.outputHeadBackend = outputHeadBackend
+        self.futureOutputHeadBackend = futureOutputHeadBackend
         self.trunkBackend = trunkBackend
         self.aneClassifierHead = aneClassifierHead
         self.aneRMSNormClassifierHead = aneRMSNormClassifierHead
+        self.futureANEClassifierHead = futureANEClassifierHead
+        self.futureANERMSNormClassifierHead = futureANERMSNormClassifierHead
         self.twoStepSessions = twoStepSessions
         self.fusedPairTwoStepSessions = fusedPairTwoStepSessions
         self.fusedTripletTwoStepSessions = fusedTripletTwoStepSessions
@@ -1521,15 +1564,15 @@ public struct ANEExactTwoTokenBranchStatePromotionModel: ~Copyable, ExactTwoToke
         return try Self.selectTokenFromActivation(
             currentProposalActivation,
             strategy: strategy,
-            outputHeadBackend: .cpu,
+            outputHeadBackend: futureOutputHeadBackend,
             rmsFinal: futureRMS,
             stepNorm: futureNorm,
             stepLogits: futureLogits,
             embedding: embedding,
             classifier: futureClassifier,
             sharedClassifier: false,
-            aneClassifierHead: nil,
-            aneRMSNormClassifierHead: nil,
+            aneClassifierHead: futureANEClassifierHead,
+            aneRMSNormClassifierHead: futureANERMSNormClassifierHead,
             vocabSize: vocabSize,
             stepRMSWorkspace: futureRMSWorkspace
         )

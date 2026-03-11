@@ -119,3 +119,8 @@
 - When the saved recurrent artifact is mathematically zero-trunk, do not keep forcing it through a broken generic recurrent kernel just because the interface exists; first prove the kernel is wrong with a raw-surface hardware probe, then add the smallest exact backend that matches the artifact contract.
 - Keep that specialization explicit in the benchmark contract and CLI (`identity-zero-trunk` here); hidden auto-detection would make the public claim harder to audit.
 - A stronger public story can come from a non-echo artifact family even if the multi-token path is not the fastest ANE variant, as long as the same matched harness shows exact parity and `>= 3x` over CoreML.
+
+## 2026-03-11 — Non-Echo Two-Step Needed An ANE Proposer, Not More CPU Polishing
+- Once exact non-echo acceptance is already `2` committed tokens/pass with parity `match`, stop treating proposer quality as the blocker and measure proposer placement directly; the remaining gap can be pure systems cost.
+- On the `identity-zero-trunk` artifact family, moving the future proposer from CPU onto an ANE fused head was enough to turn the exact two-step path from slower-than-control into faster-than-control in the matched release harness.
+- Keep proposer-only lane sweeps bounded and reversible; smaller proposer lanes (`1` and `8` here) hit ANE `statusType=0x9`, so failed geometry probes should be reverted immediately and kept only as docs/results evidence.

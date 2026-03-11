@@ -1,23 +1,38 @@
 # TODO
 
-- [x] Preserve the current synthetic `echo` `>= 3x` claim as the control and do not weaken its exactness or reporting contract.
-- [x] Add a minimal non-echo hardware correctness seam that must emit a nonzero token and must match a CPU teacher before any new throughput rerun is trusted.
-- [x] Isolate the root cause of the local non-echo zero-output failure across recurrent trunk, serialized weights, and direct ANE output-head paths.
-- [x] Fix the smallest proven bug and rerun the non-echo hardware correctness seam until the ANE path is functionally valid.
-- [x] If the non-echo seam turns green, rerun the matched recurrent-checkpoint harness with repeated medians and exact parity requirements.
-- [x] Update docs, lessons, Wax notes, handoff, and review with the stronger claim if it exists, or with a sharply measured negative result if it does not.
+- [x] Preserve the current non-echo `identity-zero-trunk` public claim as the control and do not weaken its exactness, artifact, or reporting contract.
+- [x] Add TDD seams for ANE-backed future-head selection so proposer behavior can be checked without rerunning the full harness.
+- [x] Replace the CPU future proposer on the exact two-token non-echo path with an ANE head that uses the saved `futureRMS` and `futureClassifier`.
+- [x] Re-verify unit parity, focused hardware parity, and proposer metrics after the ANE proposer is wired in.
+- [x] Rerun the matched recurrent-checkpoint/CoreML harness and keep the change because the exact two-token path beats the previous CPU-proposer two-step median and the one-token ANE identity control.
+- [x] Update docs, lessons, Wax notes, handoff, and review with the stronger non-echo throughput result and the failed smaller-lane probes.
 
 # Review
 
-- The exact synthetic `echo` control remains intact at `3.5383781787824304x` and `3.7377633193960738x` over matched CoreML with parity `match`, `committed_exact_tokens/pass = 2`, and `accepted_future_tokens/pass = 1`.
-- The generic RWKV-style recurrent ANE cell is still invalid on a non-echo one-hot seam: raw `xIn` writes peaked at token `35` with value `1.0`, but both `xOut` and `stateOut` stayed all zero after eval, so that route remains a documented negative result.
-- The stronger non-echo claim now exists on an exact local bigram artifact with an explicit `identity-zero-trunk` backend:
-  - focused hardware parity tests matched the CPU teacher for both one-token and exact two-token generation on prompt `35`
-  - offline gate: parity `match`, `committed exact tokens/pass = 2`, `accepted future tokens/pass = 1`
-  - one-command wrapper (`scripts/reproduce_local_real_artifact_claim.sh`) reran the matched recurrent-checkpoint/CoreML harness at:
-    - exact two-step `1.2012578125 ms/token`
-    - exact one-token ANE control `1.0598854166666667 ms/token`
-    - matched zero-weight `6`-layer CoreML trunk `4.7705807291666664 ms/token`
-    - exact two-step speedup vs CoreML `3.9541428963040195x`
-    - parity `match`
-- Important nuance: on this non-echo artifact family the exact two-step path is now publishably `>= 3x` over matched CoreML, but it is still slower than the one-token ANE identity control because proposer cost remains CPU-side.
+- Previous non-echo control on this branch was the exact local bigram artifact with explicit `identity-zero-trunk` backends and a CPU proposer:
+  - exact two-step `1.2012578125 ms/token`
+  - exact one-token ANE control `1.0598854166666667 ms/token`
+  - matched zero-weight `6`-layer CoreML `4.7705807291666664 ms/token`
+  - exact two-step speedup vs CoreML `3.9541428963040195x`
+  - parity `match`
+  - committed exact tokens/pass `2`
+  - accepted future tokens/pass `1`
+- Current winning non-echo result on this branch uses an ANE future proposer on the same exact `identity-zero-trunk` artifact contract:
+  - exact two-step `1.0806302083333332 ms/token`
+  - exact one-token ANE control `1.0957500000000002 ms/token`
+  - matched zero-weight `6`-layer CoreML `5.085307291666668 ms/token`
+  - exact two-step speedup vs CoreML `4.7583224488025415x`
+  - exact one-token ANE control speedup vs CoreML `4.640428016426192x`
+  - parity `match`
+  - committed exact tokens/pass `2`
+  - accepted future tokens/pass `1`
+- Sample same-session run (`run-3.json`) shows the mechanism clearly:
+  - exact two-step `1.0607916666666668 ms/token`
+  - exact one-token ANE control `1.0760208333333334 ms/token`
+  - proposer `0.9317604166666666 ms/pass`
+  - verifier logits `0.9893697916666667 ms/pass`
+  - verifier trunk `0.000010416666666666666 ms/pass`
+- Failed bounded follow-ups were reverted:
+  - proposer-only `laneSpatial=1` hit ANE `statusType=0x9`
+  - proposer-only `laneSpatial=8` hit ANE `statusType=0x9`
+- The generic RWKV-style recurrent ANE cell remains a separate negative result on non-echo one-hot seams and should not be reopened during this proposer phase.
