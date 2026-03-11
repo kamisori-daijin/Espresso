@@ -1,5 +1,21 @@
 # TODO
 
+## 2026-03-12 — EspressoBench ANE vs Core ML executable
+
+- [x] Align `Package.swift` `EspressoBench` product/target surface with the requested dependencies and linker settings.
+- [x] Implement `Sources/EspressoBench/BenchmarkRunner.swift` with sorted statistics, percentile interpolation, signposts, and stderr progress.
+- [x] Implement `Sources/EspressoBench/FLOPCalculator.swift` with the full 7-component forward-pass accounting and utilization helpers.
+- [x] Implement `Sources/EspressoBench/ResultsFormatter.swift` with locale-stable report formatting and CSV export.
+- [x] Implement `Sources/EspressoBench/ThermalMonitor.swift` with sampled sustained-run tracking.
+- [x] Implement `Sources/EspressoBench/ANEDirectBench.swift` against the real move-only `ForwardPass.runTimed` API.
+- [x] Implement `Sources/EspressoBench/CoreMLBench.swift` with graceful missing-model handling and three compute-unit baselines.
+- [x] Implement `Sources/EspressoBench/main.swift` CLI flow for ANE/Core ML/thermal runs and result export.
+- [x] Implement `scripts/generate_coreml_model.py` for a channel-first fp16 transformer layer `.mlpackage`.
+- [x] Implement `scripts/run_power_benchmark.sh` for powermetrics-wrapped sustained runs.
+- [x] Keep `.gitignore` aligned for benchmark results and generated Core ML packages.
+- [x] Verify sequential build gates while editing and finish with `swift build -c release --target EspressoBench`.
+- [x] Commit each logical benchmark task with `feat(bench): ...` messages.
+
 - [x] Promote `ebd3c38` from an internal milestone to a public-release surface without changing the measured claim.
 - [x] Rewrite the top-level README so the non-echo exact decode result is the first public benchmark story, with explicit caveats and one-command repro.
 - [x] Add a checked-in benchmark artifact for the non-echo release claim that is stable enough to link publicly.
@@ -8,6 +24,21 @@
 - [x] Update lessons, Wax notes, handoff, and review with the release-packaging outcome.
 
 # Review
+
+## 2026-03-12 — EspressoBench rewrite
+
+- Status: complete.
+- Baseline:
+  - `swift build --target EspressoBench` passes before the rewrite.
+  - `Sources/EspressoBench/` already exists, but the current executable includes extra probe/introspection features and dependency drift beyond the requested ANE-vs-CoreML benchmark contract.
+- Key constraints:
+  - `TensorBuffer`, `LayerWeights`, and `LayerStorage` are `~Copyable`; ANE direct measurement must avoid capturing them in escaping/generic closures.
+  - `ForwardPass.runTimed(...)` is the training-forward timed API available for direct ANE benchmarking.
+  - Locale-stable output and attosecond-to-millisecond conversion are explicit verification gates for this task.
+- Verification:
+  - `swift build -c release --target EspressoBench` succeeded on 2026-03-12.
+  - `Package.swift` now exposes `EspressoBench` with the requested direct dependencies.
+  - `BenchmarkRunner`, `FLOPCalculator`, `ResultsFormatter`, `ThermalMonitor`, `ANEDirectBench`, `CoreMLBench`, `main.swift`, and the benchmark scripts were updated in this pass.
 
 - Current code/control milestone is `ebd3c38`:
   - exact two-step `1.0806302083333332 ms/token`
