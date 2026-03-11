@@ -7,6 +7,7 @@ let package = Package(
     products: [
         .executable(name: "espresso-train", targets: ["EspressoTrain"]),
         .executable(name: "espresso-bench", targets: ["EspressoBench"]),
+        .executable(name: "espresso-bench-app", targets: ["EspressoBenchApp"]),
         .executable(name: "espresso-multitoken-probe", targets: ["EspressoMultitokenProbe"]),
         .library(name: "Espresso", targets: ["Espresso"]),
     ],
@@ -73,13 +74,24 @@ let package = Package(
         ),
         .executableTarget(
             name: "EspressoBench",
-            dependencies: ["Espresso", "ANERuntime", "ANETypes", "CPUOps"],
+            dependencies: ["Espresso", "ANERuntime", "ANETypes", "CPUOps", "MILGenerator"],
             path: "Sources/EspressoBench",
             swiftSettings: [.swiftLanguageMode(.v6)],
             linkerSettings: [
                 .linkedFramework("Accelerate"),
                 .linkedFramework("IOSurface"),
                 .linkedFramework("CoreML"),
+            ]
+        ),
+        .executableTarget(
+            name: "EspressoBenchApp",
+            path: "Sources/EspressoBenchApp",
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [
+                .linkedFramework("AppKit"),
+                .linkedFramework("Charts"),
+                .linkedFramework("SwiftUI"),
+                .linkedFramework("UniformTypeIdentifiers"),
             ]
         ),
         .executableTarget(

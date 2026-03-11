@@ -4,6 +4,7 @@ set -euo pipefail
 
 MODE="${1:-both}"
 MODEL_PATH="${2:-benchmarks/models/transformer_layer.mlpackage}"
+LAYERS="${LAYERS:-1}"
 TIMESTAMP="$(date +%Y-%m-%d-%H%M%S)"
 RESULTS_DIR="benchmarks/results/power-${TIMESTAMP}"
 BENCH="./.build/release/espresso-bench"
@@ -16,6 +17,7 @@ Runs `powermetrics` alongside `espresso-bench --sustained`.
   ane     Runs ANE direct only (`--ane-only`)
   coreml  Runs ANE + Core ML baseline
   both    Runs both modes sequentially
+Set `LAYERS` in the environment to benchmark a model with more than one layer.
 EOF
 }
 
@@ -38,6 +40,7 @@ run_case() {
     --sustained \
     --warmup 10 \
     --iterations 100 \
+    --layers "${LAYERS}" \
     --model "${MODEL_PATH}" \
     --output "${RESULTS_DIR}/${label}" \
     "${bench_args[@]}"

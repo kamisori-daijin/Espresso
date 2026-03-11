@@ -1,5 +1,28 @@
 # TODO
 
+## 2026-03-12 — EspressoBench SwiftUI macOS app
+
+- [x] Add a dedicated `EspressoBenchApp` SwiftUI macOS target and executable product.
+- [x] Build an app model that launches `espresso-bench`, streams live logs, and loads generated result artifacts.
+- [x] Add a SwiftUI dashboard with run configuration, run history, summary cards, charts, and artifact browsing.
+- [x] Package the app into a runnable `.app` bundle with the CLI embedded alongside it.
+- [x] Verify the new app target builds cleanly and document the app work in review notes.
+
+## 2026-03-12 — EspressoBench review follow-up
+
+- [x] Restore `espresso-bench` CLI compatibility for decode, inference-only, kernel profiling, and chaining probe flows.
+- [x] Reinstate benchmark artifact outputs (`summary.json`, legacy CSV filenames, kernel profile CSVs) consumed by tests and automation.
+- [x] Restore `scripts/generate_coreml_model.py` support for multi-layer and zero-weight generation.
+- [x] Re-align default benchmark layer/model behavior so ANE/CoreML comparisons are valid by default.
+- [x] Verify with targeted build/test/smoke coverage for the restored bench contracts.
+
+## 2026-03-12 — EspressoBenchApp production review
+
+- [x] Inspect the SwiftUI app files under `Sources/EspressoBenchApp`.
+- [x] Trace the CLI launch path, artifact loading, and data flow boundaries.
+- [x] Review SwiftUI/Observation/accessibility/app-architecture quality gaps after first build.
+- [x] Return prioritized findings and highest-value follow-ups without editing app files.
+
 ## 2026-03-12 — EspressoBench ANE vs Core ML executable
 
 - [x] Align `Package.swift` `EspressoBench` product/target surface with the requested dependencies and linker settings.
@@ -40,6 +63,20 @@
   - `Package.swift` now exposes `EspressoBench` with the requested direct dependencies.
   - `BenchmarkRunner`, `FLOPCalculator`, `ResultsFormatter`, `ThermalMonitor`, `ANEDirectBench`, `CoreMLBench`, `main.swift`, and the benchmark scripts were updated in this pass.
 
+## 2026-03-12 — Review follow-up fixes
+
+- Status: complete.
+- Fix scope:
+  - Restored the legacy `espresso-bench` CLI paths for decode, inference-only, profiling, and chaining probe modes.
+  - Restored `summary.json`, legacy latency/profile CSV filenames, and the richer kernel profile CSV schema.
+  - Restored multi-layer and zero-weight support in `scripts/generate_coreml_model.py`.
+  - Re-aligned default layer behavior to the single-layer default Core ML package, and made the power script pass an explicit `LAYERS` value.
+- Verification:
+  - `swift build -c release --target EspressoBench` succeeded.
+  - `./.build/arm64-apple-macosx/debug/espresso-bench --help` shows the restored decode/inference/probe flags.
+  - `python3 -m py_compile scripts/generate_coreml_model.py scripts/ane_bench_sweep.py` succeeded.
+  - `ANE_HARDWARE_TESTS=1 swift test --filter DecodeChainingInteropTests/test_external_prepare_probe_isolated_from_test_harness` passed.
+
 - Current code/control milestone is `ebd3c38`:
   - exact two-step `1.0806302083333332 ms/token`
   - exact one-token ANE control `1.0957500000000002 ms/token`
@@ -63,3 +100,17 @@
   - lead now scopes the performance number to the reproducible non-echo local-artifact benchmark
   - repro notes now state that first-run `coremltools` bootstrap may occur
   - public copy now avoids broader "CoreML in general" wording
+
+## 2026-03-12 — EspressoBench SwiftUI macOS app
+
+- Status: complete.
+- Implementation scope:
+  - Added `EspressoBenchApp` as a native SwiftUI macOS executable target and product.
+  - Wrapped the existing `espresso-bench` CLI instead of reimplementing benchmark logic.
+  - Added live process streaming, typed `summary.json` loading, CSV latency plotting, artifact browsing, and direct bundle packaging with the CLI embedded.
+  - Made launch provenance explicit in the UI, stabilized history identity on output-directory paths, batched log updates, and added accessibility labels for cards/charts.
+- Verification:
+  - `swift build --target EspressoBenchApp` succeeded.
+  - `swift build -c release --target EspressoBenchApp` succeeded.
+  - `swift build -c release --target EspressoBench` succeeded.
+  - `./scripts/package_espresso_bench_app.sh` succeeded and produced `.build/apps/EspressoBench.app`.

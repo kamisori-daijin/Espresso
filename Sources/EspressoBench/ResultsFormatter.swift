@@ -271,74 +271,167 @@ enum ResultsFormatter {
     }
 
     static func writeInferenceKernelProfileCSV(profile: InferenceKernelProfile, to path: String) throws {
-        var rows = ["layer,iteration,attn_eval_us,attn_hw_ns,attn_host_overhead_us,ffn_eval_us,ffn_hw_ns,ffn_host_overhead_us"]
-        for (layerIndex, layer) in profile.layers.enumerated() {
-            for iteration in layer.attnEvalUS.indices {
-                rows.append(
-                    formatted(
-                        "%d,%d,%.3f,%llu,%.3f,%.3f,%llu,%.3f",
-                        layerIndex,
-                        iteration,
-                        layer.attnEvalUS[iteration],
-                        layer.attnHwNS[iteration],
-                        layer.attnHostOverheadUS[iteration],
-                        layer.ffnEvalUS[iteration],
-                        layer.ffnHwNS[iteration],
-                        layer.ffnHostOverheadUS[iteration]
-                    )
+        let posix = Locale(identifier: "en_US_POSIX")
+        var out = "layer,iteration,attn_write_us,attn_write_lock_us,attn_write_body_us,attn_write_unlock_us,attn_eval_us,attn_hw_ns,attn_hw_us,attn_host_overhead_us,attn_read_us,attn_read_lock_us,attn_read_body_us,attn_read_unlock_us,gap_attn_to_ffn_us,ffn_write_us,ffn_write_lock_us,ffn_write_body_us,ffn_write_unlock_us,ffn_copy_us,ffn_eval_us,ffn_hw_ns,ffn_hw_us,ffn_host_overhead_us,ffn_read_us,ffn_read_lock_us,ffn_read_body_us,ffn_read_unlock_us\n"
+
+        for (layerIdx, layer) in profile.layers.enumerated() {
+            let n = layer.attnWriteUS.count
+            precondition(layer.attnWriteLockUS.count == n)
+            precondition(layer.attnWriteBodyUS.count == n)
+            precondition(layer.attnWriteUnlockUS.count == n)
+            precondition(layer.attnEvalUS.count == n)
+            precondition(layer.attnHwNS.count == n)
+            precondition(layer.attnHostOverheadUS.count == n)
+            precondition(layer.attnReadUS.count == n)
+            precondition(layer.attnReadLockUS.count == n)
+            precondition(layer.attnReadBodyUS.count == n)
+            precondition(layer.attnReadUnlockUS.count == n)
+            precondition(layer.ffnWriteUS.count == n)
+            precondition(layer.ffnWriteLockUS.count == n)
+            precondition(layer.ffnWriteBodyUS.count == n)
+            precondition(layer.ffnWriteUnlockUS.count == n)
+            precondition(layer.ffnCopyUS.count == n)
+            precondition(layer.ffnEvalUS.count == n)
+            precondition(layer.ffnHwNS.count == n)
+            precondition(layer.ffnHostOverheadUS.count == n)
+            precondition(layer.ffnReadUS.count == n)
+            precondition(layer.ffnReadLockUS.count == n)
+            precondition(layer.ffnReadBodyUS.count == n)
+            precondition(layer.ffnReadUnlockUS.count == n)
+            precondition(layer.gapAttnToFfnUS.count == n)
+
+            for i in 0..<n {
+                let attnHwUS = Double(layer.attnHwNS[i]) / 1_000.0
+                let ffnHwUS = Double(layer.ffnHwNS[i]) / 1_000.0
+                out += String(
+                    format: "%d,%d,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f\n",
+                    locale: posix,
+                    layerIdx,
+                    i,
+                    layer.attnWriteUS[i],
+                    layer.attnWriteLockUS[i],
+                    layer.attnWriteBodyUS[i],
+                    layer.attnWriteUnlockUS[i],
+                    layer.attnEvalUS[i],
+                    layer.attnHwNS[i],
+                    attnHwUS,
+                    layer.attnHostOverheadUS[i],
+                    layer.attnReadUS[i],
+                    layer.attnReadLockUS[i],
+                    layer.attnReadBodyUS[i],
+                    layer.attnReadUnlockUS[i],
+                    layer.gapAttnToFfnUS[i],
+                    layer.ffnWriteUS[i],
+                    layer.ffnWriteLockUS[i],
+                    layer.ffnWriteBodyUS[i],
+                    layer.ffnWriteUnlockUS[i],
+                    layer.ffnCopyUS[i],
+                    layer.ffnEvalUS[i],
+                    layer.ffnHwNS[i],
+                    ffnHwUS,
+                    layer.ffnHostOverheadUS[i],
+                    layer.ffnReadUS[i],
+                    layer.ffnReadLockUS[i],
+                    layer.ffnReadBodyUS[i],
+                    layer.ffnReadUnlockUS[i]
                 )
             }
         }
-        try (rows.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+
+        try out.write(toFile: path, atomically: true, encoding: .utf8)
     }
 
     static func formatInferenceKernelProfileSummaryTable(
         profile: InferenceKernelProfile,
         handoff: ForwardPass.InferenceInterKernelHandoff
     ) -> String {
-        let handoffLabel = switch handoff {
-        case .cpuRoundTrip: "cpuRoundTrip"
-        case .fp16SurfaceCopy: "fp16SurfaceCopy"
+        guard !profile.layers.isEmpty else { return "" }
+        let hasAnyHWExecutionTime = profile.layers.contains { layer in
+            layer.attnHwNS.contains(where: { $0 > 0 }) || layer.ffnHwNS.contains(where: { $0 > 0 })
         }
-        var lines: [String] = []
-        lines.append("")
-        lines.append("Inference Kernel Profile")
-        lines.append("------------------------")
-        lines.append("Handoff: \(handoffLabel)")
-        for layerIndex in profile.layers.indices {
-            let averages = profile.averageLayerMetrics(layerIndex: layerIndex)
-            lines.append(
-                formatted(
-                    "L%d attn %.3f us | ffn %.3f us | gap %.3f us",
-                    layerIndex,
-                    averages.attnEvalUS,
-                    averages.ffnEvalUS,
-                    averages.gapAttnToFfnUS
-                )
+        let handoffLabel: String
+        switch handoff {
+        case .cpuRoundTrip:
+            handoffLabel = "cpuRoundTrip"
+        case .fp16SurfaceCopy:
+            handoffLabel = "fp16SurfaceCopy"
+        }
+        var out = ""
+        out += "--- Inference Per-Layer Breakdown (avg us) ---\n"
+        out += "Columns: host_eval_us, hw_exec_us, host_overhead_us, io_lock_us, io_body_us, io_unlock_us\n"
+        out += "Handoff mode: \(handoffLabel)\n"
+        if !hasAnyHWExecutionTime {
+            out += "hwExecutionTime unavailable on this host (perf stats not provided by driver/runtime); hw columns remain 0.0\n"
+        }
+        out += "layer | attn(host/hw/over) | attn_io(lock/body/unlock) | gap | handoff(cpu/copy) | ffn(host/hw/over) | ffn_io(lock/body/unlock)\n"
+
+        for idx in profile.layers.indices {
+            let mean = profile.averageLayerMetrics(layerIndex: idx)
+            out += String(
+                format: "L%-3d | %.1f / %.1f / %.1f | %.1f / %.1f / %.1f | %.1f | %.1f / %.1f | %.1f / %.1f / %.1f | %.1f / %.1f / %.1f\n",
+                idx,
+                mean.attnEvalUS,
+                mean.attnHwUS,
+                mean.attnHostOverheadUS,
+                mean.attnIOLockUS,
+                mean.attnIOBodyUS,
+                mean.attnIOUnlockUS,
+                mean.gapAttnToFfnUS,
+                mean.handoffCPUUS,
+                mean.handoffFP16CopyUS,
+                mean.ffnEvalUS,
+                mean.ffnHwUS,
+                mean.ffnHostOverheadUS,
+                mean.ffnIOLockUS,
+                mean.ffnIOBodyUS,
+                mean.ffnIOUnlockUS
             )
         }
-        return lines.joined(separator: "\n") + "\n"
+
+        out += "\n"
+        return out
     }
 
     static func writeDecodeKernelProfileCSV(profile: DecodeKernelProfile, to path: String) throws {
-        var rows = ["layer,iteration,attn_eval_us,attn_hw_ns,attn_host_overhead_us,ffn_eval_us,ffn_hw_ns,ffn_host_overhead_us"]
-        for (layerIndex, layer) in profile.layers.enumerated() {
-            for iteration in layer.attnEvalUS.indices {
-                rows.append(
-                    formatted(
-                        "%d,%d,%.3f,%llu,%.3f,%.3f,%llu,%.3f",
-                        layerIndex,
-                        iteration,
-                        layer.attnEvalUS[iteration],
-                        layer.attnHwNS[iteration],
-                        layer.attnHostOverheadUS[iteration],
-                        layer.ffnEvalUS[iteration],
-                        layer.ffnHwNS[iteration],
-                        layer.ffnHostOverheadUS[iteration]
-                    )
+        let posix = Locale(identifier: "en_US_POSIX")
+        var out = "layer,sample,attn_eval_us,attn_hw_ns,attn_host_overhead_us,self_mask_update_us,k_cache_update_us,v_cache_update_us,mask_update_us,x2_to_ffn_copy_us,ffn_eval_us,ffn_hw_ns,ffn_host_overhead_us,ffn_to_next_attn_copy_us\n"
+
+        for (layerIdx, layer) in profile.layers.enumerated() {
+            let n = layer.attnEvalUS.count
+            precondition(layer.attnHwNS.count == n)
+            precondition(layer.attnHostOverheadUS.count == n)
+            precondition(layer.selfMaskUpdateUS.count == n)
+            precondition(layer.kCacheUpdateUS.count == n)
+            precondition(layer.vCacheUpdateUS.count == n)
+            precondition(layer.maskUpdateUS.count == n)
+            precondition(layer.x2ToFfnCopyUS.count == n)
+            precondition(layer.ffnEvalUS.count == n)
+            precondition(layer.ffnHwNS.count == n)
+            precondition(layer.ffnHostOverheadUS.count == n)
+            precondition(layer.ffnToNextAttnCopyUS.count == n)
+
+            for i in 0..<n {
+                out += String(
+                    format: "%d,%d,%.3f,%llu,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%.3f,%llu,%.3f,%.3f\n",
+                    locale: posix,
+                    layerIdx,
+                    i,
+                    layer.attnEvalUS[i],
+                    layer.attnHwNS[i],
+                    layer.attnHostOverheadUS[i],
+                    layer.selfMaskUpdateUS[i],
+                    layer.kCacheUpdateUS[i],
+                    layer.vCacheUpdateUS[i],
+                    layer.maskUpdateUS[i],
+                    layer.x2ToFfnCopyUS[i],
+                    layer.ffnEvalUS[i],
+                    layer.ffnHwNS[i],
+                    layer.ffnHostOverheadUS[i],
+                    layer.ffnToNextAttnCopyUS[i]
                 )
             }
         }
-        try (rows.joined(separator: "\n") + "\n").write(toFile: path, atomically: true, encoding: .utf8)
+
+        try out.write(toFile: path, atomically: true, encoding: .utf8)
     }
 }
