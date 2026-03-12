@@ -138,3 +138,9 @@
 - Launch-facing benchmark headlines must name the exact benchmark scope when the result is artifact-specific; otherwise readers will upgrade a narrow measurement into a blanket product claim.
 - Remove secondary throughput wins from the hero section unless they are backed by the same public harness and caveat level as the primary claim.
 - If a repro path may bootstrap local tooling, say that directly instead of implying a completely offline zero-download first run.
+
+## 2026-03-12 — Planning Docs Must Follow Current Repo Truth, Not Stale Notebook Guidance
+- Before presenting any repo seam as active, cross-check it against the latest hardware tests and latest status/outcome sections in the research docs; if a test now expects compile failure or a later entry marks the avenue abandoned, do not list it as a usable seam.
+- When an evergreen roadmap links to a lab notebook, explicitly mark historical/superseded sections as non-authoritative so the source-of-truth chain stays internally consistent.
+- Phase-0 measurement plans must inherit the repo's existing benchmark-discipline rules up front: machine-readable JSON, timestamp + git SHA in every artifact format, explicit required-vs-optional probe gates, and `N/A` with blocker evidence when perf cannot be measured.
+- For any new off-echo ANE optimization path, require at least one nonzero-token hardware correctness seam against an independent CPU teacher before trusting throughput numbers; echo-like behavior can hide zero-output failures.
