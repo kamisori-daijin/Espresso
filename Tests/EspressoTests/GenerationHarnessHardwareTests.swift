@@ -2719,6 +2719,226 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         print("probe fused_head_with_reduce_max: \(fusedHeadResult)")
     }
 
+    // MARK: - Int8 weight quantization ANE compile probe
+
+    func test_int8_quantized_weight_compile_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let inCh = 64
+        let outCh = 64
+        let spatial = 32
+
+        // Helper: build an int8 weight blob (same header, 1 byte per element)
+        func buildInt8Blob(count: Int) -> Data {
+            let payloadBytes = count
+            let total = 128 + payloadBytes
+            var data = Data(count: total)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1
+                base[4] = 2
+                base[64] = 0xEF
+                base[65] = 0xBE
+                base[66] = 0xAD
+                base[67] = 0xDE
+                base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                // Fill with small int8 values
+                for i in 0..<payloadBytes {
+                    base[128 + i] = UInt8(bitPattern: Int8(i % 127))
+                }
+            }
+            return data
+        }
+
+        // Helper: build fp16 scalar blob
+        func buildFP16ScalarBlob(value: Float) -> Data {
+            var data = Data(count: 128 + 2)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(2).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                payload[0] = Float16(value).bitPattern
+            }
+            return data
+        }
+
+        // Helper: build per-channel fp16 blob
+        func buildFP16PerChannelBlob(count: Int, value: Float) -> Data {
+            let payloadBytes = count * 2
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                let payload = raw.baseAddress!.advanced(by: 128).assumingMemoryBound(to: UInt16.self)
+                for i in 0..<count { payload[i] = Float16(value).bitPattern }
+            }
+            return data
+        }
+
+        // Helper: build per-channel int8 blob (zero points)
+        func buildInt8PerChannelBlob(count: Int, value: Int8) -> Data {
+            let payloadBytes = count
+            var data = Data(count: 128 + payloadBytes)
+            data.withUnsafeMutableBytes { raw in
+                let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+                base[0] = 1; base[4] = 2
+                base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+                raw.storeBytes(of: UInt32(payloadBytes).littleEndian, toByteOffset: 72, as: UInt32.self)
+                raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+                for i in 0..<payloadBytes { base[128 + i] = UInt8(bitPattern: value) }
+            }
+            return data
+        }
+
+        let int8WeightBlob = buildInt8Blob(count: outCh * inCh)
+        let scaleBlob = buildFP16PerChannelBlob(count: outCh, value: 0.01)
+        let zpBlob = buildInt8PerChannelBlob(count: outCh, value: 0)
+
+        // --- Probe A: constexpr_affine_dequantize with per-channel scale ---
+        let milQuantA = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<int8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                tensor<fp16, [\(outCh), 1, 1, 1]> scale = const()[name=string("scale"), val=tensor<fp16, [\(outCh), 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/scale.bin"), offset=uint64(128)))];
+                tensor<int8, [\(outCh), 1, 1, 1]> zp = const()[name=string("zp"), val=tensor<int8, [\(outCh), 1, 1, 1]>(BLOBFILE(path=string("@model_path/weights/zp.bin"), offset=uint64(128)))];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = constexpr_affine_dequantize(quantized_data=Wq, zero_point=zp, scale=scale, axis=int32(0))[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultA = tryCompileAndEvalWithWeights(
+            label: "constexpr_affine_dequantize_per_channel",
+            milText: milQuantA,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob),
+                ("@model_path/weights/scale.bin", scaleBlob),
+                ("@model_path/weights/zp.bin", zpBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe constexpr_affine_dequantize (per-channel): \(resultA)")
+
+        // --- Probe B: constexpr_affine_dequantize with scalar scale ---
+        let scalarScaleBlob = buildFP16ScalarBlob(value: 0.01)
+        let scalarZpData = Data([0])  // single int8 zero
+        var scalarZpBlob = Data(count: 128 + 1)
+        scalarZpBlob.withUnsafeMutableBytes { raw in
+            let base = raw.baseAddress!.assumingMemoryBound(to: UInt8.self)
+            base[0] = 1; base[4] = 2
+            base[64] = 0xEF; base[65] = 0xBE; base[66] = 0xAD; base[67] = 0xDE; base[68] = 1
+            raw.storeBytes(of: UInt32(1).littleEndian, toByteOffset: 72, as: UInt32.self)
+            raw.storeBytes(of: UInt32(128).littleEndian, toByteOffset: 80, as: UInt32.self)
+            base[128] = 0
+        }
+        let milQuantB = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<int8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                fp16 scale = const()[name=string("scale"), val=fp16(0.01)];
+                int8 zp = const()[name=string("zp"), val=int8(0)];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = constexpr_affine_dequantize(quantized_data=Wq, zero_point=zp, scale=scale, axis=int32(0))[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultB = tryCompileAndEvalWithWeights(
+            label: "constexpr_affine_dequantize_scalar",
+            milText: milQuantB,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe constexpr_affine_dequantize (scalar): \(resultB)")
+
+        // --- Probe C: direct cast int8→fp16 then conv ---
+        let milQuantC = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<int8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<int8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                string to_fp16 = const()[name=string("to_fp16"), val=string("fp16")];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = cast(dtype=to_fp16, x=Wq)[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultC = tryCompileAndEvalWithWeights(
+            label: "int8_cast_to_fp16_conv",
+            milText: milQuantC,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe int8_cast_to_fp16_conv: \(resultC)")
+
+        // --- Probe D: constexpr_lut_to_dense (palette quantization) ---
+        // This is another quantization approach used in CoreML
+        // Skip for now if constexpr_affine_dequantize works
+
+        // --- Probe E: uint8 instead of int8 ---
+        let milQuantE = """
+        program(1.3)
+        [buildInfo = dict<string, string>({{"coremlc-component-MIL", "3510.2.1"}, {"coremlc-version", "3505.4.1"}, {"coremltools-component-milinternal", ""}, {"coremltools-version", "9.0"}})]
+        {
+            func main<ios18>(tensor<fp16, [1, \(inCh), 1, \(spatial)]> x) {
+                tensor<uint8, [\(outCh), \(inCh), 1, 1]> Wq = const()[name=string("Wq"), val=tensor<uint8, [\(outCh), \(inCh), 1, 1]>(BLOBFILE(path=string("@model_path/weights/wq.bin"), offset=uint64(128)))];
+                fp16 scale = const()[name=string("scale"), val=fp16(0.01)];
+                uint8 zp = const()[name=string("zp"), val=uint8(128)];
+                tensor<fp16, [\(outCh), \(inCh), 1, 1]> W = constexpr_affine_dequantize(quantized_data=Wq, zero_point=zp, scale=scale, axis=int32(0))[name=string("W")];
+                string pt = const()[name=string("pt"), val=string("valid")];
+                tensor<int32, [2]> st = const()[name=string("st"), val=tensor<int32, [2]>([1,1])];
+                tensor<int32, [4]> pd = const()[name=string("pd"), val=tensor<int32, [4]>([0,0,0,0])];
+                tensor<int32, [2]> dl = const()[name=string("dl"), val=tensor<int32, [2]>([1,1])];
+                int32 gr = const()[name=string("gr"), val=int32(1)];
+                tensor<fp16, [1, \(outCh), 1, \(spatial)]> out = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=W,x=x)[name=string("out")];
+            } -> (out);
+        }
+        """
+        let resultE = tryCompileAndEvalWithWeights(
+            label: "constexpr_affine_dequantize_uint8",
+            milText: milQuantE,
+            weights: [
+                ("@model_path/weights/wq.bin", int8WeightBlob)
+            ],
+            inputBytes: inCh * spatial * 2,
+            outputBytes: outCh * spatial * 2
+        )
+        print("probe constexpr_affine_dequantize (uint8): \(resultE)")
+    }
+
     private enum ProbeResult: CustomStringConvertible {
         case compileFailed(String)
         case evalFailed(String)
@@ -3402,6 +3622,217 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         print("  argmax:      \(String(format: "%.1f", median(argmaxUs))) µs (\(String(format: "%.1f", median(argmaxUs) / totalUs * 100))%)")
         print("  TOTAL:       \(String(format: "%.1f", totalUs)) µs")
         print("  implied_tps: \(String(format: "%.1f", Double(streamCount) / (totalUs / 1_000_000.0)))")
+    }
+
+    func test_batched_step_component_timing_512_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let layerCount = 6
+        let streamCount = 512
+        let dim = ModelConfig.dim
+        let laneSpatial = 512
+        let iterations = 50
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let tripletCount = layerCount / 3
+
+        var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
+            count: tripletCount,
+            throwingInitializer: { tripletIdx in
+                let base = tripletIdx * 3
+                return try RWKVStyleFusedThreeLayerSession(
+                    weights0: weights.layers[base],
+                    weights1: weights.layers[base + 1],
+                    weights2: weights.layers[base + 2],
+                    laneSpatial: laneSpatial
+                )
+            }
+        )
+
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
+            vocabSize: weights.vocabSize,
+            bottleneck: 128,
+            laneSpatial: laneSpatial
+        )
+
+        let t0xIn = tripletSessions[0].handles.xIn
+        let t0xOut = tripletSessions[0].handles.xOut
+        let t0sIn0 = tripletSessions[0].handles.stateIn0
+        let t0sIn1 = tripletSessions[0].handles.stateIn1
+        let t0sIn2 = tripletSessions[0].handles.stateIn2
+        let t0sOut0 = tripletSessions[0].handles.stateOut0
+        let t0sOut1 = tripletSessions[0].handles.stateOut1
+        let t0sOut2 = tripletSessions[0].handles.stateOut2
+        let t1xIn = tripletSessions[1].handles.xIn
+        let t1xOut = tripletSessions[1].handles.xOut
+        let t1sIn0 = tripletSessions[1].handles.stateIn0
+        let t1sIn1 = tripletSessions[1].handles.stateIn1
+        let t1sIn2 = tripletSessions[1].handles.stateIn2
+        let t1sOut0 = tripletSessions[1].handles.stateOut0
+        let t1sOut1 = tripletSessions[1].handles.stateOut1
+        let t1sOut2 = tripletSessions[1].handles.stateOut2
+        let headIn = try factoredHead.rmsNormClassifier.inputSurface(at: 0)
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+        let vocabSize = weights.vocabSize
+
+        var tokens = Array(repeating: UInt16(0), count: streamCount)
+
+        // Warmup
+        for _ in 0..<3 {
+            try batchedTokenStepWithEval(
+                tokens: &tokens, streamCount: streamCount,
+                embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
+                tripletCount: tripletCount, tripletSessions: &tripletSessions,
+                t0xIn: t0xIn, t0xOut: t0xOut,
+                t0sIn0: t0sIn0, t0sIn1: t0sIn1, t0sIn2: t0sIn2,
+                t0sOut0: t0sOut0, t0sOut1: t0sOut1, t0sOut2: t0sOut2,
+                t1xIn: t1xIn, t1xOut: t1xOut,
+                t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
+                t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
+                headIn: headIn, headOut: headOut,
+                headEval: { try factoredHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
+            )
+        }
+
+        var embedUs: [Double] = []
+        var evalT0Us: [Double] = []
+        var stateT0Us: [Double] = []
+        var xferUs: [Double] = []
+        var evalT1Us: [Double] = []
+        var stateT1Us: [Double] = []
+        var headCopyUs: [Double] = []
+        var evalHeadUs: [Double] = []
+        var argmaxUs: [Double] = []
+
+        for _ in 0..<iterations {
+            var t = GenerationClock.now()
+
+            try weights.embedding.withUnsafePointer { embPtr in
+                try tokens.withUnsafeBufferPointer { tokenBuf in
+                    try SurfaceIO.writeEmbeddingBatchFP16(
+                        to: t0xIn, channelOffset: 0, spatial: laneSpatial,
+                        embeddingTable: embPtr, dim: dim,
+                        tokenIDs: tokenBuf.baseAddress!, streamCount: streamCount
+                    )
+                }
+            }
+            var t2 = GenerationClock.now(); embedUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[0].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t0sIn0, dstChannelOffset: 0, src: t0sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn1, dstChannelOffset: 0, src: t0sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t0sIn2, dstChannelOffset: 0, src: t0sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT0Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1xIn, dstChannelOffset: 0, src: t0xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); xferUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try tripletSessions[1].kernels.step.eval()
+            t2 = GenerationClock.now(); evalT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: t1sIn0, dstChannelOffset: 0, src: t1sOut0, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn1, dstChannelOffset: 0, src: t1sOut1, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            try SurfaceIO.copyFP16(dst: t1sIn2, dstChannelOffset: 0, src: t1sOut2, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); stateT1Us.append(machMicroseconds(t2 - t)); t = t2
+
+            try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: t1xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
+            t2 = GenerationClock.now(); headCopyUs.append(machMicroseconds(t2 - t)); t = t2
+
+            try factoredHead.rmsNormClassifier.eval()
+            t2 = GenerationClock.now(); evalHeadUs.append(machMicroseconds(t2 - t)); t = t2
+
+            let argmaxResults = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: vocabSize, streamCount: streamCount, nBlocks: 8
+            )
+            for i in 0..<streamCount { tokens[i] = UInt16(argmaxResults[i].index) }
+            t2 = GenerationClock.now(); argmaxUs.append(machMicroseconds(t2 - t))
+        }
+
+        func median(_ arr: [Double]) -> Double {
+            let sorted = arr.sorted()
+            let n = sorted.count
+            return n % 2 == 0 ? (sorted[n/2 - 1] + sorted[n/2]) / 2.0 : sorted[n/2]
+        }
+
+        let totalUs = median(embedUs) + median(evalT0Us) + median(stateT0Us) + median(xferUs) +
+            median(evalT1Us) + median(stateT1Us) + median(headCopyUs) + median(evalHeadUs) + median(argmaxUs)
+
+        print("Component timing (median µs, \(streamCount) streams @ lane=\(laneSpatial), \(iterations) iterations):")
+        print("  embed_write: \(String(format: "%.1f", median(embedUs))) µs (\(String(format: "%.1f", median(embedUs) / totalUs * 100))%)")
+        print("  eval_T0:     \(String(format: "%.1f", median(evalT0Us))) µs (\(String(format: "%.1f", median(evalT0Us) / totalUs * 100))%)")
+        print("  state_T0:    \(String(format: "%.1f", median(stateT0Us))) µs (\(String(format: "%.1f", median(stateT0Us) / totalUs * 100))%)")
+        print("  xfer_T0T1:   \(String(format: "%.1f", median(xferUs))) µs (\(String(format: "%.1f", median(xferUs) / totalUs * 100))%)")
+        print("  eval_T1:     \(String(format: "%.1f", median(evalT1Us))) µs (\(String(format: "%.1f", median(evalT1Us) / totalUs * 100))%)")
+        print("  state_T1:    \(String(format: "%.1f", median(stateT1Us))) µs (\(String(format: "%.1f", median(stateT1Us) / totalUs * 100))%)")
+        print("  head_copy:   \(String(format: "%.1f", median(headCopyUs))) µs (\(String(format: "%.1f", median(headCopyUs) / totalUs * 100))%)")
+        print("  eval_head:   \(String(format: "%.1f", median(evalHeadUs))) µs (\(String(format: "%.1f", median(evalHeadUs) / totalUs * 100))%)")
+        print("  argmax:      \(String(format: "%.1f", median(argmaxUs))) µs (\(String(format: "%.1f", median(argmaxUs) / totalUs * 100))%)")
+        print("  TOTAL:       \(String(format: "%.1f", totalUs)) µs")
+        print("  implied_tps: \(String(format: "%.1f", Double(streamCount) / (totalUs / 1_000_000.0)))")
+    }
+
+    func test_head_k_sweep_512_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let layerCount = 6
+        let streamCount = 512
+        let dim = ModelConfig.dim
+        let laneSpatial = 512
+        let iterations = 30
+
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+        let vocabSize = weights.vocabSize
+
+        for k in [32, 64, 96, 128, 192, 256] {
+            let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+                rmsFinal: weights.rmsFinal,
+                classifierProjection: TensorBuffer(count: k * dim, zeroed: true),
+                classifierExpansion: TensorBuffer(count: vocabSize * k, zeroed: true),
+                vocabSize: vocabSize,
+                bottleneck: k,
+                laneSpatial: laneSpatial
+            )
+            let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+
+            // Warmup
+            for _ in 0..<5 { try factoredHead.rmsNormClassifier.eval() }
+
+            var evalUs: [Double] = []
+            var argmaxUs: [Double] = []
+            for _ in 0..<iterations {
+                var t = GenerationClock.now()
+                try factoredHead.rmsNormClassifier.eval()
+                var t2 = GenerationClock.now()
+                evalUs.append(machMicroseconds(t2 - t))
+
+                t = t2
+                let _ = try SurfaceIO.argmaxBatchFP16SpatialParallel(
+                    from: headOut, channelOffset: 0, spatial: laneSpatial,
+                    channels: vocabSize, streamCount: streamCount, nBlocks: 8
+                )
+                t2 = GenerationClock.now()
+                argmaxUs.append(machMicroseconds(t2 - t))
+            }
+
+            func median(_ arr: [Double]) -> Double {
+                let sorted = arr.sorted()
+                let n = sorted.count
+                return n % 2 == 0 ? (sorted[n/2-1] + sorted[n/2]) / 2.0 : sorted[n/2]
+            }
+
+            let headMs = median(evalUs) / 1000.0
+            let argMs = median(argmaxUs) / 1000.0
+            let projWeightKB = k * dim * 2 / 1024
+            let expandWeightKB = vocabSize * k * 2 / 1024
+            print("k=\(k): head_eval=\(String(format: "%.3f", headMs))ms argmax=\(String(format: "%.3f", argMs))ms total=\(String(format: "%.3f", headMs + argMs))ms proj_w=\(projWeightKB)KB expand_w=\(expandWeightKB)KB")
+        }
     }
 
     private func machMicroseconds(_ deltaTicks: UInt64) -> Double {
