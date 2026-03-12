@@ -3,7 +3,7 @@
 </p>
 
 <p align="center">
-  <img src="docs/demo.gif" alt="Espresso Demo" width="800">
+  <img src="demo.gif" alt="Espresso Demo" width="800">
 </p>
 
 # Espresso
