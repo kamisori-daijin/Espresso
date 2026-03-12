@@ -1002,7 +1002,11 @@ Speedup:    1.05x
 | 4 | Metal SharedEvent on standard eval | True async dispatch | Medium | Medium |
 | 5 | Speculative decoding | 3-5x algorithmic | Large | Low |
 
-### Recommended Execution Order
+### Historical Execution Order (Superseded)
+
+> Historical note: the list below was an earlier forward-looking ordering, not the current source of truth.
+> Later entries in this notebook and the matching hardware tests supersede it.
+> In particular, multi-layer fused decode was later abandoned with `InvalidMILProgram`, and the blocked private-API routes should not be retried without new evidence.
 
 1. **Probe `evaluateRealTimeWithModel:`** -- quick win, 1-2 hours, might reveal a
    lower-overhead dispatch path
