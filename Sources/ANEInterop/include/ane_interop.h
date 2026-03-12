@@ -244,6 +244,18 @@ bool ane_interop_io_argmax_batch_fp16_spatial_parallel(
     float *out_values,
     int n_blocks);
 
+/// Lockless argmax — assumes surface is already coherent (e.g., after sync ANE eval).
+/// WARNING: May produce stale data if called without prior synchronization.
+bool ane_interop_io_argmax_batch_fp16_spatial_nolock(
+    IOSurfaceRef surface,
+    int ch_off,
+    int spatial,
+    int channels,
+    int stream_count,
+    int *out_indices,
+    float *out_values,
+    int n_blocks);
+
 /// Lock/unlock surfaces independently for batched I/O sequences.
 /// Use these to amortize lock overhead across write→eval→read cycles.
 bool ane_interop_io_lock_write(IOSurfaceRef surface);

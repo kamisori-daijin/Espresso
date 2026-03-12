@@ -101,7 +101,7 @@ private func makeEchoGenerationWeights(layerCount: Int) -> GenerationWeights {
     )
 }
 
-private func makeEchoRecurrentGenerationWeights(layerCount: Int) -> RecurrentGenerationWeights {
+private func makeEchoRecurrentGenerationWeights(layerCount: Int, vocabSize: Int = ModelConfig.vocab) -> RecurrentGenerationWeights {
     let layers = LayerStorage<RWKVStyleRecurrentWeights>(count: layerCount) { _ in
         let weights = RWKVStyleRecurrentWeights()
         fill(weights.rms, value: 1)
@@ -115,7 +115,7 @@ private func makeEchoRecurrentGenerationWeights(layerCount: Int) -> RecurrentGen
     let rmsFinal = TensorBuffer(count: ModelConfig.dim, zeroed: false)
     fill(rmsFinal, value: 1)
 
-    let embedding = TensorBuffer(count: ModelConfig.vocab * ModelConfig.dim, zeroed: true)
+    let embedding = TensorBuffer(count: vocabSize * ModelConfig.dim, zeroed: true)
     embedding.withUnsafeMutablePointer { ptr in
         for dimIdx in 0..<ModelConfig.dim {
             ptr[dimIdx] = 1
@@ -127,7 +127,8 @@ private func makeEchoRecurrentGenerationWeights(layerCount: Int) -> RecurrentGen
         rmsFinal: rmsFinal,
         embedding: embedding,
         classifier: TensorBuffer(count: 0, zeroed: true),
-        sharedClassifier: true
+        sharedClassifier: true,
+        vocabSize: vocabSize
     )
 }
 
@@ -1664,7 +1665,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         iterations: Int,
         streamCounts: [Int],
         groups: Int = 1,
-        headGroups: Int = 1
+        headGroups: Int = 1,
+        vocabSize: Int = ModelConfig.vocab
     ) throws -> ConcurrentGenerationScalingReport {
         let dim = ModelConfig.dim
         var samples: [ConcurrentGenerationScalingSample] = []
@@ -1681,7 +1683,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
 
             let compileStart = GenerationClock.now()
 
-            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount)
+            let weights = makeEchoRecurrentGenerationWeights(layerCount: layerCount, vocabSize: vocabSize)
             let tripletCount = layerCount / 3
 
             var tripletSessions = try LayerStorage<RWKVStyleFusedThreeLayerSession>(
@@ -2341,8 +2343,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         try requireGenerationHardware()
 
         let prompt: [UInt16] = [0]
-        let warmup = 3
-        let iterations = 20
+        let warmup = 10
+        let iterations = 50
         let maxNewTokens = 8
 
         let result = try benchmarkBatchedRecurrentGeneration(
