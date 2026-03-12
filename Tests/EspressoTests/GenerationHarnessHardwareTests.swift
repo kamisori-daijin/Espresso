@@ -2353,7 +2353,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             maxNewTokens: maxNewTokens,
             warmup: warmup,
             iterations: iterations,
-            streamCounts: [256],
+            streamCounts: [512],
             groups: 16,
             headGroups: 16
         )
