@@ -6,6 +6,7 @@ import ANEInterop
 import CoreML
 import CPUOps
 import IOSurface
+import Metal
 @testable import MILGenerator
 @testable import Espresso
 
@@ -1895,6 +1896,423 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         }
     }
 
+    func test_fused_trunk_head_compile_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        let laneSpatial = 256
+        let dim = ModelConfig.dim
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let k = 128
+        let vocabSize = weights.vocabSize
+
+        // Build MIL for N-layer trunk + factored head, and try compile+eval
+        func probeNLayerFusedHead(layerCount: Int) {
+            let invd: Float = 1.0 / Float(dim)
+            var b = MILBuilder(reserveCapacity: 32_768)
+            b.append(MILText.header)
+
+            var inputs = "tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x"
+            for i in 0..<layerCount {
+                inputs += ", tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> stateIn\(i)"
+            }
+            b.appendLine("    func main<ios18>(\(inputs)) {")
+
+            // Shared constants
+            b.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            b.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            b.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            b.appendFP16(invd)
+            b.appendLine(")];")
+            b.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            b.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            b.append(MILText.convConst)
+
+            // Recurrent layers
+            for i in 0..<layerCount {
+                let p = "l\(i)_"
+                let xIn = i == 0 ? "x" : "l\(i-1)_xNext"
+                let xOut = i == layerCount - 1 ? "xNext" : "l\(i)_xNext"
+                let sIn = "stateIn\(i)"
+                let sOut = "stateOut\(i)"
+
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sq = mul(x=\(xIn),y=\(xIn))[name=string(\"\(p)sq\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss = reduce_sum(x=\(p)sq,axes=raxCh,keep_dims=kd)[name=string(\"\(p)ss\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss2 = mul(x=\(p)ss,y=invd)[name=string(\"\(p)ss2\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss3 = add(x=\(p)ss2,y=eps)[name=string(\"\(p)ss3\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)rrms = pow(x=\(p)ss3,y=nhalf)[name=string(\"\(p)rrms\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xr = mul(x=\(xIn),y=\(p)rrms)[name=string(\"\(p)xr\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,1]> \(p)rw = const()[name=string(\"\(p)rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rwkv_rms\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xn = mul(x=\(p)xr,y=\(p)rw)[name=string(\"\(p)xn\")];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wx = const()[name=string(\"\(p)Wx\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wx\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Ws = const()[name=string(\"\(p)Ws\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/ws\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wd = const()[name=string(\"\(p)Wd\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wd\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wo = const()[name=string(\"\(p)Wo\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wx,x=\(p)xn)[name=string(\"\(p)x_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Ws,x=\(sIn))[name=string(\"\(p)s_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wd,x=\(sIn))[name=string(\"\(p)carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)mixPre = add(x=\(p)xMix,y=\(p)sMix)[name=string(\"\(p)mix_pre\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gate = sigmoid(x=\(p)mixPre)[name=string(\"\(p)gate\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gatedCarry = mul(x=\(p)carry,y=\(p)gate)[name=string(\"\(p)gated_carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(sOut) = add(x=\(p)xMix,y=\(p)gatedCarry)[name=string(\"\(p)state_out\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wo,x=\(sOut))[name=string(\"\(p)proj\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(xOut) = add(x=\(xIn),y=\(p)proj)[name=string(\"\(p)x_next\")];")
+            }
+
+            // Factored head on xNext
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> h_sq = mul(x=xNext,y=xNext)[name=string(\"h_sq\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_ss = reduce_sum(x=h_sq,axes=raxCh,keep_dims=kd)[name=string(\"h_ss\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_ss2 = mul(x=h_ss,y=invd)[name=string(\"h_ss2\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_ss3 = add(x=h_ss2,y=eps)[name=string(\"h_ss3\")];")
+            b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> h_rrms = pow(x=h_ss3,y=nhalf)[name=string(\"h_rrms\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> h_xr = mul(x=xNext,y=h_rrms)[name=string(\"h_xr\")];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,1]> h_rw = const()[name=string(\"h_rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];")
+            b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> h_xn = mul(x=h_xr,y=h_rw)[name=string(\"h_xn\")];")
+            b.appendLine("        tensor<fp16, [\(k), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(k), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];")
+            b.appendLine("        tensor<fp16, [1, \(k), 1, \(laneSpatial)]> h_proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=h_xn)[name=string(\"h_proj\")];")
+            b.appendLine("        tensor<fp16, [\(vocabSize), \(k), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocabSize), \(k), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];")
+            b.appendLine("        tensor<fp16, [1, \(vocabSize), 1, \(laneSpatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=h_proj)[name=string(\"h_expand\")];")
+
+            var outputs = "xNext"
+            for i in 0..<layerCount {
+                outputs += ",stateOut\(i)"
+            }
+            outputs += ",logits"
+            b.appendLine("    } -> (\(outputs));")
+            b.appendLine("}")
+
+            // Build weight blobs
+            var weightBlobs: [(path: String, data: Data)] = []
+            for i in 0..<layerCount {
+                let idx = i >= weights.layers.count ? 0 : i
+                weightBlobs.append(("@model_path/weights/rwkv_rms\(i).bin", weights.layers[idx].rms.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wx\(i).bin", weights.layers[idx].Wx.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/ws\(i).bin", weights.layers[idx].Ws.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wd\(i).bin", weights.layers[idx].Wd.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wo\(i).bin", weights.layers[idx].Wo.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+            }
+            // Head weights
+            weightBlobs.append(("@model_path/weights/rms_final.bin", weights.rmsFinal.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }))
+            let projBuf = TensorBuffer(count: k * dim, zeroed: true)
+            weightBlobs.append(("@model_path/weights/cls_proj.bin", projBuf.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: k, cols: dim) }))
+            let expBuf = TensorBuffer(count: vocabSize * k, zeroed: true)
+            weightBlobs.append(("@model_path/weights/cls_expand.bin", expBuf.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: vocabSize, cols: k) }))
+
+            let stateBytes = dim * laneSpatial * 2
+            let inputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount)
+            let outputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount) + [vocabSize * laneSpatial * 2]
+
+            let compileStart = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: b.text,
+                    weights: weightBlobs,
+                    inputSizes: inputSizes,
+                    outputSizes: outputSizes
+                )
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+                // Try eval
+                try kernel.eval()
+
+                // Benchmark 20 evals
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t))
+                }
+                times.sort()
+                let median = times[times.count / 2]
+                print("\(layerCount)L+head: COMPILE OK (\(String(format: "%.0f", compileMs))ms), EVAL OK, median=\(String(format: "%.3f", median))ms")
+            } catch {
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+                print("\(layerCount)L+head: FAILED after \(String(format: "%.0f", compileMs))ms — \(error)")
+            }
+        }
+
+        // Also probe standalone N-layer trunks (no head)
+        func probeNLayerTrunk(layerCount: Int) {
+            let invd: Float = 1.0 / Float(dim)
+            var b = MILBuilder(reserveCapacity: 32_768)
+            b.append(MILText.header)
+
+            var inputs = "tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x"
+            for i in 0..<layerCount {
+                inputs += ", tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> stateIn\(i)"
+            }
+            b.appendLine("    func main<ios18>(\(inputs)) {")
+            b.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            b.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            b.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            b.appendFP16(invd)
+            b.appendLine(")];")
+            b.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            b.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            b.append(MILText.convConst)
+
+            for i in 0..<layerCount {
+                let p = "l\(i)_"
+                let xIn = i == 0 ? "x" : "l\(i-1)_xNext"
+                let xOut = i == layerCount - 1 ? "xNext" : "l\(i)_xNext"
+                let sIn = "stateIn\(i)"
+                let sOut = "stateOut\(i)"
+
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sq = mul(x=\(xIn),y=\(xIn))[name=string(\"\(p)sq\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss = reduce_sum(x=\(p)sq,axes=raxCh,keep_dims=kd)[name=string(\"\(p)ss\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss2 = mul(x=\(p)ss,y=invd)[name=string(\"\(p)ss2\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)ss3 = add(x=\(p)ss2,y=eps)[name=string(\"\(p)ss3\")];")
+                b.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> \(p)rrms = pow(x=\(p)ss3,y=nhalf)[name=string(\"\(p)rrms\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xr = mul(x=\(xIn),y=\(p)rrms)[name=string(\"\(p)xr\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,1]> \(p)rw = const()[name=string(\"\(p)rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rwkv_rms\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xn = mul(x=\(p)xr,y=\(p)rw)[name=string(\"\(p)xn\")];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wx = const()[name=string(\"\(p)Wx\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wx\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Ws = const()[name=string(\"\(p)Ws\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/ws\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wd = const()[name=string(\"\(p)Wd\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wd\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [\(dim),\(dim),1,1]> \(p)Wo = const()[name=string(\"\(p)Wo\"), val=tensor<fp16, [\(dim),\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/wo\(i).bin\"), offset=uint64(64)))];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)xMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wx,x=\(p)xn)[name=string(\"\(p)x_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)sMix = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Ws,x=\(sIn))[name=string(\"\(p)s_mix\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)carry = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wd,x=\(sIn))[name=string(\"\(p)carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)mixPre = add(x=\(p)xMix,y=\(p)sMix)[name=string(\"\(p)mix_pre\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gate = sigmoid(x=\(p)mixPre)[name=string(\"\(p)gate\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)gatedCarry = mul(x=\(p)carry,y=\(p)gate)[name=string(\"\(p)gated_carry\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(sOut) = add(x=\(p)xMix,y=\(p)gatedCarry)[name=string(\"\(p)state_out\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(p)proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=\(p)Wo,x=\(sOut))[name=string(\"\(p)proj\")];")
+                b.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> \(xOut) = add(x=\(xIn),y=\(p)proj)[name=string(\"\(p)x_next\")];")
+            }
+
+            var outputs = "xNext"
+            for i in 0..<layerCount { outputs += ",stateOut\(i)" }
+            b.appendLine("    } -> (\(outputs));")
+            b.appendLine("}")
+
+            var weightBlobs: [(path: String, data: Data)] = []
+            for i in 0..<layerCount {
+                let idx = i >= weights.layers.count ? 0 : i
+                weightBlobs.append(("@model_path/weights/rwkv_rms\(i).bin", weights.layers[idx].rms.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wx\(i).bin", weights.layers[idx].Wx.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/ws\(i).bin", weights.layers[idx].Ws.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wd\(i).bin", weights.layers[idx].Wd.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+                weightBlobs.append(("@model_path/weights/wo\(i).bin", weights.layers[idx].Wo.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: dim, cols: dim) }))
+            }
+
+            let stateBytes = dim * laneSpatial * 2
+            let inputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount)
+            let outputSizes = [stateBytes] + Array(repeating: stateBytes, count: layerCount)
+
+            let compileStart = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: b.text,
+                    weights: weightBlobs,
+                    inputSizes: inputSizes,
+                    outputSizes: outputSizes
+                )
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+
+                try kernel.eval()
+
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t))
+                }
+                times.sort()
+                let median = times[times.count / 2]
+                print("\(layerCount)L trunk: COMPILE OK (\(String(format: "%.0f", compileMs))ms), EVAL OK, median=\(String(format: "%.3f", median))ms")
+            } catch {
+                let compileMs = machMilliseconds(GenerationClock.now() - compileStart)
+                print("\(layerCount)L trunk: FAILED after \(String(format: "%.0f", compileMs))ms — \(error)")
+            }
+        }
+
+        // Probe matrix: trunk-only and fused trunk+head at different layer counts
+        print("=== Trunk-only probes ===")
+        probeNLayerTrunk(layerCount: 4)
+        probeNLayerTrunk(layerCount: 5)
+
+        print("=== Fused trunk+head probes ===")
+        probeNLayerFusedHead(layerCount: 1)
+        probeNLayerFusedHead(layerCount: 2)
+        probeNLayerFusedHead(layerCount: 3)
+
+        // Probe: factored head variants
+        print("=== Factored head output variants ===")
+        let blockSize = 125 // 32000 / 256 = 125
+        let numBlocks = 256
+
+        // Helper to build factored head MIL with configurable outputs
+        func buildFactoredHeadMILProbe(outputLogits: Bool, outputBmax: Bool, outputProj: Bool) -> String {
+            let invdVal: Float = 1.0 / Float(dim)
+            var hb = MILBuilder(reserveCapacity: 4_096)
+            hb.append(MILText.header)
+            hb.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x) {")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> sq = mul(x=x,y=x)[name=string(\"sq\")];")
+            hb.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            hb.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            hb.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            hb.appendFP16(invdVal)
+            hb.appendLine(")];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string(\"ss\")];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];")
+            hb.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];")
+            hb.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            hb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];")
+            hb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];")
+            hb.append(MILText.convConst)
+            hb.appendLine("        tensor<fp16, [\(k), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(k), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];")
+            hb.appendLine("        tensor<fp16, [1, \(k), 1, \(laneSpatial)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=xn)[name=string(\"proj\")];")
+            hb.appendLine("        tensor<fp16, [\(vocabSize), \(k), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocabSize), \(k), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];")
+            hb.appendLine("        tensor<fp16, [1, \(vocabSize), 1, \(laneSpatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=proj)[name=string(\"expand\")];")
+            if outputBmax {
+                hb.appendLine("        tensor<int32, [4]> rs = const()[name=string(\"rs\"), val=tensor<int32, [4]>([1, \(numBlocks), \(blockSize), \(laneSpatial)])];")
+                hb.appendLine("        tensor<fp16, [1, \(numBlocks), \(blockSize), \(laneSpatial)]> lr = reshape(x=logits, shape=rs)[name=string(\"lr\")];")
+                hb.appendLine("        tensor<int32, [1]> raxH = const()[name=string(\"rax_h\"), val=tensor<int32, [1]>([2])];")
+                hb.appendLine("        tensor<fp16, [1, \(numBlocks), 1, \(laneSpatial)]> bmax = reduce_max(x=lr,axes=raxH,keep_dims=kd)[name=string(\"bmax\")];")
+            }
+            var outs: [String] = []
+            if outputLogits { outs.append("logits") }
+            if outputBmax { outs.append("bmax") }
+            if outputProj { outs.append("proj") }
+            hb.appendLine("    } -> (\(outs.joined(separator: ",")));")
+            hb.appendLine("}")
+            return hb.text
+        }
+
+        func probeHeadVariant(label: String, milText: String, outputSizes: [Int]) {
+            let rmsBlob = weights.rmsFinal.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }
+            let projBuf2 = TensorBuffer(count: k * dim, zeroed: true)
+            let projBlob2 = projBuf2.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: k, cols: dim) }
+            let expBuf2 = TensorBuffer(count: vocabSize * k, zeroed: true)
+            let expBlob2 = expBuf2.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: vocabSize, cols: k) }
+
+            let t = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: milText,
+                    weights: [
+                        (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                        (path: "@model_path/weights/cls_proj.bin", data: projBlob2),
+                        (path: "@model_path/weights/cls_expand.bin", data: expBlob2),
+                    ],
+                    inputSizes: [dim * laneSpatial * 2],
+                    outputSizes: outputSizes
+                )
+                let cMs = machMilliseconds(GenerationClock.now() - t)
+                try kernel.eval()
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t0 = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t0))
+                }
+                times.sort()
+                print("\(label): OK compile=\(String(format: "%.0f", cMs))ms eval_median=\(String(format: "%.3f", times[10]))ms")
+            } catch {
+                let cMs = machMilliseconds(GenerationClock.now() - t)
+                print("\(label): FAILED after \(String(format: "%.0f", cMs))ms")
+            }
+        }
+
+        // Variant A: logits only (baseline — should work)
+        probeHeadVariant(
+            label: "logits_only",
+            milText: buildFactoredHeadMILProbe(outputLogits: true, outputBmax: false, outputProj: false),
+            outputSizes: [vocabSize * laneSpatial * 2]
+        )
+        // Variant B: logits + bmax (two outputs)
+        probeHeadVariant(
+            label: "logits+bmax",
+            milText: buildFactoredHeadMILProbe(outputLogits: true, outputBmax: true, outputProj: false),
+            outputSizes: [vocabSize * laneSpatial * 2, numBlocks * laneSpatial * 2]
+        )
+        // Variant C: bmax only (no full logits)
+        probeHeadVariant(
+            label: "bmax_only",
+            milText: buildFactoredHeadMILProbe(outputLogits: false, outputBmax: true, outputProj: false),
+            outputSizes: [numBlocks * laneSpatial * 2]
+        )
+        // Variant D: proj + bmax (bottleneck + blocked max, no full logits)
+        probeHeadVariant(
+            label: "proj+bmax",
+            milText: buildFactoredHeadMILProbe(outputLogits: false, outputBmax: true, outputProj: true),
+            outputSizes: [numBlocks * laneSpatial * 2, k * laneSpatial * 2]
+        )
+        // Variant E: proj only (bottleneck only)
+        probeHeadVariant(
+            label: "proj_only",
+            milText: buildFactoredHeadMILProbe(outputLogits: false, outputBmax: false, outputProj: true),
+            outputSizes: [k * laneSpatial * 2]
+        )
+
+        // K-sweep at 256 lanes: measure head eval with different bottleneck sizes
+        print("=== K-sweep at lane=\(laneSpatial) ===")
+        for kVal in [32, 64, 128, 256, 512] {
+            let kInvd: Float = 1.0 / Float(dim)
+            var kb = MILBuilder(reserveCapacity: 4_096)
+            kb.append(MILText.header)
+            kb.appendLine("    func main<ios18>(tensor<fp16, [1, \(dim), 1, \(laneSpatial)]> x) {")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> sq = mul(x=x,y=x)[name=string(\"sq\")];")
+            kb.appendLine("        tensor<int32, [1]> raxCh = const()[name=string(\"rax_ch\"), val=tensor<int32, [1]>([1])];")
+            kb.appendLine("        bool kd = const()[name=string(\"kd\"), val=bool(true)];")
+            kb.append("        fp16 invd = const()[name=string(\"invd\"), val=fp16(")
+            kb.appendFP16(kInvd)
+            kb.appendLine(")];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss = reduce_sum(x=sq,axes=raxCh,keep_dims=kd)[name=string(\"ss\")];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss2 = mul(x=ss,y=invd)[name=string(\"ss2\")];")
+            kb.appendLine("        fp16 eps = const()[name=string(\"eps\"), val=fp16(0.00001)];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> ss3 = add(x=ss2,y=eps)[name=string(\"ss3\")];")
+            kb.appendLine("        fp16 nhalf = const()[name=string(\"nhalf\"), val=fp16(-0.5)];")
+            kb.appendLine("        tensor<fp16, [1,1,1,\(laneSpatial)]> rrms = pow(x=ss3,y=nhalf)[name=string(\"rrms\")];")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xr = mul(x=x,y=rrms)[name=string(\"xr\")];")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,1]> rw = const()[name=string(\"rw\"), val=tensor<fp16, [1,\(dim),1,1]>(BLOBFILE(path=string(\"@model_path/weights/rms_final.bin\"), offset=uint64(64)))];")
+            kb.appendLine("        tensor<fp16, [1,\(dim),1,\(laneSpatial)]> xn = mul(x=xr,y=rw)[name=string(\"xn\")];")
+            kb.append(MILText.convConst)
+            kb.appendLine("        tensor<fp16, [\(kVal), \(dim), 1, 1]> Wproj = const()[name=string(\"Wproj\"), val=tensor<fp16, [\(kVal), \(dim), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_proj.bin\"), offset=uint64(64)))];")
+            kb.appendLine("        tensor<fp16, [1, \(kVal), 1, \(laneSpatial)]> proj = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wproj,x=xn)[name=string(\"proj\")];")
+            kb.appendLine("        tensor<fp16, [\(vocabSize), \(kVal), 1, 1]> Wexp = const()[name=string(\"Wexp\"), val=tensor<fp16, [\(vocabSize), \(kVal), 1, 1]>(BLOBFILE(path=string(\"@model_path/weights/cls_expand.bin\"), offset=uint64(64)))];")
+            kb.appendLine("        tensor<fp16, [1, \(vocabSize), 1, \(laneSpatial)]> logits = conv(dilations=dl,groups=gr,pad=pd,pad_type=pt,strides=st,weight=Wexp,x=proj)[name=string(\"expand\")];")
+            kb.appendLine("    } -> (logits);")
+            kb.appendLine("}")
+
+            let rmsBlob2 = weights.rmsFinal.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: 1, cols: dim) }
+            let projBuf3 = TensorBuffer(count: kVal * dim, zeroed: true)
+            let projBlob3 = projBuf3.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: kVal, cols: dim) }
+            let expBuf3 = TensorBuffer(count: vocabSize * kVal, zeroed: true)
+            let expBlob3 = expBuf3.withUnsafeBufferPointer { WeightBlob.build(from: $0, rows: vocabSize, cols: kVal) }
+
+            let ct = GenerationClock.now()
+            do {
+                let kernel = try ANEKernel(
+                    milText: kb.text,
+                    weights: [
+                        (path: "@model_path/weights/rms_final.bin", data: rmsBlob2),
+                        (path: "@model_path/weights/cls_proj.bin", data: projBlob3),
+                        (path: "@model_path/weights/cls_expand.bin", data: expBlob3),
+                    ],
+                    inputSizes: [dim * laneSpatial * 2],
+                    outputSizes: [vocabSize * laneSpatial * 2]
+                )
+                let cMs = machMilliseconds(GenerationClock.now() - ct)
+                try kernel.eval()
+                var times: [Double] = []
+                for _ in 0..<20 {
+                    let t0 = GenerationClock.now()
+                    try kernel.eval()
+                    times.append(machMilliseconds(GenerationClock.now() - t0))
+                }
+                times.sort()
+                let wtMB = Double(kVal * dim + vocabSize * kVal) * 2.0 / 1_000_000.0
+                print("k=\(kVal): eval_median=\(String(format: "%.3f", times[10]))ms compile=\(String(format: "%.0f", cMs))ms weights=\(String(format: "%.1f", wtMB))MB")
+            } catch {
+                print("k=\(kVal): FAILED — \(error)")
+            }
+        }
+    }
+
     func test_batched_multistream_high_lane_sweep_on_hardware() throws {
         try requireGenerationHardware()
 
@@ -2533,6 +2951,170 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         return b.text
     }
 
+    func test_metal_argmax_probe_on_hardware() throws {
+        try requireGenerationHardware()
+
+        guard let device = MTLCreateSystemDefaultDevice() else {
+            print("METAL: No GPU device available")
+            return
+        }
+        guard let queue = device.makeCommandQueue() else {
+            print("METAL: No command queue")
+            return
+        }
+
+        // Metal compute shader for per-lane argmax over channels
+        // Each thread handles one spatial lane. Iterates over all channels.
+        let shaderSource = """
+        #include <metal_stdlib>
+        using namespace metal;
+
+        kernel void argmax_channels(
+            device const half *data [[buffer(0)]],
+            device int *outIndices [[buffer(1)]],
+            device half *outValues [[buffer(2)]],
+            constant uint &channels [[buffer(3)]],
+            constant uint &spatial [[buffer(4)]],
+            uint lane [[thread_position_in_grid]]
+        ) {
+            if (lane >= spatial) return;
+            half bestVal = data[lane]; // channel 0
+            int bestIdx = 0;
+            for (uint c = 1; c < channels; c++) {
+                half val = data[c * spatial + lane];
+                if (val > bestVal) {
+                    bestVal = val;
+                    bestIdx = int(c);
+                }
+            }
+            outIndices[lane] = bestIdx;
+            outValues[lane] = bestVal;
+        }
+        """
+
+        let library: MTLLibrary
+        do {
+            library = try device.makeLibrary(source: shaderSource, options: nil)
+        } catch {
+            print("METAL: Shader compile failed: \(error)")
+            return
+        }
+        guard let function = library.makeFunction(name: "argmax_channels"),
+              let pso = try? device.makeComputePipelineState(function: function) else {
+            print("METAL: Pipeline state failed")
+            return
+        }
+
+        let laneSpatial = 256
+        let channels = 32000  // ModelConfig.vocab
+        let dim = ModelConfig.dim
+
+        // Create a factored head kernel to get a real output surface
+        let weights = makeEchoRecurrentGenerationWeights(layerCount: 6)
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
+            rmsFinal: weights.rmsFinal,
+            classifierProjection: TensorBuffer(count: 128 * dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: channels * 128, zeroed: true),
+            vocabSize: channels,
+            bottleneck: 128,
+            laneSpatial: laneSpatial
+        )
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
+
+        // Eval once to populate the output surface
+        try factoredHead.rmsNormClassifier.eval()
+
+        // Create Metal buffer from IOSurface base address (unified memory, zero-copy)
+        let surfaceSize = IOSurfaceGetAllocSize(headOut)
+        IOSurfaceLock(headOut, .readOnly, nil)
+        let baseAddr = IOSurfaceGetBaseAddress(headOut)
+        let metalBuf = device.makeBuffer(bytesNoCopy: baseAddr, length: surfaceSize, options: .storageModeShared, deallocator: nil)!
+        IOSurfaceUnlock(headOut, .readOnly, nil)
+
+        // Output buffers
+        let indexBuf = device.makeBuffer(length: laneSpatial * MemoryLayout<Int32>.size, options: .storageModeShared)!
+        let valueBuf = device.makeBuffer(length: laneSpatial * MemoryLayout<UInt16>.size, options: .storageModeShared)!
+        var channelsVal = UInt32(channels)
+        var spatialVal = UInt32(laneSpatial)
+
+        // Warmup
+        for _ in 0..<5 {
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(metalBuf, offset: 0, index: 0)
+            enc.setBuffer(indexBuf, offset: 0, index: 1)
+            enc.setBuffer(valueBuf, offset: 0, index: 2)
+            enc.setBytes(&channelsVal, length: 4, index: 3)
+            enc.setBytes(&spatialVal, length: 4, index: 4)
+            enc.dispatchThreads(MTLSize(width: laneSpatial, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(laneSpatial, pso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+        }
+
+        // Benchmark Metal argmax
+        var metalTimesUs: [Double] = []
+        for _ in 0..<50 {
+            IOSurfaceLock(headOut, .readOnly, nil)
+            let t = GenerationClock.now()
+
+            let cb = queue.makeCommandBuffer()!
+            let enc = cb.makeComputeCommandEncoder()!
+            enc.setComputePipelineState(pso)
+            enc.setBuffer(metalBuf, offset: 0, index: 0)
+            enc.setBuffer(indexBuf, offset: 0, index: 1)
+            enc.setBuffer(valueBuf, offset: 0, index: 2)
+            enc.setBytes(&channelsVal, length: 4, index: 3)
+            enc.setBytes(&spatialVal, length: 4, index: 4)
+            enc.dispatchThreads(MTLSize(width: laneSpatial, height: 1, depth: 1),
+                               threadsPerThreadgroup: MTLSize(width: min(laneSpatial, pso.maxTotalThreadsPerThreadgroup), height: 1, depth: 1))
+            enc.endEncoding()
+            cb.commit()
+            cb.waitUntilCompleted()
+
+            metalTimesUs.append(machMicroseconds(GenerationClock.now() - t))
+            IOSurfaceUnlock(headOut, .readOnly, nil)
+        }
+
+        // Benchmark NEON argmax for comparison
+        var neonTimesUs: [Double] = []
+        for _ in 0..<50 {
+            let t = GenerationClock.now()
+            let _ = try SurfaceIO.argmaxBatchFP16Spatial(
+                from: headOut, channelOffset: 0, spatial: laneSpatial,
+                channels: channels, streamCount: laneSpatial
+            )
+            neonTimesUs.append(machMicroseconds(GenerationClock.now() - t))
+        }
+
+        metalTimesUs.sort()
+        neonTimesUs.sort()
+        let metalMedian = metalTimesUs[25]
+        let neonMedian = neonTimesUs[25]
+
+        print("Metal argmax: median=\(String(format: "%.1f", metalMedian))µs (32K ch × 256 lanes)")
+        print("NEON argmax:  median=\(String(format: "%.1f", neonMedian))µs")
+        print("Speedup: \(String(format: "%.2f", neonMedian / metalMedian))x")
+
+        // Verify correctness
+        let metalIndices = indexBuf.contents().bindMemory(to: Int32.self, capacity: laneSpatial)
+        let neonResults = try SurfaceIO.argmaxBatchFP16Spatial(
+            from: headOut, channelOffset: 0, spatial: laneSpatial,
+            channels: channels, streamCount: laneSpatial
+        )
+        var correct = true
+        for i in 0..<laneSpatial {
+            if metalIndices[i] != Int32(neonResults[i].index) {
+                print("MISMATCH at lane \(i): metal=\(metalIndices[i]) neon=\(neonResults[i].index)")
+                correct = false
+                break
+            }
+        }
+        print("Correctness: \(correct ? "MATCH" : "MISMATCH")")
+    }
+
     func test_batched_step_component_timing_256_on_hardware() throws {
         try requireGenerationHardware()
 
@@ -2558,10 +3140,12 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             }
         )
 
-        let head = try ANEGenerationRMSNormClassifierHead(
+        let factoredHead = try FactoredGenerationRMSNormClassifierKernelSet(
             rmsFinal: weights.rmsFinal,
-            classifierWeights: weights.embedding,
+            classifierProjection: TensorBuffer(count: 128 * ModelConfig.dim, zeroed: true),
+            classifierExpansion: TensorBuffer(count: weights.vocabSize * 128, zeroed: true),
             vocabSize: weights.vocabSize,
+            bottleneck: 128,
             laneSpatial: laneSpatial
         )
 
@@ -2581,15 +3165,15 @@ final class GenerationHarnessHardwareTests: XCTestCase {
         let t1sOut0 = tripletSessions[1].handles.stateOut0
         let t1sOut1 = tripletSessions[1].handles.stateOut1
         let t1sOut2 = tripletSessions[1].handles.stateOut2
-        let headIn = head.inputSurface
-        let headOut = head.outputSurface
+        let headIn = try factoredHead.rmsNormClassifier.inputSurface(at: 0)
+        let headOut = try factoredHead.rmsNormClassifier.outputSurface(at: 0)
         let vocabSize = weights.vocabSize
 
         var tokens = Array(repeating: UInt16(0), count: streamCount)
 
         // Warmup
         for _ in 0..<3 {
-            try batchedTokenStep(
+            try batchedTokenStepWithEval(
                 tokens: &tokens, streamCount: streamCount,
                 embedding: weights.embedding, dim: dim, laneSpatial: laneSpatial,
                 tripletCount: tripletCount, tripletSessions: &tripletSessions,
@@ -2600,7 +3184,8 @@ final class GenerationHarnessHardwareTests: XCTestCase {
                 t1sIn0: t1sIn0, t1sIn1: t1sIn1, t1sIn2: t1sIn2,
                 t1sOut0: t1sOut0, t1sOut1: t1sOut1, t1sOut2: t1sOut2,
                 headIn: headIn, headOut: headOut,
-                head: head, vocabSize: vocabSize
+                headEval: { try factoredHead.rmsNormClassifier.eval() },
+                vocabSize: vocabSize
             )
         }
 
@@ -2650,7 +3235,7 @@ final class GenerationHarnessHardwareTests: XCTestCase {
             try SurfaceIO.copyFP16(dst: headIn, dstChannelOffset: 0, src: t1xOut, srcChannelOffset: 0, channels: dim, spatial: laneSpatial)
             t2 = GenerationClock.now(); headCopyUs.append(machMicroseconds(t2 - t)); t = t2
 
-            try head.kernelSet.rmsNormClassifier.eval()
+            try factoredHead.rmsNormClassifier.eval()
             t2 = GenerationClock.now(); evalHeadUs.append(machMicroseconds(t2 - t)); t = t2
 
             let argmaxResults = try SurfaceIO.argmaxBatchFP16Spatial(
