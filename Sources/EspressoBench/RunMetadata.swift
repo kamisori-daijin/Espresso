@@ -26,6 +26,8 @@ enum RunMetadata {
                 "inference_fp16_handoff": options.inferenceFP16Handoff,
                 "decode_steps": options.decodeSteps,
                 "decode_max_seq": options.decodeMaxSeq,
+                "sustained": options.sustained,
+                "output_directory": options.outputDir ?? "",
                 "model_path": options.coreMLModelPath,
                 "ane_only": options.aneOnly,
             ],
