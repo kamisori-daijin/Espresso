@@ -344,14 +344,16 @@ public struct RWKVStyleFusedThreeLayerSession: ~Copyable {
         weights1: borrowing RWKVStyleRecurrentWeights,
         weights2: borrowing RWKVStyleRecurrentWeights,
         laneSpatial: Int = RWKVStyleFusedThreeLayerKernelSet.defaultLaneSpatial,
-        groups: Int = 1
+        groups: Int = 1,
+        includeRMSNorm: Bool = true
     ) throws(ANEError) {
         let kernels = try RWKVStyleFusedThreeLayerKernelSet(
             weights0: weights0,
             weights1: weights1,
             weights2: weights2,
             laneSpatial: laneSpatial,
-            groups: groups
+            groups: groups,
+            includeRMSNorm: includeRMSNorm
         )
         let handles = try RWKVStyleFusedThreeLayerSurfaceHandles(kernels: kernels)
         self.kernels = kernels
