@@ -9,12 +9,12 @@ import Testing
     #expect(g.liveNodeCount == 0)
 }
 
-@Test func addNodeReturnsSequentialIndices() {
+@Test func addNodeReturnsSequentialIndices() throws {
     var g = ANEGraph()
-    let i0 = g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
-                                shape: ANEShape(channels: 4, spatial: 4)))
-    let i1 = g.addNode(ANENode(op: .relu, name: "y", dtype: .fp16,
-                                shape: ANEShape(channels: 4, spatial: 4), inputs: [i0]))
+    let i0 = try g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
+                                    shape: try ANEShape(channels: 4, spatial: 4)))
+    let i1 = try g.addNode(ANENode(op: .relu, name: "y", dtype: .fp16,
+                                    shape: try ANEShape(channels: 4, spatial: 4), inputs: [i0]))
     #expect(i0 == 0)
     #expect(i1 == 1)
     #expect(g.nodes.count == 2)
@@ -28,30 +28,30 @@ import Testing
     #expect(order!.isEmpty)
 }
 
-@Test func topoSortLinearChain() {
+@Test func topoSortLinearChain() throws {
     // x → relu(x) → output
     var g = ANEGraph()
-    let x = g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4)))
-    let r = g.addNode(ANENode(op: .relu, name: "r", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4),
-                               inputs: [x], isOutput: true))
-    g.graphOutputs = [GraphPort(name: "r", nodeIndex: r)]
+    let x = try g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4)))
+    let r = try g.addNode(ANENode(op: .relu, name: "r", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4),
+                                   inputs: [x], isOutput: true))
+    try g.setGraphOutputs([GraphPort(name: "r", nodeIndex: r)])
 
     let order = g.topoSort()
     #expect(order != nil)
     #expect(order! == [x, r])
 }
 
-@Test func topoSortSelfReference() {
+@Test func topoSortSelfReference() throws {
     // x → add(x, x) → output (same node referenced twice)
     var g = ANEGraph()
-    let x = g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4)))
-    let sum = g.addNode(ANENode(op: .add, name: "sum", dtype: .fp16,
-                                 shape: ANEShape(channels: 4, spatial: 4),
-                                 inputs: [x, x], isOutput: true))
-    g.graphOutputs = [GraphPort(name: "sum", nodeIndex: sum)]
+    let x = try g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4)))
+    let sum = try g.addNode(ANENode(op: .add, name: "sum", dtype: .fp16,
+                                     shape: try ANEShape(channels: 4, spatial: 4),
+                                     inputs: [x, x], isOutput: true))
+    try g.setGraphOutputs([GraphPort(name: "sum", nodeIndex: sum)])
 
     let order = g.topoSort()
     #expect(order != nil)
@@ -60,19 +60,19 @@ import Testing
     #expect(order![1] == sum)
 }
 
-@Test func topoSortDiamondGraph() {
+@Test func topoSortDiamondGraph() throws {
     // x → a(relu), x → b(sigmoid), a + b → c(add)
     var g = ANEGraph()
-    let x = g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4)))
-    let a = g.addNode(ANENode(op: .relu, name: "a", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4), inputs: [x]))
-    let b = g.addNode(ANENode(op: .sigmoid, name: "b", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4), inputs: [x]))
-    let c = g.addNode(ANENode(op: .add, name: "c", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4),
-                               inputs: [a, b], isOutput: true))
-    g.graphOutputs = [GraphPort(name: "c", nodeIndex: c)]
+    let x = try g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4)))
+    let a = try g.addNode(ANENode(op: .relu, name: "a", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4), inputs: [x]))
+    let b = try g.addNode(ANENode(op: .sigmoid, name: "b", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4), inputs: [x]))
+    let c = try g.addNode(ANENode(op: .add, name: "c", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4),
+                                   inputs: [a, b], isOutput: true))
+    try g.setGraphOutputs([GraphPort(name: "c", nodeIndex: c)])
 
     let order = g.topoSort()
     #expect(order != nil)
@@ -86,19 +86,19 @@ import Testing
     #expect(bPos < cPos)
 }
 
-@Test func topoSortSkipsDeadNodes() {
+@Test func topoSortSkipsDeadNodes() throws {
     var g = ANEGraph()
-    let x = g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4)))
+    let x = try g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4)))
     var deadNode = ANENode(op: .relu, name: "dead", dtype: .fp16,
-                            shape: ANEShape(channels: 4, spatial: 4), inputs: [x])
+                            shape: try ANEShape(channels: 4, spatial: 4), inputs: [x])
     deadNode.isLive = false
-    let _ = g.addNode(deadNode)
+    let _ = try g.addNode(deadNode)
 
-    let out = g.addNode(ANENode(op: .sigmoid, name: "out", dtype: .fp16,
-                                 shape: ANEShape(channels: 4, spatial: 4),
-                                 inputs: [x], isOutput: true))
-    g.graphOutputs = [GraphPort(name: "out", nodeIndex: out)]
+    let out = try g.addNode(ANENode(op: .sigmoid, name: "out", dtype: .fp16,
+                                     shape: try ANEShape(channels: 4, spatial: 4),
+                                     inputs: [x], isOutput: true))
+    try g.setGraphOutputs([GraphPort(name: "out", nodeIndex: out)])
 
     let order = g.topoSort()
     #expect(order != nil)
@@ -106,30 +106,39 @@ import Testing
     #expect(!order!.contains(1))
 }
 
-@Test func topoSortDetectsCycle() {
+@Test func topoSortDetectsCycle() throws {
     // Manually create a cycle: a references b, b references a
     var g = ANEGraph()
-    let a = g.addNode(ANENode(op: .relu, name: "a", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4),
-                               inputs: [1]))
-    let b = g.addNode(ANENode(op: .relu, name: "b", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4),
-                               inputs: [a], isOutput: true))
-    g.graphOutputs = [GraphPort(name: "b", nodeIndex: b)]
+    let a = try g.addNode(ANENode(op: .relu, name: "a", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4)))
+    let b = try g.addNode(ANENode(op: .relu, name: "b", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4),
+                                   inputs: [a], isOutput: true))
+    try g.replaceNode(
+        at: a,
+        with: ANENode(
+            op: .relu,
+            name: "a",
+            dtype: .fp16,
+            shape: try ANEShape(channels: 4, spatial: 4),
+            inputs: [b]
+        )
+    )
+    try g.setGraphOutputs([GraphPort(name: "b", nodeIndex: b)])
 
     let order = g.topoSort()
     #expect(order == nil)
 }
 
-@Test func liveNodeCountAfterKilling() {
+@Test func liveNodeCountAfterKilling() throws {
     var g = ANEGraph()
-    let _ = g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4)))
-    let _ = g.addNode(ANENode(op: .relu, name: "y", dtype: .fp16,
-                               shape: ANEShape(channels: 4, spatial: 4), inputs: [0]))
+    let _ = try g.addNode(ANENode(op: .input, name: "x", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4)))
+    let _ = try g.addNode(ANENode(op: .relu, name: "y", dtype: .fp16,
+                                   shape: try ANEShape(channels: 4, spatial: 4), inputs: [0]))
 
     #expect(g.liveNodeCount == 2)
-    g.nodes[1].isLive = false
+    g.setNodeLiveness(at: 1, isLive: false)
     #expect(g.liveNodeCount == 1)
 }
 
@@ -143,9 +152,9 @@ import Testing
 
 @Test func nodeEquality() {
     let a = ANENode(op: .relu, name: "r", dtype: .fp16,
-                     shape: ANEShape(channels: 4, spatial: 4), inputs: [0])
+                     shape: try! ANEShape(channels: 4, spatial: 4), inputs: [0])
     let b = ANENode(op: .relu, name: "r", dtype: .fp16,
-                     shape: ANEShape(channels: 4, spatial: 4), inputs: [0])
+                     shape: try! ANEShape(channels: 4, spatial: 4), inputs: [0])
     #expect(a == b)
 }
 
@@ -196,4 +205,83 @@ import Testing
     #expect(ANEDType.fp32.description == "fp32")
     #expect(ANEDType.int32.description == "int32")
     #expect(ANEDType.bool.description == "bool")
+}
+
+@Test func addNodeRejectsOutOfRangeInputIndex() throws {
+    var g = ANEGraph()
+
+    do {
+        _ = try g.addNode(
+            ANENode(
+                op: .relu,
+                name: "bad",
+                dtype: .fp16,
+                shape: try ANEShape(channels: 4, spatial: 4),
+                inputs: [99]
+            )
+        )
+        #expect(Bool(false), "Expected invalid input index to be rejected")
+    } catch let error as ANEGraphValidationError {
+        #expect(error == .invalidNodeInput(nodeName: "bad", inputIndex: 0, referencedIndex: 99))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
+}
+
+@Test func duplicateNodeNamesFailValidation() throws {
+    var g = ANEGraph()
+    let x = try g.addNode(
+        ANENode(op: .input, name: "dup", dtype: .fp16, shape: try ANEShape(channels: 4, spatial: 4))
+    )
+    do {
+        _ = try g.addNode(
+            ANENode(op: .relu, name: "dup", dtype: .fp16, shape: try ANEShape(channels: 4, spatial: 4), inputs: [x])
+        )
+        #expect(Bool(false), "Expected duplicate node name to be rejected")
+    } catch let error as ANEGraphValidationError {
+        #expect(error == .duplicateNodeName("dup"))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
+}
+
+@Test func setGraphOutputsRejectsUnsortedNames() throws {
+    var g = ANEGraph()
+    let a = try g.addNode(
+        ANENode(op: .input, name: "a", dtype: .fp16, shape: try ANEShape(channels: 4, spatial: 4))
+    )
+    let b = try g.addNode(
+        ANENode(op: .relu, name: "b", dtype: .fp16, shape: try ANEShape(channels: 4, spatial: 4), inputs: [a])
+    )
+
+    do {
+        try g.setGraphOutputs([
+            GraphPort(name: "zeta", nodeIndex: b),
+            GraphPort(name: "alpha", nodeIndex: a),
+        ])
+        #expect(Bool(false), "Expected unsorted outputs to be rejected")
+    } catch let error as ANEGraphValidationError {
+        #expect(error == .unsortedGraphOutputs)
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
+}
+
+@Test func setGraphOutputsRejectsOutOfRangeNodeIndex() throws {
+    var g = ANEGraph()
+    let x = try g.addNode(
+        ANENode(op: .input, name: "x", dtype: .fp16, shape: try ANEShape(channels: 4, spatial: 4))
+    )
+
+    do {
+        try g.setGraphOutputs([
+            GraphPort(name: "x", nodeIndex: x),
+            GraphPort(name: "y", nodeIndex: 99),
+        ])
+        #expect(Bool(false), "Expected invalid output node index to be rejected")
+    } catch let error as ANEGraphValidationError {
+        #expect(error == .invalidGraphOutputPort(name: "y", nodeIndex: 99))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
 }
