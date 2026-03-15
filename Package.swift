@@ -9,6 +9,7 @@ let package = Package(
         .executable(name: "espresso-bench", targets: ["EspressoBench"]),
         .executable(name: "espresso-multitoken-probe", targets: ["EspressoMultitokenProbe"]),
         .library(name: "Espresso", targets: ["Espresso"]),
+        .library(name: "ModelSupport", targets: ["ModelSupport"]),
     ],
     targets: [
         .target(
@@ -35,7 +36,7 @@ let package = Package(
         ),
         .target(
             name: "MILGenerator",
-            dependencies: ["ANETypes"],
+            dependencies: ["ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
             path: "Sources/MILGenerator",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
@@ -161,10 +162,54 @@ let package = Package(
             path: "Sources/ANEBuilder",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        .target(
+            name: "DeltaCompilation",
+            dependencies: ["ANEInterop", "ANETypes", "ANERuntime"],
+            path: "Sources/DeltaCompilation",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "LoRAAdapter",
+            dependencies: ["ANEGraphIR", "ANEBuilder", "ANETypes"],
+            path: "Sources/LoRAAdapter",
+            swiftSettings: [.swiftLanguageMode(.v6)],
+            linkerSettings: [.linkedFramework("IOSurface")]
+        ),
         .testTarget(
             name: "ANEBuilderTests",
             dependencies: ["ANEBuilder", "ANEGraphIR"],
             path: "Tests/ANEBuilderTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .target(
+            name: "ModelSupport",
+            dependencies: ["ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses", "ANETypes"],
+            path: "Sources/ModelSupport",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "ModelSupportTests",
+            dependencies: ["ModelSupport", "ANEGraphIR", "ANETypes", "ANEPasses"],
+            path: "Tests/ModelSupportTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "DeltaCompilationTests",
+            dependencies: ["DeltaCompilation", "ANEGraphIR"],
+            path: "Tests/DeltaCompilationTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "LoRAAdapterTests",
+            dependencies: ["LoRAAdapter", "ANEGraphIR"],
+            path: "Tests/LoRAAdapterTests",
+            swiftSettings: [.swiftLanguageMode(.v6)]
+        ),
+        .testTarget(
+            name: "MigrationParityTests",
+            dependencies: ["MILGenerator", "ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
+            path: "Tests/MigrationParityTests",
+            resources: [.process("Fixtures")],
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
     ]
