@@ -216,7 +216,7 @@ let package = Package(
         ),
         .target(
             name: "RealModelInference",
-            dependencies: ["ModelSupport", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses", "ANERuntime", "ANETypes", "ANEInterop", "CPUOps"],
+            dependencies: ["ModelSupport", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses", "ANERuntime", "ANETypes", "ANEInterop", "CPUOps", "Espresso"],
             path: "Sources/RealModelInference",
             swiftSettings: [.swiftLanguageMode(.v6)],
             linkerSettings: [
