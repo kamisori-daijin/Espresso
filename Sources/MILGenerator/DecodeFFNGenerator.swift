@@ -11,24 +11,32 @@ import ANEGraphIR
 /// Output:
 /// - `x + ffn(x)`: `[1, dim, 1, laneSpatial]`
 public struct DecodeFFNGenerator: MILProgramGenerator {
+    public let dim: Int
+    public let hiddenDim: Int
     public let laneSpatial: Int
     public let architecture: LayerWeightsArchitecture
 
     public init(
+        dim: Int = ModelConfig.dim,
+        hiddenDim: Int = ModelConfig.hidden,
         laneSpatial: Int = 32,
         architecture: LayerWeightsArchitecture = .rmsNormSwiGLU
     ) {
+        precondition(dim > 0)
+        precondition(hiddenDim > 0)
         precondition(laneSpatial > 0)
+        self.dim = dim
+        self.hiddenDim = hiddenDim
         self.laneSpatial = laneSpatial
         self.architecture = architecture
     }
 
-    public var inputBytes: Int { ModelConfig.dim * laneSpatial * 2 }
-    public var outputByteSizes: [Int] { [ModelConfig.dim * laneSpatial * 2] }
+    public var inputBytes: Int { dim * laneSpatial * 2 }
+    public var outputByteSizes: [Int] { [dim * laneSpatial * 2] }
 
     public var milText: String {
         LegacyGraphSupport.emitGraph { graph in
-            let x = try LegacyGraphSupport.input(&graph, name: "x", channels: ModelConfig.dim, spatial: laneSpatial)
+            let x = try LegacyGraphSupport.input(&graph, name: "x", channels: dim, spatial: laneSpatial)
             let normalized: Int
             let y: Int
 
@@ -37,7 +45,7 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
                 normalized = try graph.rmsNorm(
                     "norm",
                     input: x,
-                    dim: ModelConfig.dim,
+                    dim: dim,
                     spatial: laneSpatial,
                     eps: 0.00001,
                     weightPath: "@model_path/weights/rms2.bin"
@@ -45,8 +53,8 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
                 y = try graph.swigluFFN(
                     "ffn",
                     input: normalized,
-                    inDim: ModelConfig.dim,
-                    hiddenDim: ModelConfig.hidden,
+                    inDim: dim,
+                    hiddenDim: hiddenDim,
                     spatial: laneSpatial,
                     w1Path: "@model_path/weights/w1.bin",
                     w3Path: "@model_path/weights/w3.bin",
@@ -56,7 +64,7 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
                 normalized = try graph.layerNorm(
                     "norm",
                     input: x,
-                    dim: ModelConfig.dim,
+                    dim: dim,
                     spatial: laneSpatial,
                     eps: 0.00001,
                     gammaPath: "@model_path/weights/rms2.bin",
@@ -65,8 +73,8 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
                 y = try graph.ffn(
                     "ffn",
                     input: normalized,
-                    inDim: ModelConfig.dim,
-                    hiddenDim: ModelConfig.hidden,
+                    inDim: dim,
+                    hiddenDim: hiddenDim,
                     spatial: laneSpatial,
                     w1Path: "@model_path/weights/w1.bin",
                     b1Path: "@model_path/weights/b1.bin",
