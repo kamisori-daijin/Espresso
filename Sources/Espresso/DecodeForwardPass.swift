@@ -643,23 +643,23 @@ public extension ForwardPass {
 
     public static func initializeHybridDecodeCaches(
         surfaceHandles: [HybridDecodeSurfaceHandles],
-        dim: Int = ModelConfig.dim,
-        kvDim: Int? = nil
+        dim: Int = ModelConfig.dim
     ) {
         precondition(dim > 0)
         guard let first = surfaceHandles.first else { return }
-        let resolvedKVDim = kvDim ?? first.kvDim
         let maxSeq = first.maxSeq
         precondition(maxSeq > 0)
 
-        let zeroKVCache = Array(repeating: Float(0), count: resolvedKVDim * maxSeq)
         let zeroContext = Array(repeating: Float(0), count: dim * first.laneSpatial)
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
             precondition(handles.laneSpatial == first.laneSpatial)
+            // Use each handle's own kvDim — matches its cache allocation size
+            let handleKVDim = handles.kvDim
+            let zeroKVCache = Array(repeating: Float(0), count: handleKVDim * maxSeq)
             zeroKVCache.withUnsafeBufferPointer { src in
-                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: resolvedKVDim, spatial: maxSeq)
-                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: resolvedKVDim, spatial: maxSeq)
+                SurfaceIO.writeFP16(to: handles.kCacheFull, data: src, channels: handleKVDim, spatial: maxSeq)
+                SurfaceIO.writeFP16(to: handles.vCacheFull, data: src, channels: handleKVDim, spatial: maxSeq)
             }
             do {
                 try SurfaceIO.copyFP16(

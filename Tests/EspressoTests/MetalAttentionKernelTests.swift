@@ -425,4 +425,32 @@ final class MetalAttentionKernelTests: XCTestCase {
 
         return context
     }
+
+    // MARK: - GQA MetalDecodeAttentionShape validation
+
+    func test_gqa_decode_shape_accepts_valid_head_groups() throws {
+        let shape = try MetalDecodeAttentionShape(
+            heads: 32, kvHeads: 4, headDim: 64,
+            visibleTokens: 10, cacheStride: 256, laneStride: 32
+        )
+        XCTAssertEqual(shape.heads, 32)
+        XCTAssertEqual(shape.kvHeads, 4)
+    }
+
+    func test_gqa_decode_shape_rejects_indivisible_kvHeads() {
+        XCTAssertThrowsError(
+            try MetalDecodeAttentionShape(
+                heads: 32, kvHeads: 5, headDim: 64,
+                visibleTokens: 10, cacheStride: 256, laneStride: 32
+            )
+        )
+    }
+
+    func test_mha_decode_shape_defaults_kvHeads_to_heads() throws {
+        let shape = try MetalDecodeAttentionShape(
+            heads: 12, headDim: 64,
+            visibleTokens: 10, cacheStride: 256, laneStride: 32
+        )
+        XCTAssertEqual(shape.kvHeads, 12)
+    }
 }

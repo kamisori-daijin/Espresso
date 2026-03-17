@@ -1258,4 +1258,32 @@ final class ANETypesTests: XCTestCase {
         XCTAssertEqual(hdr.pad1, 0)
         XCTAssertEqual(hdr.pad2, 0)
     }
+
+    // MARK: - GQA LayerWeights
+
+    func test_layer_weights_gqa_allocates_kv_with_kvDim() {
+        let dim = 768
+        let kvDim = 256
+        let hidden = 2048
+        let w = LayerWeights(architecture: .rmsNormSwiGLU, dim: dim, hiddenDim: hidden, kvDim: kvDim)
+
+        XCTAssertEqual(w.kvDim, kvDim)
+        w.Wq.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * dim) }
+        w.Wk.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * kvDim) }
+        w.Wv.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * kvDim) }
+        w.Wo.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * dim) }
+        w.bk.withUnsafeBufferPointer { XCTAssertEqual($0.count, kvDim) }
+        w.bv.withUnsafeBufferPointer { XCTAssertEqual($0.count, kvDim) }
+        w.bq.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim) }
+    }
+
+    func test_layer_weights_mha_kvDim_defaults_to_dim() {
+        let dim = 768
+        let hidden = 2048
+        let w = LayerWeights(architecture: .rmsNormSwiGLU, dim: dim, hiddenDim: hidden)
+
+        XCTAssertEqual(w.kvDim, dim)
+        w.Wk.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * dim) }
+        w.Wv.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * dim) }
+    }
 }

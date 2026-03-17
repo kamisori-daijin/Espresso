@@ -43,6 +43,47 @@ final class DecodeQKVOnlyGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("vNew"))
     }
 
+    func test_decode_qkv_only_generator_gqa_output_byte_sizes_reflect_kvDim() {
+        let dim = 2048
+        let kvDim = 256  // nKVHeads=4, headDim=64
+        let lane = 32
+        let gen = DecodeQKVOnlyGenerator(dim: dim, kvDim: kvDim, laneSpatial: lane)
+
+        // Outputs are alphabetical: kNew(kvDim), qOut(dim), vNew(kvDim)
+        XCTAssertEqual(gen.outputByteSizes, [
+            kvDim * lane * 2,
+            dim * lane * 2,
+            kvDim * lane * 2,
+        ])
+        // Input stays at dim
+        XCTAssertEqual(gen.inputByteSizes, [dim * lane * 2])
+    }
+
+    func test_decode_qkv_only_generator_gqa_mil_has_correct_kv_weight_shapes() {
+        let dim = 768
+        let kvDim = 256
+        let lane = 32
+        let mil = DecodeQKVOnlyGenerator(dim: dim, kvDim: kvDim, laneSpatial: lane).milText
+
+        // Q weight is [dim, dim] = [768, 768]
+        XCTAssertTrue(mil.contains("tensor<fp16, [\(dim), \(dim), 1, 1]>"))
+        // K/V weights are [kvDim, dim] = [256, 768]
+        XCTAssertTrue(mil.contains("tensor<fp16, [\(kvDim), \(dim), 1, 1]>"))
+    }
+
+    func test_decode_qkv_only_generator_mha_kvDim_defaults_to_dim() {
+        let dim = 768
+        let lane = 32
+        let gen = DecodeQKVOnlyGenerator(dim: dim, laneSpatial: lane)
+
+        XCTAssertEqual(gen.kvDim, dim)
+        XCTAssertEqual(gen.outputByteSizes, [
+            dim * lane * 2,
+            dim * lane * 2,
+            dim * lane * 2,
+        ])
+    }
+
     func test_decode_qkv_only_generator_gpt2_uses_layernorm_beta_and_qkv_biases() {
         let mil = DecodeQKVOnlyGenerator(
             laneSpatial: 32,

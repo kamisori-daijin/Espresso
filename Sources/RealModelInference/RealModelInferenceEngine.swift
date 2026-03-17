@@ -2289,8 +2289,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         ForwardPass.initializeHybridDecodeCaches(
             surfaceHandles: compiledHybridSurfaceHandles,
-            dim: config.dModel,
-            kvDim: config.nKVHead * config.headDim
+            dim: config.dModel
         )
 
         let xCur = TensorBuffer(count: config.dModel, zeroed: true)
@@ -2627,6 +2626,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         paths: LayerWeightPaths
     ) throws -> LayerWeights {
+        // GPT-2 is always MHA (nKVHeads == nHeads), so kvDim defaults to dim
         let weights = LayerWeights(
             architecture: .gpt2,
             dim: config.dModel,
