@@ -273,6 +273,8 @@ private struct MetadataConfigFile: Decodable {
             parsedArchitecture = .gpt2
         case "llama":
             parsedArchitecture = .llama
+        case "qwen3.5":
+            parsedArchitecture = .qwen3_5
         default:
             throw CLIError.runtime("Unsupported architecture in metadata.json: \(architecture)")
         }
