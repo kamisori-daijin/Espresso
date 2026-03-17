@@ -81,3 +81,6 @@ training/
 # Tooling version pins
 .swift-version
 _reference/
+
+#Python environment
+.venv/
