@@ -34,6 +34,7 @@ enum QwenGGUFRegressionSupport {
     static let helloPromptTokens: [TokenID] = [9707]
     static let helloContinuationTokens: [TokenID] = [21806, 11, 358, 2776, 14589, 369, 279, 3681]
     static let helloContinuationText = "Hello Answer, I'm sorry for the previous"
+    static let latePrefixPrompt = "Hello Answer, I'm sorry for the"
     static let latePrefixTokens: [TokenID] = [9707, 21806, 11, 358, 2776, 14589, 369, 279]
     static let latePrefixExpectedToken: TokenID = 3681
     static let helloFirstToken: TokenID = 21806

@@ -91,17 +91,129 @@
 
 ---
 
+## Contact Details
+
+| # | Target | Handle / Contact | Channel |
+|---|--------|-----------------|---------|
+| 1 | Stephen Panaro | @smpanaro (GitHub), @flat (Twitter) | github.com/smpanaro/more-ane-transformers |
+| 2 | Matthijs Hollemans | @hollance (GitHub), @mhollemans | github.com/hollance/neural-engine |
+| 3 | Maderix | @maderix (GitHub/Substack) | maderix.substack.com, github.com/maderix/ANE |
+| 4 | MLX Team | ml-explore org | github.com/ml-explore/mlx-swift |
+| 5 | HF Swift Team | Hugging Face | github.com/apple/coremltools |
+| 6 | Paul Hudson | @twostraws | paul@hackingwithswift.com |
+| 7 | Sean Allen | @seanallen_dev | Twitter DM (no public email) |
+| 8 | Apple ANE team | - | github.com/apple/ml-ane-transformers |
+| 9 | ANEMLL | Anemll org | github.com/Anemll/Anemll |
+| 10 | Performance bloggers | Various | Substack/Medium pitch |
+
 ## Tracking
 
 | # | Target | Status | Date Contacted | Response | Notes |
 |---|--------|--------|---------------|----------|-------|
-| 1 | Stephen Panaro | Pending | - | - | Open GitHub issue |
-| 2 | Hollance | Pending | - | - | GitHub + cross-link ask |
-| 3 | Maderix | Pending | - | - | Joint post pitch |
-| 4 | MLX Contributors | Pending | - | - | Discussion thread |
-| 5 | HF Swift Team | Pending | - | - | HF Discord + GitHub |
-| 6 | Paul Hudson | Pending | - | - | Twitter DM + email |
-| 7 | Sean Allen | Pending | - | - | Twitter DM |
-| 8 | Apple ANE team | Pending | - | - | GitHub discussion |
-| 9 | ANEMLL | Pending | - | - | GitHub issue |
-| 10 | Performance bloggers | Pending | - | - | Pitch batch |
+| 1 | Stephen Panaro | Sent | 2026-03-17 | Awaiting | github.com/smpanaro/more-ane-transformers/discussions/4 |
+| 2 | Hollance | Sent | 2026-03-17 | Awaiting | github.com/hollance/neural-engine/issues/44 |
+| 3 | Maderix | Sent | 2026-03-17 | Awaiting | github.com/maderix/ANE/issues/49 |
+| 4 | MLX Contributors | Sent | 2026-03-17 | Awaiting | github.com/ml-explore/mlx-swift/discussions/372 |
+| 5 | HF Swift Team | Draft ready | - | - | See messages.md |
+| 6 | Paul Hudson | Email drafted | 2026-03-16 | - | Gmail draft: r-5734871108926968060 |
+| 7 | Sean Allen | Draft ready | - | - | Twitter DM — use messages.md template |
+| 8 | Apple ANE team | Backlog | - | - | Low priority — post after tier 1-2 |
+| 9 | ANEMLL | Sent | 2026-03-17 | Awaiting | github.com/Anemll/Anemll/issues/49 |
+| 10 | Performance bloggers | Backlog | - | - | Batch after initial responses |
+
+---
+
+## Wave 2 Targets — From Viral Tweet Engagers + ANE Community (March 2026)
+
+Identified from community engagement with the ANE/Espresso viral content and the maderix ANE training breakthrough wave.
+
+### Priority A: Direct ANE Researchers
+
+#### 11. mechramc / Ramchand Kumaresan
+- **Why**: Author of Orion (arxiv 2603.06728) — first open end-to-end ANE LLM training+inference system. Building on top of maderix's work. Closest peer in the space. Our inference-focused benchmarks complement their training work.
+- **Channel**: GitHub @mechramc / github.com/mechramc/Orion — open an issue or discussion
+- **Angle**: "Espresso reaches 519 tok/s / 3.41x CoreML for pure inference — would love to compare approaches and cross-reference benchmarks. Possible joint benchmark or citation?"
+- **Ask**: Benchmark comparison, mutual citation, potential collaboration on inference side of Orion
+- **Priority**: CRITICAL — most technically relevant new peer
+
+#### 12. InsiderLLM.com
+- **Why**: Published "Apple Neural Engine for LLM Inference: What Actually Works" — a high-quality guide with strong SEO that references the exact problem Espresso solves. Adding Espresso's benchmarks to this guide would be high-value placement.
+- **Channel**: Contact form / Twitter if available
+- **Angle**: "You wrote the definitive guide on ANE LLM inference. Espresso is the open-source answer to your question — happy to share benchmarks and a guest section."
+- **Ask**: Add Espresso to their guide as a benchmark reference, guest post contribution
+- **Priority**: HIGH — high SEO authority in the exact niche
+
+### Priority B: Twitter/X Amplifiers
+
+#### 13. @ronaldmannak (Ronald Mannak)
+- **Why**: iOS/Swift developer, tweeted about ANE reverse engineering and CoreML 2-4x overhead. Direct overlap with Espresso's value prop. Developer credibility.
+- **Channel**: Twitter/X @ronaldmannak
+- **Angle**: "You posted about CoreML 2-4x overhead — Espresso eliminates it, 4.76x faster. Here's how: [repo link]"
+- **Ask**: Retweet, star, feedback on API design
+- **Priority**: HIGH — developer with credibility, right audience
+
+#### 14. @LiorOnAI (Lior Alexander)
+- **Why**: ~45K followers, AI educator who posted about the ANE training breakthrough. Audience is exactly the developer/ML community that would star Espresso.
+- **Channel**: Twitter/X @LiorOnAI
+- **Angle**: "You covered the ANE training breakthrough. The inference side has been solved too — Espresso: 4.76x faster, pure Swift, MIT. Worth a thread?"
+- **Ask**: Tweet/thread about Espresso, star the repo
+- **Priority**: HIGH — reach + right audience
+
+#### 15. @BrianRoemmele
+- **Why**: 1.8M+ followers, amplified the ANE training story massively. A single repost of Espresso would drive significant star momentum.
+- **Channel**: Twitter/X @BrianRoemmele
+- **Angle**: Short, punchy: "The ANE inference side of the story: Espresso hits 519 tok/s, 4.76x over CoreML, pure Swift. [repo]"
+- **Ask**: Repost to his audience
+- **Priority**: MEDIUM-HIGH — low personalization ceiling but huge reach multiplier
+
+#### 16. @rohanpaul_ai (Rohan Paul)
+- **Why**: Large ML/AI educator following (~50K+), covered M5 Neural Engine launch. Would connect Espresso to Apple Silicon hardware news.
+- **Channel**: Twitter/X @rohanpaul_ai
+- **Angle**: "You covered M5 Neural Engine — Espresso is the open-source framework that squeezes max inference performance from M-series ANE. Benchmark thread?"
+- **Ask**: Feature in thread or newsletter
+- **Priority**: MEDIUM
+
+### Priority C: GitHub Projects (Integration Partners)
+
+#### 17. anentropic / hft2ane
+- **Why**: Tool for converting HuggingFace transformer models to ANE-accelerated versions. Direct integration: Espresso could be the inference runtime for their converted models.
+- **Channel**: GitHub github.com/anentropic/hft2ane — open issue
+- **Angle**: "Espresso could serve as the inference runtime for hft2ane-converted models — pure Swift, 4.76x faster than CoreML. Interested in exploring integration?"
+- **Ask**: Integration discussion, README link
+- **Priority**: HIGH — direct technical synergy
+
+#### 18. FluidInference/FluidAudio
+- **Why**: Swift SDK for local audio AI on Apple Neural Engine. Using CoreML today. Espresso's direct ANE approach could significantly improve their throughput.
+- **Channel**: GitHub github.com/FluidInference/FluidAudio — open issue
+- **Angle**: "Espresso achieves 4.76x faster inference than CoreML via direct ANE access in pure Swift — potential backend for FluidAudio?"
+- **Ask**: Technical discussion, integration evaluation
+- **Priority**: MEDIUM-HIGH — concrete integration opportunity
+
+#### 19. llama.cpp ANE discussion thread (#336)
+- **Why**: Active open GitHub discussion requesting ANE support for llama.cpp. Hundreds of developers watching this thread. Contributing Espresso's approach exposes it to the world's largest LLM inference project.
+- **Channel**: github.com/ggml-org/llama.cpp/discussions/336
+- **Angle**: "Espresso demonstrates a working pure-Swift ANE direct inference path at 519 tok/s. Sharing our MIL-level approach in case it's useful for llama.cpp's ANE work."
+- **Ask**: Discussion contribution, potential integration collaboration with ggml team
+- **Priority**: HIGH — massive audience, authoritative thread
+
+#### 20. Code Coup / Coding Nexus (Medium)
+- **Why**: Published two viral Medium articles about ANE training ("I Trained an LLM..." + "Someone Trained...") with tens of thousands of reads. The inference story is the natural follow-up piece.
+- **Channel**: Medium @CodeCoup / contact via publication
+- **Angle**: "You told the training side of the ANE story. Espresso is the inference chapter — 519 tok/s, 3.41x over CoreML, pure Swift. Interested in a follow-up piece or co-authorship?"
+- **Ask**: Feature article, co-authored post, or a reference in their next ANE piece
+- **Priority**: HIGH — proven ANE content reach, same audience
+
+---
+
+| # | Target | Status | Date Contacted | Response | Notes |
+|---|--------|--------|---------------|----------|-------|
+| 11 | mechramc/Orion | Todo | - | - | GitHub issue on mechramc/Orion |
+| 12 | InsiderLLM.com | Todo | - | - | Contact via site + Twitter |
+| 13 | @ronaldmannak | Todo | - | - | Twitter DM |
+| 14 | @LiorOnAI | Todo | - | - | Twitter DM |
+| 15 | @BrianRoemmele | Todo | - | - | Twitter reply/DM |
+| 16 | @rohanpaul_ai | Todo | - | - | Twitter DM |
+| 17 | anentropic/hft2ane | Todo | - | - | GitHub issue |
+| 18 | FluidInference/FluidAudio | Todo | - | - | GitHub issue |
+| 19 | llama.cpp ANE discussion | Todo | - | - | github.com/ggml-org/llama.cpp/discussions/336 |
+| 20 | Code Coup / Coding Nexus | Todo | - | - | Medium contact |

@@ -241,7 +241,11 @@ let package = Package(
         ),
         .testTarget(
             name: "RealModelInferenceTests",
-            dependencies: ["RealModelInference", "ModelSupport", "ANEGraphIR", "ANETypes", "Espresso"],
+            dependencies: [
+                "RealModelInference", "ModelSupport", "ANEGraphIR", "ANETypes", "Espresso",
+                .product(name: "EspressoEdgeRunner", package: "Edgerunner"),
+                .product(name: "EdgeRunner", package: "Edgerunner"),
+            ],
             path: "Tests/RealModelInferenceTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),

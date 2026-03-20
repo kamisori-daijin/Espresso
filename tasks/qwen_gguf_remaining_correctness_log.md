@@ -615,11 +615,12 @@ swift test --filter qwenManual
 
 **Applied**: Changed default Qwen sidecar mode to `.automatic` with layers 0-11 narrowing. This cuts the sidecar artifact from 28 layers to 12 layers (43% of the model), saving ~57% of prepare-time disk and compute.
 
-**Merge gate status**:
+**Merge gate status** (ALL PASSED):
 - ✓ 0.6B: All 3-check gate passed (cold-start, late-prefix, hello)
 - ✓ 0.6B regression tests: PASS
 - ✓ 1.7B late-prefix: PASS (545.9s)
 - ✓ 1.7B hello continuation: PASS (193.9s)
-- ⏳ 4B: Disk-limited (needs ~23 GiB free for full sidecars)
+- ✓ 4B late-prefix: PASS (1284.1s)
+- ✓ 4B hello continuation: PASS (332.5s)
 
 **Key insight**: FP16 rounding errors in early layers (0-11) compound through the forward pass. Once the first 12 layers have exact FP32 weights, the accumulated precision is sufficient for all downstream layers to produce correct tokens. Late-layer FP32 sidecars alone (Experiments 13-14) cannot compensate for early-layer rounding. This principle generalizes across model sizes: 0.6B, 1.7B both confirm the same early-layer critical region.

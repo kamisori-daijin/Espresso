@@ -12,24 +12,27 @@ import ANEGraphIR
 /// Output:
 /// - `Wo(context) + bias + residual`: `[1, dim, 1, 1]` fp16
 public struct DecodeProjectionGenerator: MILProgramGenerator {
+    public let contextDim: Int
     public let dim: Int
     public let laneSpatial: Int
     public let architecture: LayerWeightsArchitecture
 
     public init(
+        contextDim: Int? = nil,
         dim: Int = ModelConfig.dim,
         laneSpatial: Int = 32,
         architecture: LayerWeightsArchitecture = .rmsNormSwiGLU
     ) {
         precondition(dim > 0)
         precondition(laneSpatial > 0)
+        self.contextDim = contextDim ?? dim
         self.dim = dim
         self.laneSpatial = laneSpatial
         self.architecture = architecture
     }
 
     public var inputBytes: Int {
-        dim * laneSpatial * MemoryLayout<Float>.stride
+        contextDim * laneSpatial * MemoryLayout<Float>.stride
     }
 
     public var inputByteSizes: [Int] {
@@ -48,7 +51,7 @@ public struct DecodeProjectionGenerator: MILProgramGenerator {
             let context = try LegacyGraphSupport.input(
                 &graph,
                 name: "context",
-                channels: dim,
+                channels: contextDim,
                 spatial: laneSpatial,
                 dtype: .fp32
             )
@@ -62,7 +65,7 @@ public struct DecodeProjectionGenerator: MILProgramGenerator {
             let projected = try graph.linear(
                 "proj",
                 input: context16,
-                inDim: dim,
+                inDim: contextDim,
                 outDim: dim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wo.bin",

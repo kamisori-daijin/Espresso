@@ -2,6 +2,46 @@ import XCTest
 @testable import CPUOps
 
 final class RoPEDecodeStepTests: XCTestCase {
+    func test_applyDecodeStep_usesHalfSplitRotation() {
+        var q: [Float] = [1, 2, 3, 4]
+        var k: [Float] = [5, 6, 7, 8]
+
+        q.withUnsafeMutableBufferPointer { qBuf in
+            k.withUnsafeMutableBufferPointer { kBuf in
+                RoPE.applyDecodeStep(
+                    q: qBuf.baseAddress!,
+                    k: kBuf.baseAddress!,
+                    nHeads: 1,
+                    nKVHeads: 1,
+                    headDim: 4,
+                    position: 1
+                )
+            }
+        }
+
+        let cos0 = cosf(1.0)
+        let sin0 = sinf(1.0)
+        let cos1 = cosf(0.01)
+        let sin1 = sinf(0.01)
+        let expectedQ: [Float] = [
+            1 * cos0 - 3 * sin0,
+            2 * cos1 - 4 * sin1,
+            1 * sin0 + 3 * cos0,
+            2 * sin1 + 4 * cos1,
+        ]
+        let expectedK: [Float] = [
+            5 * cos0 - 7 * sin0,
+            6 * cos1 - 8 * sin1,
+            5 * sin0 + 7 * cos0,
+            6 * sin1 + 8 * cos1,
+        ]
+
+        for index in q.indices {
+            XCTAssertEqual(q[index], expectedQ[index], accuracy: 1e-5, "Q mismatch at index \(index)")
+            XCTAssertEqual(k[index], expectedK[index], accuracy: 1e-5, "K mismatch at index \(index)")
+        }
+    }
+
     /// Verify that `applyDecodeStep(position: 0)` matches `apply(seqLen: 1)` on identical data.
     func test_applyDecodeStep_matchesFullApply() {
         let nHeads = 4

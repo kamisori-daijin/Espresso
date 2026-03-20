@@ -2,6 +2,8 @@ import Foundation
 
 public struct LayerWeightPaths: Sendable, Equatable {
     public let rmsAtt: String
+    public let qNorm: String?
+    public let kNorm: String?
     public let wq: String
     public let wk: String
     public let wv: String
@@ -34,6 +36,8 @@ public struct LayerWeightPaths: Sendable, Equatable {
         case .gpt2:
             return LayerWeightPaths(
                 rmsAtt: path("ln_1_gamma.bin"),
+                qNorm: nil,
+                kNorm: nil,
                 wq: path("wq.bin"),
                 wk: path("wk.bin"),
                 wv: path("wv.bin"),
@@ -52,6 +56,8 @@ public struct LayerWeightPaths: Sendable, Equatable {
         case .llama:
             return LayerWeightPaths(
                 rmsAtt: path("rms_att.bin"),
+                qNorm: path("q_norm.bin"),
+                kNorm: path("k_norm.bin"),
                 wq: path("wq.bin"),
                 wk: path("wk.bin"),
                 wv: path("wv.bin"),

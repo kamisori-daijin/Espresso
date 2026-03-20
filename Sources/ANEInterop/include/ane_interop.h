@@ -41,6 +41,8 @@ void ane_interop_set_force_eval_failure(bool value);
 int ane_interop_live_handle_count(void);
 uint64_t ane_interop_last_hw_execution_time_ns(ANEHandle *handle);
 bool ane_interop_has_perf_stats(ANEHandle *handle);
+bool ane_interop_cached_donor_net_plist_exists(const char *hexId);
+bool ane_interop_should_try_cached_load(const char *hexId, bool compiledExists);
 
 /// Replace an input surface and rebuild the ANE request.
 /// Returns true on success (request rebuilt). False if index is out of range

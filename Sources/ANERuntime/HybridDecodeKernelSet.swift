@@ -4,11 +4,21 @@ import MILGenerator
 
 public struct HybridOutputProjectionWeights: Sendable {
     public let cacheKey: String
+    public let inputDim: Int
+    public let outputDim: Int
     public let rowMajorWeights: [Float]
     public let rowMajorBias: [Float]
 
-    public init(cacheKey: String, rowMajorWeights: [Float], rowMajorBias: [Float]) {
+    public init(
+        cacheKey: String,
+        inputDim: Int,
+        outputDim: Int,
+        rowMajorWeights: [Float],
+        rowMajorBias: [Float]
+    ) {
         self.cacheKey = cacheKey
+        self.inputDim = inputDim
+        self.outputDim = outputDim
         self.rowMajorWeights = rowMajorWeights
         self.rowMajorBias = rowMajorBias
     }
@@ -16,6 +26,12 @@ public struct HybridOutputProjectionWeights: Sendable {
 
 /// Owns the split decode path for ANE QKV-only + Metal attention + ANE FFN.
 public struct HybridDecodeKernelSet: ~Copyable {
+    package struct DonorHexIDs {
+        package let decodeQKVOnly: String
+        package let decodeProjection: String
+        package let decodeFFN: String
+    }
+
     internal enum KernelKind: String, CaseIterable {
         case decodeQKVOnly
         case decodeProjectionFFN
@@ -44,6 +60,7 @@ public struct HybridDecodeKernelSet: ~Copyable {
     public let outputProjection: HybridOutputProjectionWeights
     public let maxSeq: Int
     public let laneSpatial: Int
+    package let donorHexIDs: DonorHexIDs
 
     @inline(__always)
     private static func buildBlob(from buffer: borrowing TensorBuffer, rows: Int, cols: Int) -> Data {
@@ -77,7 +94,8 @@ public struct HybridDecodeKernelSet: ~Copyable {
         usesFusedPostAttention: Bool,
         outputProjection: HybridOutputProjectionWeights,
         maxSeq: Int,
-        laneSpatial: Int
+        laneSpatial: Int,
+        donorHexIDs: DonorHexIDs
     ) {
         self.decodeQKVOnly = decodeQKVOnly
         self.decodeProjection = decodeProjection
@@ -86,17 +104,42 @@ public struct HybridDecodeKernelSet: ~Copyable {
         self.outputProjection = outputProjection
         self.maxSeq = maxSeq
         self.laneSpatial = laneSpatial
+        self.donorHexIDs = donorHexIDs
     }
 
     public init(weights: borrowing LayerWeights, maxSeq: Int = ModelConfig.seqLen) throws(ANEError) {
+        try self.init(weights: weights, maxSeq: maxSeq, donorHexIDs: nil)
+    }
+
+    package init(
+        weights: borrowing LayerWeights,
+        maxSeq: Int = ModelConfig.seqLen,
+        donorHexIDs: DonorHexIDs? = nil
+    ) throws(ANEError) {
         guard maxSeq > 0 else {
             throw .invalidArguments("hybrid decode maxSeq must be > 0")
         }
         let laneSpatial = Self.resolvedLaneSpatialForCurrentProcess()
-        let compiledQKV = try Self.compileDecodeQKVOnly(weights: weights, laneSpatial: laneSpatial)
-        let compiledPostAttention = try Self.compilePostAttention(weights: weights, laneSpatial: laneSpatial)
+        let compiledQKV = try Self.compileDecodeQKVOnly(
+            weights: weights,
+            laneSpatial: laneSpatial,
+            donorHexId: donorHexIDs?.decodeQKVOnly
+        )
+        let compiledPostAttention = try Self.compilePostAttention(
+            weights: weights,
+            laneSpatial: laneSpatial,
+            donorProjectionHexId: donorHexIDs?.decodeProjection,
+            donorFFNHexId: donorHexIDs?.decodeFFN
+        )
+        let donorHexIDs = DonorHexIDs(
+            decodeQKVOnly: compiledQKV.hexId,
+            decodeProjection: compiledPostAttention.decodeProjection.hexId,
+            decodeFFN: compiledPostAttention.decodeFFN.hexId
+        )
         let outputProjection = HybridOutputProjectionWeights(
             cacheKey: UUID().uuidString,
+            inputDim: weights.qDim,
+            outputDim: weights.dim,
             rowMajorWeights: Self.copyRowMajorWeights(from: weights.Wo),
             rowMajorBias: weights.architecture == .gpt2
                 ? Self.copyRowMajorWeights(from: weights.bo)
@@ -109,7 +152,8 @@ public struct HybridDecodeKernelSet: ~Copyable {
             usesFusedPostAttention: compiledPostAttention.usesFusedPostAttention,
             outputProjection: outputProjection,
             maxSeq: maxSeq,
-            laneSpatial: laneSpatial
+            laneSpatial: laneSpatial,
+            donorHexIDs: donorHexIDs
         )
     }
 
@@ -125,15 +169,11 @@ public struct HybridDecodeKernelSet: ~Copyable {
 
     private static func compileDecodeQKVOnly(
         weights: borrowing LayerWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        donorHexId: String?
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeQKVOnlySpec(weights: weights, laneSpatial: laneSpatial)
-        return try ANEKernel(
-            milText: spec.milText,
-            weights: spec.weights,
-            inputSizes: spec.inputSizes,
-            outputSizes: spec.outputSizes
-        )
+        return try compile(spec: spec, donorHexId: donorHexId)
     }
 
     private static func makeDecodeQKVOnlySpec(
@@ -141,20 +181,23 @@ public struct HybridDecodeKernelSet: ~Copyable {
         laneSpatial: Int
     ) -> CompileSpec {
         let dim = weights.dim
+        let qDim = weights.qDim
         let kvDim = weights.kvDim
         let generator = DecodeQKVOnlyGenerator(
             dim: dim,
+            qDim: qDim,
             kvDim: kvDim,
             laneSpatial: laneSpatial,
-            architecture: weights.architecture
+            architecture: weights.architecture,
+            normEps: weights.normEps
         )
 
         let rms1Blob = buildBlob(from: weights.rmsAtt, rows: 1, cols: dim)
-        let wqBlob = buildBlob(from: weights.Wq, rows: dim, cols: dim)
+        let wqBlob = buildBlob(from: weights.Wq, rows: qDim, cols: dim)
         let wkBlob = buildBlob(from: weights.Wk, rows: kvDim, cols: dim)
         let wvBlob = buildBlob(from: weights.Wv, rows: kvDim, cols: dim)
         let rms1BetaBlob = buildBlob(from: weights.attentionNormBeta, rows: 1, cols: dim)
-        let bqBlob = buildBlob(from: weights.bq, rows: 1, cols: dim)
+        let bqBlob = buildBlob(from: weights.bq, rows: 1, cols: qDim)
         let bkBlob = buildBlob(from: weights.bk, rows: 1, cols: kvDim)
         let bvBlob = buildBlob(from: weights.bv, rows: 1, cols: kvDim)
 
@@ -191,40 +234,48 @@ public struct HybridDecodeKernelSet: ~Copyable {
 
     private static func compileDecodeFFN(
         weights: borrowing LayerWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        donorHexId: String?
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeFFNSpec(weights: weights, laneSpatial: laneSpatial)
-        return try ANEKernel(
-            milText: spec.milText,
-            weights: spec.weights,
-            inputSizes: spec.inputSizes,
-            outputSizes: spec.outputSizes
-        )
+        return try compile(spec: spec, donorHexId: donorHexId)
     }
 
     private static func compileDecodeProjectionFFN(
         weights: borrowing LayerWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        donorHexId: String?
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeProjectionFFNSpec(weights: weights, laneSpatial: laneSpatial)
-        return try ANEKernel(
-            milText: spec.milText,
-            weights: spec.weights,
-            inputSizes: spec.inputSizes,
-            outputSizes: spec.outputSizes
-        )
+        return try compile(spec: spec, donorHexId: donorHexId)
     }
 
     private static func compilePostAttention(
         weights: borrowing LayerWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        donorProjectionHexId: String?,
+        donorFFNHexId: String?
     ) throws(ANEError) -> CompiledPostAttention {
-        let fusionEnabled = ProcessInfo.processInfo.environment["ESPRESSO_ENABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
+        // Fusion is enabled by default for rmsNormSwiGLU (LLaMA-family).
+        // Set ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION=1 to force the split path.
+        let fusionDisabled = ProcessInfo.processInfo.environment["ESPRESSO_DISABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
+        let fusionEnabled = !fusionDisabled && (
+            weights.architecture == .rmsNormSwiGLU ||
+            ProcessInfo.processInfo.environment["ESPRESSO_ENABLE_HYBRID_FUSED_POST_ATTENTION"] == "1"
+        )
         if fusionEnabled {
             do {
                 return CompiledPostAttention(
-                    decodeProjection: try compileDecodeProjectionFFN(weights: weights, laneSpatial: laneSpatial),
-                    decodeFFN: try compileDecodeFFN(weights: weights, laneSpatial: laneSpatial),
+                    decodeProjection: try compileDecodeProjectionFFN(
+                        weights: weights,
+                        laneSpatial: laneSpatial,
+                        donorHexId: donorProjectionHexId
+                    ),
+                    decodeFFN: try compileDecodeFFN(
+                        weights: weights,
+                        laneSpatial: laneSpatial,
+                        donorHexId: donorFFNHexId
+                    ),
                     usesFusedPostAttention: true
                 )
             } catch {
@@ -232,17 +283,45 @@ public struct HybridDecodeKernelSet: ~Copyable {
         }
 
         return CompiledPostAttention(
-            decodeProjection: try compileDecodeProjection(weights: weights, laneSpatial: laneSpatial),
-            decodeFFN: try compileDecodeFFN(weights: weights, laneSpatial: laneSpatial),
+            decodeProjection: try compileDecodeProjection(
+                weights: weights,
+                laneSpatial: laneSpatial,
+                donorHexId: donorProjectionHexId
+            ),
+            decodeFFN: try compileDecodeFFN(
+                weights: weights,
+                laneSpatial: laneSpatial,
+                donorHexId: donorFFNHexId
+            ),
             usesFusedPostAttention: false
         )
     }
 
     private static func compileDecodeProjection(
         weights: borrowing LayerWeights,
-        laneSpatial: Int
+        laneSpatial: Int,
+        donorHexId: String?
     ) throws(ANEError) -> ANEKernel {
         let spec = makeDecodeProjectionSpec(weights: weights, laneSpatial: laneSpatial)
+        return try compile(spec: spec, donorHexId: donorHexId)
+    }
+
+    private static func compile(spec: CompileSpec, donorHexId: String?) throws(ANEError) -> ANEKernel {
+        let donorDisabled = ProcessInfo.processInfo.environment["ESPRESSO_DISABLE_HYBRID_DONOR_DELTA"] == "1"
+        if !donorDisabled, let donorHexId, !donorHexId.isEmpty {
+            do {
+                return try ANEKernel(
+                    milText: spec.milText,
+                    weights: spec.weights,
+                    inputSizes: spec.inputSizes,
+                    outputSizes: spec.outputSizes,
+                    donorHexId: donorHexId
+                )
+            } catch {
+                // Delta reload is a best-effort fast path. Fall back to a cold compile.
+            }
+        }
+
         return try ANEKernel(
             milText: spec.milText,
             weights: spec.weights,
@@ -256,12 +335,14 @@ public struct HybridDecodeKernelSet: ~Copyable {
         laneSpatial: Int
     ) -> CompileSpec {
         let dim = weights.dim
+        let qDim = weights.qDim
         let generator = DecodeProjectionGenerator(
+            contextDim: qDim,
             dim: dim,
             laneSpatial: laneSpatial,
             architecture: weights.architecture
         )
-        let woBlob = buildBlob(from: weights.Wo, rows: dim, cols: dim)
+        let woBlob = buildBlob(from: weights.Wo, rows: dim, cols: qDim)
         let boBlob = buildBlob(from: weights.bo, rows: 1, cols: dim)
 
         let projectionWeights: [(path: String, data: Data)]
@@ -291,14 +372,17 @@ public struct HybridDecodeKernelSet: ~Copyable {
         laneSpatial: Int
     ) -> CompileSpec {
         let dim = weights.dim
+        let qDim = weights.qDim
         let hidden = weights.hiddenDim
         let generator = DecodeProjectionFFNGenerator(
+            contextDim: qDim,
             dim: dim,
             hiddenDim: hidden,
             laneSpatial: laneSpatial,
-            architecture: weights.architecture
+            architecture: weights.architecture,
+            normEps: weights.normEps
         )
-        let woBlob = buildBlob(from: weights.Wo, rows: dim, cols: dim)
+        let woBlob = buildBlob(from: weights.Wo, rows: dim, cols: qDim)
         let boBlob = buildBlob(from: weights.bo, rows: 1, cols: dim)
         let rms2Blob = buildBlob(from: weights.rmsFfn, rows: 1, cols: dim)
         let w1Blob = buildBlob(from: weights.W1, rows: hidden, cols: dim)
@@ -350,7 +434,8 @@ public struct HybridDecodeKernelSet: ~Copyable {
             dim: dim,
             hiddenDim: hidden,
             laneSpatial: laneSpatial,
-            architecture: weights.architecture
+            architecture: weights.architecture,
+            normEps: weights.normEps
         )
 
         let rms2Blob = buildBlob(from: weights.rmsFfn, rows: 1, cols: dim)

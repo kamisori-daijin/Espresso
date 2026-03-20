@@ -255,12 +255,44 @@ static NSDictionary *ane_interop_reload_with_fallback_options(id mdl,
 }
 
 static NSString *ane_interop_user_caches_directory(void) {
+    const char *override = getenv("ANE_INTEROP_CACHE_ROOT");
+    if (override && override[0] != '\0') {
+        NSString *overridePath = [NSString stringWithUTF8String:override];
+        if (overridePath.length > 0) {
+            return [overridePath stringByStandardizingPath];
+        }
+    }
+
     NSArray<NSString *> *candidates =
         NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
     if (candidates.count > 0) {
         return candidates.firstObject;
     }
     return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Caches"];
+}
+
+static bool ane_interop_cached_donor_net_plist_exists_ns(NSString *hexId) {
+    if (hexId.length == 0) {
+        return false;
+    }
+    NSString *source = [[ane_interop_user_caches_directory()
+        stringByAppendingPathComponent:hexId] stringByAppendingPathComponent:@"net.plist"];
+    return [[NSFileManager defaultManager] fileExistsAtPath:source];
+}
+
+bool ane_interop_cached_donor_net_plist_exists(const char *hexId) {
+    if (!hexId || hexId[0] == '\0') {
+        return false;
+    }
+    NSString *hex = [NSString stringWithUTF8String:hexId];
+    return ane_interop_cached_donor_net_plist_exists_ns(hex);
+}
+
+bool ane_interop_should_try_cached_load(const char *hexId, bool compiledExists) {
+    if (compiledExists) {
+        return true;
+    }
+    return ane_interop_cached_donor_net_plist_exists(hexId);
 }
 
 static NSDistributedLock *ane_interop_cache_lock(NSString *hexId) {
@@ -1985,16 +2017,20 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
                 finalOptions = (NSDictionary *)computed;
             }
         }
-        if (ane_interop_trace_enabled()) {
-            fprintf(stderr, "ANE compile cachePolicy=%d compiledExists=%d options=%lu\n",
-                    cachePolicy, (int)compiledExists, (unsigned long)[finalOptions count]);
-        }
-
         id hx = ((id(*)(id,SEL))objc_msgSend)(mdl, @selector(hexStringIdentifier));
         if (![hx isKindOfClass:[NSString class]]) {
             ane_interop_set_compile_error(ANE_INTEROP_COMPILE_ERROR_COMPILER_FAILURE);
             return NULL;
         }
+        const bool donorExists = ane_interop_cached_donor_net_plist_exists_ns((NSString *)hx);
+        const bool shouldTryCachedLoad =
+            cachePolicy == ANE_COMPILE_CACHE_PREFER_CACHED &&
+            ane_interop_should_try_cached_load([((NSString *)hx) UTF8String], compiledExists);
+        if (ane_interop_trace_enabled()) {
+            fprintf(stderr, "ANE compile cachePolicy=%d compiledExists=%d donorExists=%d options=%lu\n",
+                    cachePolicy, (int)compiledExists, (int)donorExists, (unsigned long)[finalOptions count]);
+        }
+
         NSString *td = [NSTemporaryDirectory() stringByAppendingPathComponent:hx];
         if (ane_interop_trace_enabled()) {
             fprintf(
@@ -2055,7 +2091,7 @@ ANEHandle *ane_interop_compile(const uint8_t *milText, size_t milLen,
         NSError *e = nil;
         const bool strictOptions = ane_interop_strict_options_enabled();
         BOOL loadedFromCache = NO;
-        if (cachePolicy == ANE_COMPILE_CACHE_PREFER_CACHED && compiledExists) {
+        if (shouldTryCachedLoad) {
             if (ane_interop_copy_donor_net_plist((NSString *)hx, td)) {
                 NSDictionary *loadOptions = ane_interop_reload_with_fallback_options(
                     mdl, finalOptions, strictOptions, &e

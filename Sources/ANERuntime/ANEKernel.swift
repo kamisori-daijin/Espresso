@@ -68,6 +68,7 @@ public struct ANEKernel: ~Copyable {
     }
 
     private let handle: OpaquePointer
+    internal let hexId: String
 
     @inline(__always)
     private static func checkedSurfaceIndex(_ index: Int) throws(ANEError) -> Int32 {
@@ -89,6 +90,23 @@ public struct ANEKernel: ~Copyable {
         default:
             return .compilationFailed
         }
+    }
+
+    private static func readHexId(from handle: OpaquePointer) throws(ANEError) -> String {
+        var buffer = [CChar](repeating: 0, count: 257)
+        let ok = buffer.withUnsafeMutableBufferPointer { buf in
+            ane_interop_get_hex_id(handle, buf.baseAddress, buf.count)
+        }
+        guard ok else {
+            throw .compilationFailed
+        }
+
+        let nulIndex = buffer.firstIndex(of: 0) ?? buffer.endIndex
+        let hexId = String(decoding: buffer[..<nulIndex].map(UInt8.init(bitPattern:)), as: UTF8.self)
+        guard !hexId.isEmpty else {
+            throw .compilationFailed
+        }
+        return hexId
     }
 
     static func compileWithRetry(
@@ -238,7 +256,115 @@ public struct ANEKernel: ~Copyable {
         guard let rawHandle else {
             throw Self.mapInteropCompileError()
         }
+        let hexId = try Self.readHexId(from: rawHandle)
         self.handle = rawHandle
+        self.hexId = hexId
+    }
+
+    public init(
+        milText: String,
+        weights: [(path: String, data: Data)],
+        inputSizes: [Int],
+        outputSizes: [Int],
+        donorHexId: String
+    ) throws(ANEError) {
+        guard !donorHexId.isEmpty else {
+            throw .invalidArguments("donorHexId must be non-empty")
+        }
+        guard weights.count <= Int(Int32.max),
+              inputSizes.count <= Int(Int32.max),
+              outputSizes.count <= Int(Int32.max),
+              inputSizes.allSatisfy({ $0 >= 0 }),
+              outputSizes.allSatisfy({ $0 >= 0 }) else {
+            throw .invalidArguments("Counts must fit Int32 and byte sizes must be non-negative")
+        }
+
+        guard let milData = milText.data(using: .utf8), !milData.isEmpty else {
+            throw .invalidArguments("MIL text must be valid, non-empty UTF-8")
+        }
+
+        let weightPaths = weights.map(\.path)
+        let weightDatas = weights.map(\.data)
+        var pathPointers = [UnsafePointer<CChar>?](repeating: nil, count: weights.count)
+        var dataPointers = [UnsafePointer<UInt8>?](repeating: nil, count: weights.count)
+        let dataLengths = weightDatas.map(\.count)
+
+        func reloadHandle() -> OpaquePointer? {
+            ane_interop_init()
+
+            return milData.withUnsafeBytes { milRaw in
+                let milBuffer = milRaw.bindMemory(to: UInt8.self)
+                guard let milBase = milBuffer.baseAddress else {
+                    return nil
+                }
+
+                func withWeightPathPointers<R>(_ index: Int, _ body: () -> R) -> R {
+                    guard index < weightPaths.count else {
+                        return body()
+                    }
+                    return weightPaths[index].withCString { cPath in
+                        pathPointers[index] = cPath
+                        return withWeightPathPointers(index + 1, body)
+                    }
+                }
+
+                func withWeightDataPointers<R>(_ index: Int, _ body: () -> R) -> R {
+                    guard index < weightDatas.count else {
+                        return body()
+                    }
+                    if weightDatas[index].isEmpty {
+                        dataPointers[index] = nil
+                        return withWeightDataPointers(index + 1, body)
+                    }
+                    return weightDatas[index].withUnsafeBytes { raw in
+                        dataPointers[index] = raw.bindMemory(to: UInt8.self).baseAddress
+                        return withWeightDataPointers(index + 1, body)
+                    }
+                }
+
+                return withWeightPathPointers(0) {
+                    withWeightDataPointers(0) {
+                        pathPointers.withUnsafeMutableBufferPointer { pathBuf in
+                            dataPointers.withUnsafeMutableBufferPointer { dataBuf in
+                                dataLengths.withUnsafeBufferPointer { lenBuf in
+                                    inputSizes.withUnsafeBufferPointer { inputBuf in
+                                        outputSizes.withUnsafeBufferPointer { outputBuf in
+                                            donorHexId.withCString { donorCString in
+                                                ane_interop_delta_reload(
+                                                    milBase,
+                                                    milBuffer.count,
+                                                    weights.isEmpty ? nil : pathBuf.baseAddress,
+                                                    weights.isEmpty ? nil : dataBuf.baseAddress,
+                                                    weights.isEmpty ? nil : lenBuf.baseAddress,
+                                                    Int32(weights.count),
+                                                    Int32(inputSizes.count),
+                                                    inputSizes.isEmpty ? nil : inputBuf.baseAddress,
+                                                    Int32(outputSizes.count),
+                                                    outputSizes.isEmpty ? nil : outputBuf.baseAddress,
+                                                    donorCString
+                                                )
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let rawHandle = try Self.compileWithRetry(
+            checkBudget: false,
+            compileAttempt: reloadHandle
+        )
+
+        guard let rawHandle else {
+            throw Self.mapInteropCompileError()
+        }
+        let hexId = try Self.readHexId(from: rawHandle)
+        self.handle = rawHandle
+        self.hexId = hexId
     }
 
     private static func writeCompileRetryNotice(_ message: String) {

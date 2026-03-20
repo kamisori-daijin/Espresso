@@ -175,4 +175,28 @@ public enum RMSNorm {
             dw[i] += s // ACCUMULATE, do not overwrite
         }
     }
+
+    /// Applies RMSNorm in-place to a single-token head-major buffer.
+    ///
+    /// `values` is laid out as `[head0_dim0...head0_dimN, head1_dim0...]`.
+    /// `weights` has shape `[headDim]` and is shared across all heads.
+    public static func applyPerHeadSingleTokenInPlace(
+        values: UnsafeMutablePointer<Float>,
+        headCount: Int,
+        headDim: Int,
+        weights: UnsafePointer<Float>,
+        epsilon: Float
+    ) {
+        precondition(headCount > 0)
+        precondition(headDim > 0)
+
+        for head in 0..<headCount {
+            let base = values.advanced(by: head * headDim)
+            var sumSquares: Float = 0
+            vDSP_dotpr(base, 1, base, 1, &sumSquares, vDSP_Length(headDim))
+            var invRms = 1.0 / sqrtf(sumSquares / Float(headDim) + epsilon)
+            vDSP_vsmul(base, 1, &invRms, base, 1, vDSP_Length(headDim))
+            vDSP_vmul(base, 1, weights, 1, base, 1, vDSP_Length(headDim))
+        }
+    }
 }

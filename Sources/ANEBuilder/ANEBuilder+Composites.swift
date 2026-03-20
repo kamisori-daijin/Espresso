@@ -1,3 +1,4 @@
+import Foundation
 import ANEGraphIR
 
 extension ANEGraph {
@@ -43,6 +44,25 @@ extension ANEGraph {
         eps: Float,
         weightPath: String
     ) throws -> Int {
+        if ProcessInfo.processInfo.environment["ESPRESSO_RMSNORM_USE_FP32"] == "1" {
+            let input32 = try castToFP32("\(prefix)_input32", input: input)
+            let sq32 = try mul("\(prefix)_sq32", x: input32, y: input32)
+            let ss32 = try reduceSum("\(prefix)_ss32", input: sq32, axis: 1, keepDims: true)
+            let invd32 = try constScalar("\(prefix)_invd32", 1.0 / Float(dim))
+            let ms32 = try mul("\(prefix)_ms32", x: ss32, y: invd32)
+            let eps32 = try constScalar("\(prefix)_eps32", eps)
+            let ss332 = try add("\(prefix)_ss332", x: ms32, y: eps32)
+            let nhalf32 = try constScalar("\(prefix)_nhalf32", -0.5)
+            let rrms32 = try pow("\(prefix)_rrms32", base: ss332, exp: nhalf32)
+            let xr32 = try mul("\(prefix)_xr32", x: input32, y: rrms32)
+            let xr16 = try castToFP16("\(prefix)_xr16", input: xr32)
+            let weight = try constWeight(
+                "\(prefix)_weight",
+                shape: try ANEShape(channels: dim, spatial: 1),
+                blobPath: weightPath
+            )
+            return try mul("\(prefix)_out", x: xr16, y: weight)
+        }
         let sq = try mul("\(prefix)_sq", x: input, y: input)
         let ss = try reduceSum("\(prefix)_ss", input: sq, axis: 1, keepDims: true)
         let invd = try constScalar("\(prefix)_invd", 1.0 / Float(dim))
@@ -118,6 +138,21 @@ extension ANEGraph {
         _ prefix: String,
         input: Int
     ) throws -> Int {
+        if ProcessInfo.processInfo.environment["ESPRESSO_SILU_USE_FP32"] == "1" {
+            let input32 = try castToFP32("\(prefix)_input32", input: input)
+            let sigmoid32 = try sigmoid("\(prefix)_sigmoid", input: input32)
+            let out32 = try mul("\(prefix)_out32", x: input32, y: sigmoid32)
+            return try castToFP16("\(prefix)_out", input: out32)
+        }
+        if ProcessInfo.processInfo.environment["ESPRESSO_SILU_USE_SIGMOID"] != "1" {
+            let half = try constScalar("\(prefix)_half", 0.5)
+            let halfInput = try mul("\(prefix)_half_input", x: input, y: half)
+            let tanhNode = try tanh("\(prefix)_tanh", input: halfInput)
+            let one = try constScalar("\(prefix)_one", 1.0)
+            let onePlus = try add("\(prefix)_one_plus", x: tanhNode, y: one)
+            let halfX = try mul("\(prefix)_half_x", x: input, y: half)
+            return try mul("\(prefix)_out", x: halfX, y: onePlus)
+        }
         let sigmoidNode = try sigmoid("\(prefix)_sigmoid", input: input)
         return try mul("\(prefix)_out", x: input, y: sigmoidNode)
     }

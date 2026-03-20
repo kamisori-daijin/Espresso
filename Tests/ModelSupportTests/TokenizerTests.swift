@@ -17,6 +17,33 @@ import Testing
     #expect(tokenizer.decode(newlineEncoded) == newline)
 }
 
+@Test func tokenizerJSONBPETokenizerRoundTripsAndSkipsSpecialTokens() throws {
+    let tokenizerJSONURL = try makeTokenizerJSONFixture()
+    let tokenizer = try GPT2BPETokenizer(tokenizerJSONURL: tokenizerJSONURL)
+
+    let hello = "Hello, world!"
+    let encoded = tokenizer.encode(hello)
+    #expect(encoded == [5, 0, 1, 2, 3])
+    #expect(tokenizer.decode(encoded) == hello)
+
+    let newline = "\n"
+    let newlineEncoded = tokenizer.encode(newline)
+    #expect(newlineEncoded == [5, 4])
+    #expect(tokenizer.decode(newlineEncoded) == newline)
+}
+
+@Test func localLlama32TokenizerJSONMatchesKnownHFTokenIDs() throws {
+    let tokenizerJSONURL = URL(fileURLWithPath: "/Users/chriskarani/CodingProjects/Espresso/.artifacts/llama3_2_1b_tokenizer/tokenizer.json")
+    guard FileManager.default.fileExists(atPath: tokenizerJSONURL.path) else {
+        return
+    }
+
+    let tokenizer = try GPT2BPETokenizer(tokenizerJSONURL: tokenizerJSONURL)
+    #expect(tokenizer.encode("Hello") == [128000, 9906])
+    #expect(tokenizer.encode("Hello, world!") == [128000, 9906, 11, 1917, 0])
+    #expect(tokenizer.encode("The quick brown fox") == [128000, 791, 4062, 14198, 39935])
+}
+
 @Test func sentencePieceTokenizerRoundTripsHelloWorldAndByteFallback() throws {
     let modelURL = try makeSentencePieceFixture()
     let tokenizer = try SentencePieceTokenizer(modelURL: modelURL)
@@ -52,6 +79,24 @@ import Testing
 
     #expect(throws: GPT2BPETokenizerError.nonContiguousTokenIDs(expectedCount: 2, actualMaxTokenID: 2)) {
         _ = try GPT2BPETokenizer(vocabURL: vocabURL, mergesURL: mergesURL)
+    }
+}
+
+@Test func tokenizerJSONTokenizerRejectsUnsupportedModelType() throws {
+    let directory = try makeTempDirectory()
+    let tokenizerJSONURL = directory.appendingPathComponent("tokenizer.json")
+    let payload: [String: Any] = [
+        "model": [
+            "type": "WordPiece",
+            "vocab": ["a": 0],
+            "merges": [],
+        ],
+    ]
+    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+    try data.write(to: tokenizerJSONURL)
+
+    #expect(throws: GPT2BPETokenizerError.unsupportedTokenizerModel("WordPiece")) {
+        _ = try GPT2BPETokenizer(tokenizerJSONURL: tokenizerJSONURL)
     }
 }
 
@@ -149,6 +194,85 @@ private func makeSentencePieceFixture() throws -> URL {
     }
     try data.write(to: modelURL)
     return modelURL
+}
+
+private func makeTokenizerJSONFixture() throws -> URL {
+    let newlinePiece = String(gpt2ByteUnicodeMap()[10]!)
+    let spacePiece = String(gpt2ByteUnicodeMap()[32]!)
+    let vocab: [String: Int] = [
+        "Hello": 0,
+        ",": 1,
+        "\(spacePiece)world": 2,
+        "!": 3,
+        newlinePiece: 4,
+    ]
+    let merges = [
+        "H e",
+        "He l",
+        "Hel l",
+        "Hell o",
+        "\(spacePiece) w",
+        "\(spacePiece)w o",
+        "\(spacePiece)wo r",
+        "\(spacePiece)wor l",
+        "\(spacePiece)worl d",
+    ]
+
+    let payload: [String: Any] = [
+        "added_tokens": [
+            [
+                "id": 5,
+                "content": "<|begin_of_text|>",
+                "special": true,
+                "single_word": false,
+                "lstrip": false,
+                "rstrip": false,
+                "normalized": false,
+            ],
+        ],
+        "pre_tokenizer": [
+            "type": "Sequence",
+            "pretokenizers": [
+                [
+                    "type": "Split",
+                    "pattern": [
+                        "Regex": "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+",
+                    ],
+                    "behavior": "Isolated",
+                    "invert": false,
+                ],
+            ],
+        ],
+        "post_processor": [
+            "type": "Sequence",
+            "processors": [
+                [
+                    "type": "TemplateProcessing",
+                    "single": [
+                        [
+                            "SpecialToken": [
+                                "id": "<|begin_of_text|>",
+                                "ids": [5],
+                                "tokens": ["<|begin_of_text|>"],
+                            ],
+                        ],
+                        ["Sequence": ["id": "A", "type_id": 0]],
+                    ],
+                ],
+            ],
+        ],
+        "model": [
+            "type": "BPE",
+            "vocab": vocab,
+            "merges": merges,
+        ],
+    ]
+
+    let directory = try makeTempDirectory()
+    let tokenizerJSONURL = directory.appendingPathComponent("tokenizer.json")
+    let data = try JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys])
+    try data.write(to: tokenizerJSONURL)
+    return tokenizerJSONURL
 }
 
 private func append(_ value: Int32, to data: inout Data) {

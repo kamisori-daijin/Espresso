@@ -1286,4 +1286,30 @@ final class ANETypesTests: XCTestCase {
         w.Wk.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * dim) }
         w.Wv.withUnsafeBufferPointer { XCTAssertEqual($0.count, dim * dim) }
     }
+
+    func test_layer_weights_qk_norm_buffers_are_optional() {
+        let dim = 768
+        let hidden = 2048
+        let headDim = 128
+
+        let absent = LayerWeights(architecture: .rmsNormSwiGLU, dim: dim, hiddenDim: hidden)
+        XCTAssertFalse(absent.hasQNorm)
+        XCTAssertFalse(absent.hasKNorm)
+        XCTAssertFalse(absent.hasQKNorm)
+        XCTAssertEqual(absent.qNorm.count, 0)
+        XCTAssertEqual(absent.kNorm.count, 0)
+
+        let present = LayerWeights(
+            architecture: .rmsNormSwiGLU,
+            dim: dim,
+            hiddenDim: hidden,
+            qNormDim: headDim,
+            kNormDim: headDim
+        )
+        XCTAssertTrue(present.hasQNorm)
+        XCTAssertTrue(present.hasKNorm)
+        XCTAssertTrue(present.hasQKNorm)
+        XCTAssertEqual(present.qNorm.count, headDim)
+        XCTAssertEqual(present.kNorm.count, headDim)
+    }
 }

@@ -581,6 +581,54 @@ private func shouldRunLegacyQwenExperimentTests(
     )
 }
 
+@Test func test_llamaGenerationPath_skipsHybridForQwenExactCPU() {
+    let qwenConfig = MultiModelConfig(
+        name: "qwen3",
+        nLayer: 1,
+        nHead: 2,
+        nKVHead: 2,
+        dModel: 8,
+        headDim: 4,
+        hiddenDim: 16,
+        vocab: 64,
+        maxSeq: 8,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+    let llamaConfig = MultiModelConfig(
+        name: "llama3",
+        nLayer: 1,
+        nHead: 2,
+        nKVHead: 2,
+        dModel: 8,
+        headDim: 4,
+        hiddenDim: 16,
+        vocab: 64,
+        maxSeq: 8,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+
+    #expect(
+        RealModelInferenceEngine.llamaGenerationPath(
+            config: qwenConfig,
+            environment: [:]
+        ) == .exactCPU
+    )
+    #expect(
+        RealModelInferenceEngine.llamaGenerationPath(
+            config: qwenConfig,
+            environment: ["ESPRESSO_FORCE_HYBRID_DECODE": "1"]
+        ) == .hybrid
+    )
+    #expect(
+        RealModelInferenceEngine.llamaGenerationPath(
+            config: llamaConfig,
+            environment: [:]
+        ) == .hybrid
+    )
+}
+
 @Test func test_decodeContextFromCaches_respectsVisibleTokenCount() {
     let qOut: [Float] = [1, 0]
     let kCache: [Float] = [

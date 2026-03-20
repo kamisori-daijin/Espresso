@@ -15,12 +15,14 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
     public let hiddenDim: Int
     public let laneSpatial: Int
     public let architecture: LayerWeightsArchitecture
+    public let normEps: Float
 
     public init(
         dim: Int = ModelConfig.dim,
         hiddenDim: Int = ModelConfig.hidden,
         laneSpatial: Int = 32,
-        architecture: LayerWeightsArchitecture = .rmsNormSwiGLU
+        architecture: LayerWeightsArchitecture = .rmsNormSwiGLU,
+        normEps: Float = 1e-5
     ) {
         precondition(dim > 0)
         precondition(hiddenDim > 0)
@@ -29,6 +31,7 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
         self.hiddenDim = hiddenDim
         self.laneSpatial = laneSpatial
         self.architecture = architecture
+        self.normEps = normEps
     }
 
     public var inputBytes: Int { dim * laneSpatial * 2 }
@@ -37,17 +40,16 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
     public var milText: String {
         LegacyGraphSupport.emitGraph { graph in
             let x = try LegacyGraphSupport.input(&graph, name: "x", channels: dim, spatial: laneSpatial)
-            let normalized: Int
             let y: Int
 
             switch architecture {
             case .rmsNormSwiGLU:
-                normalized = try graph.rmsNorm(
+                let normalized = try graph.rmsNorm(
                     "norm",
                     input: x,
                     dim: dim,
                     spatial: laneSpatial,
-                    eps: 0.00001,
+                    eps: normEps,
                     weightPath: "@model_path/weights/rms2.bin"
                 )
                 y = try graph.swigluFFN(
@@ -61,12 +63,12 @@ public struct DecodeFFNGenerator: MILProgramGenerator {
                     w2Path: "@model_path/weights/w2.bin"
                 )
             case .gpt2:
-                normalized = try graph.layerNorm(
+                let normalized = try graph.layerNorm(
                     "norm",
                     input: x,
                     dim: dim,
                     spatial: laneSpatial,
-                    eps: 0.00001,
+                    eps: normEps,
                     gammaPath: "@model_path/weights/rms2.bin",
                     betaPath: "@model_path/weights/rms2_beta.bin"
                 )

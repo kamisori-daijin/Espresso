@@ -738,6 +738,52 @@ final class ANERuntimeTests: XCTestCase {
         }
     }
 
+    func test_delta_reload_initializer_rejects_empty_donor_hex_id() {
+        let mil = GenericMIL.conv(inCh: identityChannels, outCh: identityChannels, spatial: identitySpatial)
+        let weightBlob = makeIdentityWeightBlob(channels: identityChannels)
+
+        do {
+            _ = try ANEKernel(
+                milText: mil,
+                weights: [(path: identityWeightPath, data: weightBlob)],
+                inputSizes: [identityInputBytes],
+                outputSizes: [identityOutputBytes],
+                donorHexId: ""
+            )
+            XCTFail("Expected .invalidArguments for empty donorHexId")
+        } catch ANEError.invalidArguments {
+        } catch {
+            XCTFail("Expected .invalidArguments, got \(error)")
+        }
+    }
+
+    func test_delta_reload_initializer_does_not_increment_compile_budget() throws {
+        try requireANEHardwareTestsEnabled()
+
+        let previous = CompileBudget.currentCount
+        defer { try? CompileBudget.setCount(previous) }
+
+        let donor = try makeIdentityKernel(checkBudget: false)
+        let afterDonor = CompileBudget.currentCount
+
+        let mil = GenericMIL.conv(inCh: identityChannels, outCh: identityChannels, spatial: identitySpatial)
+        let weightBlob = makeIdentityWeightBlob(channels: identityChannels)
+        let reloaded = try ANEKernel(
+            milText: mil,
+            weights: [(path: identityWeightPath, data: weightBlob)],
+            inputSizes: [identityInputBytes],
+            outputSizes: [identityOutputBytes],
+            donorHexId: donor.hexId
+        )
+
+        XCTAssertFalse(reloaded.hexId.isEmpty)
+        XCTAssertEqual(
+            CompileBudget.currentCount,
+            afterDonor,
+            "Delta reload should reuse donor compilation without consuming compile budget"
+        )
+    }
+
     func test_compile_retry_policy_retries_only_generic_compiler_failures() {
         XCTAssertTrue(
             ANECompileRetryPolicy.shouldRetry(

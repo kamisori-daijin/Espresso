@@ -165,6 +165,37 @@ private func withEnvironmentValue<T>(
 }
 
 final class ANEInteropTests: XCTestCase {
+    func test_cached_donor_net_plist_exists_uses_override_cache_root() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let donorID = "TEST_DONOR_HEX"
+        let donorDir = root.appendingPathComponent(donorID, isDirectory: true)
+        try FileManager.default.createDirectory(at: donorDir, withIntermediateDirectories: true)
+        try Data("plist".utf8).write(to: donorDir.appendingPathComponent("net.plist"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        withEnvironmentValue(key: "ANE_INTEROP_CACHE_ROOT", value: root.path) {
+            XCTAssertTrue(ane_interop_cached_donor_net_plist_exists(donorID))
+            XCTAssertFalse(ane_interop_cached_donor_net_plist_exists("MISSING_DONOR"))
+        }
+    }
+
+    func test_should_try_cached_load_when_donor_exists_even_if_compiled_model_exists_is_false() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        let donorID = "TEST_DONOR_DECISION"
+        let donorDir = root.appendingPathComponent(donorID, isDirectory: true)
+        try FileManager.default.createDirectory(at: donorDir, withIntermediateDirectories: true)
+        try Data("plist".utf8).write(to: donorDir.appendingPathComponent("net.plist"))
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        withEnvironmentValue(key: "ANE_INTEROP_CACHE_ROOT", value: root.path) {
+            XCTAssertTrue(ane_interop_should_try_cached_load(donorID, false))
+            XCTAssertTrue(ane_interop_should_try_cached_load("MISSING_DONOR", true))
+            XCTAssertFalse(ane_interop_should_try_cached_load("MISSING_DONOR", false))
+        }
+    }
+
     func test_neon_argmax_f16_returns_first_max_index_for_vectorized_input() {
         let input: [Float] = [
             -3, 1, 2, 7, 9, 9, 4, 5,

@@ -175,6 +175,7 @@ cmd=(
   --iterations "\$ESPRESSO_AUTORESEARCH_ITERATIONS"
   --max-tokens "\$ESPRESSO_AUTORESEARCH_MAX_TOKENS"
   --prompts "\${ESPRESSO_AUTORESEARCH_PROMPTS:-scripts/benchmark-prompts.txt}"
+  --results-tsv "$RESULTS_FILE"
 )
 
 if [[ "\${ESPRESSO_AUTORESEARCH_COLD_RUN:-1}" -eq 0 ]]; then
@@ -213,7 +214,7 @@ Local autoresearch sandbox for lane \`$LANE\`.
 - Prompt: \`$LOCAL_DIR/PROMPT.txt\`
 - Env: \`$LOCAL_DIR/env.sh\`
 - Benchmark wrapper: \`$LOCAL_DIR/bench.sh\`
-- Results log: \`$RESULTS_FILE\`
+- Raw results log: \`$RESULTS_FILE\`
 
 Tracked references:
 
@@ -226,12 +227,28 @@ Local workflow:
 2. Read \`$LOCAL_DIR/program.md\`
 3. Paste \`$LOCAL_DIR/PROMPT.txt\` into your agent
 4. Run \`$LOCAL_DIR/bench.sh\` if this worktree is the benchmark referee lane
+
+Official keep/reject verdicts come from \`results/autoresearch/.../suite-summary.json\`
+and \`./scripts/judge_suite_results.sh --baseline ...\`. The TSV log is a raw per-invocation audit trail.
 EOF
 
 if [[ ! -f "$RESULTS_PATH" ]]; then
   cat >"$RESULTS_PATH" <<'EOF'
-timestamp	commit	status	primary_metric	espresso_tokens_per_second	coreml_tokens_per_second	speedup_vs_coreml	token_match	text_match	espresso_first_token_ms	coreml_first_token_ms	espresso_median_token_ms	coreml_median_token_ms	espresso_p95_token_ms	coreml_p95_token_ms	espresso_compile_ms	coreml_compile_ms	output_dir	change_summary
+timestamp	commit	status	primary_metric	espresso_tokens_per_second	coreml_tokens_per_second	speedup_vs_coreml	token_match	text_match	espresso_first_token_ms	coreml_first_token_ms	espresso_median_token_ms	coreml_median_token_ms	espresso_p95_token_ms	coreml_p95_token_ms	espresso_compile_ms	coreml_compile_ms	output_dir	prompt_id	change_summary
 EOF
+else
+  RESULTS_HEADER_EXPECTED="timestamp	commit	status	primary_metric	espresso_tokens_per_second	coreml_tokens_per_second	speedup_vs_coreml	token_match	text_match	espresso_first_token_ms	coreml_first_token_ms	espresso_median_token_ms	coreml_median_token_ms	espresso_p95_token_ms	coreml_p95_token_ms	espresso_compile_ms	coreml_compile_ms	output_dir	prompt_id	change_summary"
+  RESULTS_HEADER_LEGACY="timestamp	commit	status	primary_metric	espresso_tokens_per_second	coreml_tokens_per_second	speedup_vs_coreml	token_match	text_match	espresso_first_token_ms	coreml_first_token_ms	espresso_median_token_ms	coreml_median_token_ms	espresso_p95_token_ms	coreml_p95_token_ms	espresso_compile_ms	coreml_compile_ms	output_dir	change_summary"
+
+  RESULTS_HEADER="$(head -n 1 "$RESULTS_PATH")"
+  if [[ "$RESULTS_HEADER" == "$RESULTS_HEADER_LEGACY" ]]; then
+    TMP_PATH="$(mktemp)"
+    {
+      echo "$RESULTS_HEADER_EXPECTED"
+      tail -n +2 "$RESULTS_PATH"
+    } >"$TMP_PATH"
+    mv "$TMP_PATH" "$RESULTS_PATH"
+  fi
 fi
 
 EXCLUDE_FILE="$(git -C "$TARGET_ROOT" rev-parse --git-path info/exclude)"

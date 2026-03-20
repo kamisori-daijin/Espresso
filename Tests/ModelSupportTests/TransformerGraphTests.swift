@@ -44,6 +44,16 @@ import ANEPasses
     #expect(!ANEOptimizationPipeline.validate(graph).contains { $0.severity == .error })
 }
 
+@Test func llamaLayerPathsExposeOptionalQKNormArtifacts() {
+    let config = ModelRegistry.llama3_2_1b_ctx512
+    let paths = LayerWeightPaths.forLayer(3, config: config, blobDir: "/tmp/qwen")
+
+    #expect(paths.qNorm == "/tmp/qwen/layers/3/q_norm.bin")
+    #expect(paths.kNorm == "/tmp/qwen/layers/3/k_norm.bin")
+    #expect(paths.bq == nil)
+    #expect(paths.bo == nil)
+}
+
 @Test func supportedMaskBucketsMatchConverterContract() {
     #expect(TransformerLayerGraphBuilder.isSupportedMaskBucket(spatial: 1, maxSeq: 256))
     #expect(TransformerLayerGraphBuilder.isSupportedMaskBucket(spatial: 16, maxSeq: 256))

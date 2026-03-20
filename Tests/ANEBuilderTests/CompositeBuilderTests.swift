@@ -1,7 +1,10 @@
 import Testing
 @testable import ANEBuilder
 import ANEGraphIR
+import Darwin
 
+@Suite(.serialized)
+struct CompositeBuilderTests {
 @Test func linearUsesConv1x1WeightShapeAndNoMatmul() throws {
     var graph = ANEGraph()
     let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 16, spatial: 8))
@@ -55,6 +58,22 @@ import ANEGraphIR
     #expect(graph.nodes.contains { $0.name == "rms_nhalf" && $0.attrs == .scalar(-0.5) })
 }
 
+@Test func rmsNormSupportsFP32Experiment() throws {
+    setenv("ESPRESSO_RMSNORM_USE_FP32", "1", 1)
+    defer { unsetenv("ESPRESSO_RMSNORM_USE_FP32") }
+
+    var graph = ANEGraph()
+    let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 16, spatial: 8))
+    let out = try graph.rmsNorm("rms", input: x, dim: 16, spatial: 8, eps: 1e-5, weightPath: "@gamma")
+
+    #expect(graph.nodes[out].op == .mul)
+    #expect(graph.nodes[out].name == "rms_out")
+    #expect(graph.nodes.contains { $0.name == "rms_input32_out" && $0.dtype == .fp32 })
+    #expect(graph.nodes.contains { $0.name == "rms_rrms32" && $0.op == .pow && $0.dtype == .fp32 })
+    #expect(graph.nodes.contains { $0.name == "rms_xr16_out" && $0.dtype == .fp16 })
+    #expect(!graph.nodes.contains { $0.name == "rms_sq" && $0.op == .mul && $0.dtype == .fp16 })
+}
+
 @Test func layerNormCentersThenAppliesGammaAndBeta() throws {
     var graph = ANEGraph()
     let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 32, spatial: 4))
@@ -85,13 +104,43 @@ import ANEGraphIR
     #expect(graph.nodes.contains { $0.name == "gelu_scale" && $0.attrs == .scalar(0.7978846) })
 }
 
-@Test func siluIsSigmoidThenMultiply() throws {
+@Test func siluUsesTanhIdentityByDefault() throws {
+    var graph = ANEGraph()
+    let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 8, spatial: 8))
+    let out = try graph.silu("silu", input: x)
+
+    #expect(graph.nodes[out].op == .mul)
+    #expect(graph.nodes.contains { $0.name == "silu_tanh" && $0.op == .tanh })
+    #expect(graph.nodes.contains { $0.name == "silu_half" && $0.attrs == .scalar(0.5) })
+    #expect(!graph.nodes.contains { $0.name == "silu_sigmoid" && $0.op == .sigmoid })
+}
+
+@Test func siluCanForceLegacySigmoidPath() throws {
+    setenv("ESPRESSO_SILU_USE_SIGMOID", "1", 1)
+    defer { unsetenv("ESPRESSO_SILU_USE_SIGMOID") }
+
     var graph = ANEGraph()
     let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 8, spatial: 8))
     let out = try graph.silu("silu", input: x)
 
     #expect(graph.nodes[out].op == .mul)
     #expect(graph.nodes.contains { $0.name == "silu_sigmoid" && $0.op == .sigmoid })
+    #expect(!graph.nodes.contains { $0.name == "silu_tanh" && $0.op == .tanh })
+}
+
+@Test func siluSupportsFP32Experiment() throws {
+    setenv("ESPRESSO_SILU_USE_FP32", "1", 1)
+    defer { unsetenv("ESPRESSO_SILU_USE_FP32") }
+
+    var graph = ANEGraph()
+    let x = try graph.input("x", dtype: .fp16, shape: try ANEShape(channels: 8, spatial: 8))
+    let out = try graph.silu("silu", input: x)
+
+    #expect(graph.nodes[out].dtype == .fp16)
+    #expect(graph.nodes.contains { $0.name == "silu_input32_out" && $0.dtype == .fp32 })
+    #expect(graph.nodes.contains { $0.name == "silu_sigmoid" && $0.op == .sigmoid && $0.dtype == .fp32 })
+    #expect(graph.nodes.contains { $0.name == "silu_out32" && $0.op == .mul && $0.dtype == .fp32 })
+    #expect(graph.nodes.contains { $0.name == "silu_out_out" && $0.dtype == .fp16 })
 }
 
 @Test func residualWrapsSingleAdd() throws {
@@ -124,4 +173,5 @@ import ANEGraphIR
     #expect(Set(names).count == names.count)
     #expect(names.contains("block0_sq"))
     #expect(names.contains("block1_sq"))
+}
 }

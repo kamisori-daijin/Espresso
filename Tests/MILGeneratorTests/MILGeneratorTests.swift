@@ -436,6 +436,16 @@ final class MILGeneratorTests: XCTestCase {
 
         XCTAssertEqual(DecodeFFNGenerator(laneSpatial: lane).inputBytes, dim * lane * 2)
         XCTAssertEqual(DecodeFFNGenerator(laneSpatial: lane).outputByteSizes, [dim * lane * 2])
+        let decodeFFNStages = DecodeFFNStagesGenerator(laneSpatial: lane)
+        XCTAssertEqual(decodeFFNStages.inputByteSizes, [dim * lane * 2])
+        XCTAssertEqual(decodeFFNStages.outputByteSizes, [dim * lane * 2])
+        XCTAssertEqual(
+            DecodeFFNStagesGenerator(laneSpatial: lane, stage: .gateLinear).outputByteSizes,
+            [ModelConfig.hidden * lane * 2]
+        )
+        let decodeFFNPostNorm = DecodeFFNPostNormGenerator(laneSpatial: lane)
+        XCTAssertEqual(decodeFFNPostNorm.inputByteSizes, [dim * lane * 2, dim * lane * 2])
+        XCTAssertEqual(decodeFFNPostNorm.outputByteSizes, [dim * lane * 2])
         let decodeProjectionFFN = DecodeProjectionFFNGenerator(laneSpatial: lane)
         XCTAssertEqual(
             decodeProjectionFFN.inputByteSizes,
@@ -461,6 +471,30 @@ final class MILGeneratorTests: XCTestCase {
         XCTAssertFalse(mil.contains("values=(x2,kfFull,vfFull)"))
     }
 
+    func test_hybrid_decode_generators_support_expanded_qdim() {
+        let lane = DecodeKernelSet.defaultLaneSpatial
+        let decodeQKV = DecodeQKVOnlyGenerator(dim: 1024, qDim: 2048, kvDim: 1024, laneSpatial: lane)
+        XCTAssertEqual(
+            decodeQKV.outputByteSizes,
+            [1024 * lane * 2, 2048 * lane * 2, 1024 * lane * 2]
+        )
+        XCTAssertTrue(decodeQKV.milText.contains("tensor<fp16, [1, 2048, 1, \(lane)]> qOut"))
+
+        let decodeProjection = DecodeProjectionGenerator(contextDim: 2048, dim: 1024, laneSpatial: lane)
+        XCTAssertEqual(
+            decodeProjection.inputByteSizes,
+            [2048 * lane * MemoryLayout<Float>.stride, 1024 * lane * 2]
+        )
+        XCTAssertTrue(decodeProjection.milText.contains("tensor<fp32, [1, 2048, 1, \(lane)]> context"))
+
+        let decodeProjectionFFN = DecodeProjectionFFNGenerator(contextDim: 2048, dim: 1024, hiddenDim: 3072, laneSpatial: lane)
+        XCTAssertEqual(
+            decodeProjectionFFN.inputByteSizes,
+            [2048 * lane * MemoryLayout<Float>.stride, 1024 * lane * 2]
+        )
+        XCTAssertTrue(decodeProjectionFFN.milText.contains("tensor<fp32, [1, 2048, 1, \(lane)]> context"))
+    }
+
     func test_decode_ffn_generator_contains_expected_decode_ops() {
         let mil = DecodeFFNGenerator().milText
         XCTAssertEqual(extractMILInputNames(mil), ["x"])
@@ -468,6 +502,32 @@ final class MILGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("sigmoid("))
         XCTAssertTrue(mil.contains("mul("))
         XCTAssertTrue(mil.contains("add("))
+    }
+
+    func test_decode_ffn_post_norm_generator_contains_expected_decode_ops() {
+        let mil = DecodeFFNPostNormGenerator().milText
+        XCTAssertEqual(extractMILInputNames(mil), ["normalized", "residual"])
+        XCTAssertEqual(extractMILReturnTuple(mil), ["out"])
+        XCTAssertTrue(mil.contains("sigmoid("))
+        XCTAssertTrue(mil.contains("mul("))
+        XCTAssertTrue(mil.contains("add("))
+        XCTAssertFalse(mil.contains("rms2.bin"))
+    }
+
+    func test_decode_ffn_stages_generator_contains_expected_decode_ops() {
+        let mil = DecodeFFNStagesGenerator().milText
+        XCTAssertEqual(extractMILInputNames(mil), ["normalized"])
+        XCTAssertEqual(extractMILReturnTuple(mil), ["down"])
+        XCTAssertTrue(mil.contains("w1.bin"))
+        XCTAssertTrue(mil.contains("w3.bin"))
+        XCTAssertTrue(mil.contains("w2.bin"))
+        XCTAssertTrue(mil.contains("sigmoid("))
+        XCTAssertTrue(mil.contains("mul("))
+        XCTAssertFalse(mil.contains("rms2.bin"))
+        XCTAssertFalse(mil.contains("add("))
+
+        let gateMIL = DecodeFFNStagesGenerator(stage: .gateLinear).milText
+        XCTAssertEqual(extractMILReturnTuple(gateMIL), ["gate_linear"])
     }
 
     func test_decode_ffn_generator_gpt2_uses_layernorm_biases_and_gelu() {
@@ -480,6 +540,19 @@ final class MILGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("b2.bin"))
         XCTAssertTrue(mil.contains("tanh("))
         XCTAssertFalse(mil.contains("w3.bin"))
+    }
+
+    func test_decode_ffn_generator_uses_custom_norm_epsilon() {
+        let mil = DecodeFFNGenerator(
+            dim: 1024,
+            hiddenDim: 3072,
+            laneSpatial: 32,
+            architecture: .rmsNormSwiGLU,
+            normEps: 1e-6
+        ).milText
+
+        XCTAssertTrue(mil.contains("0.000001"))
+        XCTAssertFalse(mil.contains("0.00001"))
     }
 
     func test_decode_projection_ffn_generator_gpt2_fuses_projection_layernorm_and_ffn() {
@@ -495,6 +568,69 @@ final class MILGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("b2.bin"))
         XCTAssertTrue(mil.contains("tanh("))
         XCTAssertFalse(mil.contains("w3.bin"))
+    }
+
+    func test_decode_projection_ffn_generator_uses_custom_norm_epsilon() {
+        let mil = DecodeProjectionFFNGenerator(
+            contextDim: 2048,
+            dim: 1024,
+            hiddenDim: 3072,
+            laneSpatial: 32,
+            architecture: .rmsNormSwiGLU,
+            normEps: 1e-6
+        ).milText
+
+        XCTAssertTrue(mil.contains("0.000001"))
+        XCTAssertFalse(mil.contains("0.00001"))
+    }
+
+    func test_decode_projection_ffn_generator_can_copy_x_branches_for_bisect() {
+        let previous = ProcessInfo.processInfo.environment["ESPRESSO_FUSED_POST_ATTENTION_COPY_X"]
+        setenv("ESPRESSO_FUSED_POST_ATTENTION_COPY_X", "1", 1)
+        defer {
+            if let previous {
+                setenv("ESPRESSO_FUSED_POST_ATTENTION_COPY_X", previous, 1)
+            } else {
+                unsetenv("ESPRESSO_FUSED_POST_ATTENTION_COPY_X")
+            }
+        }
+
+        let mil = DecodeProjectionFFNGenerator(architecture: .rmsNormSwiGLU).milText
+        XCTAssertTrue(mil.contains("copy_one"))
+        XCTAssertTrue(mil.contains("x_for_norm"))
+        XCTAssertTrue(mil.contains("x_for_residual"))
+    }
+
+    func test_decode_ffn_generator_can_promote_norm_to_fp32_before_ffn() {
+        let previous = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_FFN_FP32_RMSNORM"]
+        setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", "1", 1)
+        defer {
+            if let previous {
+                setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", previous, 1)
+            } else {
+                unsetenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM")
+            }
+        }
+
+        let mil = DecodeFFNGenerator(architecture: .rmsNormSwiGLU).milText
+        XCTAssertTrue(mil.contains("x32"))
+        XCTAssertTrue(mil.contains("norm16"))
+    }
+
+    func test_decode_projection_ffn_generator_can_promote_norm_to_fp32_before_ffn() {
+        let previous = ProcessInfo.processInfo.environment["ESPRESSO_DECODE_FFN_FP32_RMSNORM"]
+        setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", "1", 1)
+        defer {
+            if let previous {
+                setenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM", previous, 1)
+            } else {
+                unsetenv("ESPRESSO_DECODE_FFN_FP32_RMSNORM")
+            }
+        }
+
+        let mil = DecodeProjectionFFNGenerator(architecture: .rmsNormSwiGLU).milText
+        XCTAssertTrue(mil.contains("x_for_norm32"))
+        XCTAssertTrue(mil.contains("norm16"))
     }
 
     func test_mil_builder_append_fp16_uses_fixed_posix_format() {

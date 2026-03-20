@@ -41,18 +41,22 @@ public enum BlobWeightLoader {
             )
         }
 
-        var values: [Float] = []
-        values.reserveCapacity(payload.count / MemoryLayout<UInt16>.stride)
-        for index in stride(from: 0, to: payload.count, by: MemoryLayout<UInt16>.stride) {
-            let bits = payload.withUnsafeBytes { raw in
-                raw.loadUnaligned(
-                    fromByteOffset: index,
-                    as: UInt16.self
-                )
+        let count = payload.count / MemoryLayout<UInt16>.stride
+        return payload.withUnsafeBytes { raw in
+            let source = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+            return Array<Float>(unsafeUninitializedCapacity: count) { buffer, initializedCount in
+                var src = source
+                var dst = buffer.baseAddress!
+                var remaining = count
+                while remaining > 0 {
+                    dst.pointee = Float(Float16(bitPattern: UInt16(littleEndian: src.pointee)))
+                    src = src.advanced(by: 1)
+                    dst = dst.advanced(by: 1)
+                    remaining -= 1
+                }
+                initializedCount = count
             }
-            values.append(Float(Float16(bitPattern: UInt16(littleEndian: bits))))
         }
-        return values
     }
 
     static func parseHeader(from data: Data) throws -> Header {

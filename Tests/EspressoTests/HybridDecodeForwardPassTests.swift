@@ -41,6 +41,155 @@ private struct TokenBenchmark {
 }
 
 final class HybridDecodeForwardPassTests: XCTestCase {
+    func test_hybrid_decode_can_disable_fused_metal_sdpa_by_environment() {
+        XCTAssertTrue(DecodeRuntimeOptions.useMetalFusedSDPA(env: [:]))
+        XCTAssertFalse(
+            DecodeRuntimeOptions.useMetalFusedSDPA(
+                env: ["ESPRESSO_DISABLE_METAL_FUSED_SDPA": "1"]
+            )
+        )
+    }
+
+    func test_hybrid_decode_can_enable_cpu_attention_by_environment() {
+        XCTAssertFalse(DecodeRuntimeOptions.useCPUDecodeAttention(env: [:]))
+        XCTAssertTrue(
+            DecodeRuntimeOptions.useCPUDecodeAttention(
+                env: ["ESPRESSO_USE_CPU_DECODE_ATTENTION": "1"]
+            )
+        )
+    }
+
+    func test_hybrid_decode_can_enable_cpu_attention_v_dim_major_by_environment() {
+        XCTAssertFalse(DecodeRuntimeOptions.cpuDecodeAttentionVDimMajor(env: [:]))
+        XCTAssertTrue(
+            DecodeRuntimeOptions.cpuDecodeAttentionVDimMajor(
+                env: ["ESPRESSO_CPU_DECODE_ATTENTION_V_DIM_MAJOR": "1"]
+            )
+        )
+    }
+
+    func test_cpu_decode_context_matches_grouped_contiguous_reference() {
+        let qOut: [Float] = [1, 2, 3, 4]
+        let kCache: [Float] = [
+            1, 2,
+            0, 1
+        ]
+        let vCache: [Float] = [
+            10, 20,
+            30, 40
+        ]
+
+        let context = ForwardPass.cpuDecodeContext(
+            qOut: qOut,
+            kCache: kCache,
+            vCache: vCache,
+            heads: 2,
+            kvHeads: 1,
+            headDim: 2,
+            visibleTokens: 2,
+            cacheStride: 2,
+            useModuloKVHeadMapping: false,
+            useVDimMajorInterleave: false
+        )
+
+        let scale = Float(1.0 / sqrt(2.0))
+        let head0Logits = [1 * scale, 4 * scale]
+        let head1Logits = [3 * scale, 10 * scale]
+        let expected = softmaxWeightedContext(
+            logitsByHead: [head0Logits, head1Logits],
+            values: [[10, 20], [30, 40]]
+        )
+
+        XCTAssertEqual(context.count, expected.count)
+        for (actual, reference) in zip(context, expected) {
+            XCTAssertEqual(actual, reference, accuracy: 1e-5)
+        }
+    }
+
+    func test_cpu_decode_context_respects_modulo_kv_head_mapping() {
+        let qOut: [Float] = [1, 0, 0, 1]
+        let kCache: [Float] = [
+            1, 0,
+            0, 1,
+            0, 1,
+            1, 0
+        ]
+        let vCache: [Float] = [
+            10, 20,
+            30, 40,
+            50, 60,
+            70, 80
+        ]
+
+        let grouped = ForwardPass.cpuDecodeContext(
+            qOut: qOut,
+            kCache: kCache,
+            vCache: vCache,
+            heads: 2,
+            kvHeads: 2,
+            headDim: 2,
+            visibleTokens: 2,
+            cacheStride: 2,
+            useModuloKVHeadMapping: false,
+            useVDimMajorInterleave: false
+        )
+        let modulo = ForwardPass.cpuDecodeContext(
+            qOut: qOut,
+            kCache: kCache,
+            vCache: vCache,
+            heads: 2,
+            kvHeads: 2,
+            headDim: 2,
+            visibleTokens: 2,
+            cacheStride: 2,
+            useModuloKVHeadMapping: true,
+            useVDimMajorInterleave: false
+        )
+
+        XCTAssertEqual(grouped, modulo)
+
+        let qOutInterleaved: [Float] = [1, 0, 0, 1, 0, 1, 1, 0]
+        let kCacheInterleaved: [Float] = [
+            1, 0,
+            0, 1,
+            0, 1,
+            1, 0
+        ]
+        let vCacheInterleaved: [Float] = [
+            10, 20,
+            30, 40,
+            50, 60,
+            70, 80
+        ]
+
+        let groupedInterleaved = ForwardPass.cpuDecodeContext(
+            qOut: qOutInterleaved,
+            kCache: kCacheInterleaved,
+            vCache: vCacheInterleaved,
+            heads: 4,
+            kvHeads: 2,
+            headDim: 2,
+            visibleTokens: 2,
+            cacheStride: 2,
+            useModuloKVHeadMapping: false,
+            useVDimMajorInterleave: false
+        )
+        let moduloInterleaved = ForwardPass.cpuDecodeContext(
+            qOut: qOutInterleaved,
+            kCache: kCacheInterleaved,
+            vCache: vCacheInterleaved,
+            heads: 4,
+            kvHeads: 2,
+            headDim: 2,
+            visibleTokens: 2,
+            cacheStride: 2,
+            useModuloKVHeadMapping: true,
+            useVDimMajorInterleave: false
+        )
+
+        XCTAssertNotEqual(groupedInterleaved, moduloInterleaved)
+    }
+
     func test_hybrid_decode_single_step_runs_on_hardware() throws {
         try requireHybridDecodeHardware()
 
@@ -293,5 +442,20 @@ final class HybridDecodeForwardPassTests: XCTestCase {
         let elapsed = end &- start
         let nanos = elapsed &* UInt64(info.numer) / UInt64(info.denom)
         return Double(nanos) / 1_000_000.0
+    }
+}
+
+private func softmaxWeightedContext(
+    logitsByHead: [[Float]],
+    values: [[Float]]
+) -> [Float] {
+    logitsByHead.flatMap { logits in
+        let maxLogit = logits.max() ?? -.infinity
+        let exps = logits.map { expf($0 - maxLogit) }
+        let denom = exps.reduce(0, +)
+        let weights = exps.map { $0 / denom }
+        return values.map { channel in
+            zip(weights, channel).reduce(0) { $0 + ($1.0 * $1.1) }
+        }
     }
 }

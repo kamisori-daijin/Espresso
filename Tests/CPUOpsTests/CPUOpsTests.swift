@@ -100,24 +100,30 @@ private func ropeApplyReference(
     nHeads: Int,
     headDim: Int
 ) {
+    let halfDim = headDim / 2
     for t in 0..<seqLen {
         for h in 0..<nHeads {
-            for i in stride(from: 0, to: headDim, by: 2) {
-                let freq = 1.0 / powf(10000.0, Float(i) / Float(headDim))
+            for idx in 0..<halfDim {
+                let i0 = idx
+                let i1 = idx + halfDim
+                let freq = 1.0 / powf(10000.0, Float(2 * idx) / Float(headDim))
                 let value = Float(t) * freq
                 let cosv = cosf(value)
                 let sinv = sinf(value)
 
-                let off = ropeIndex(seq: t, head: h, i: i, nHeads: nHeads, headDim: headDim)
-                let q0 = q[off]
-                let q1 = q[off + 1]
-                q[off] = q0 * cosv - q1 * sinv
-                q[off + 1] = q0 * sinv + q1 * cosv
+                let qOff0 = ropeIndex(seq: t, head: h, i: i0, nHeads: nHeads, headDim: headDim)
+                let qOff1 = ropeIndex(seq: t, head: h, i: i1, nHeads: nHeads, headDim: headDim)
+                let q0 = q[qOff0]
+                let q1 = q[qOff1]
+                q[qOff0] = q0 * cosv - q1 * sinv
+                q[qOff1] = q0 * sinv + q1 * cosv
 
-                let k0 = k[off]
-                let k1 = k[off + 1]
-                k[off] = k0 * cosv - k1 * sinv
-                k[off + 1] = k0 * sinv + k1 * cosv
+                let kOff0 = ropeIndex(seq: t, head: h, i: i0, nHeads: nHeads, headDim: headDim)
+                let kOff1 = ropeIndex(seq: t, head: h, i: i1, nHeads: nHeads, headDim: headDim)
+                let k0 = k[kOff0]
+                let k1 = k[kOff1]
+                k[kOff0] = k0 * cosv - k1 * sinv
+                k[kOff1] = k0 * sinv + k1 * cosv
             }
         }
     }
@@ -130,24 +136,30 @@ private func ropeBackwardReference(
     nHeads: Int,
     headDim: Int
 ) {
+    let halfDim = headDim / 2
     for t in 0..<seqLen {
         for h in 0..<nHeads {
-            for i in stride(from: 0, to: headDim, by: 2) {
-                let freq = 1.0 / powf(10000.0, Float(i) / Float(headDim))
+            for idx in 0..<halfDim {
+                let i0 = idx
+                let i1 = idx + halfDim
+                let freq = 1.0 / powf(10000.0, Float(2 * idx) / Float(headDim))
                 let value = Float(t) * freq
                 let cosv = cosf(value)
                 let sinv = sinf(value)
 
-                let off = ropeIndex(seq: t, head: h, i: i, nHeads: nHeads, headDim: headDim)
-                let dq0 = dq[off]
-                let dq1 = dq[off + 1]
-                dq[off] = dq0 * cosv + dq1 * sinv
-                dq[off + 1] = -dq0 * sinv + dq1 * cosv
+                let dqOff0 = ropeIndex(seq: t, head: h, i: i0, nHeads: nHeads, headDim: headDim)
+                let dqOff1 = ropeIndex(seq: t, head: h, i: i1, nHeads: nHeads, headDim: headDim)
+                let dq0 = dq[dqOff0]
+                let dq1 = dq[dqOff1]
+                dq[dqOff0] = dq0 * cosv + dq1 * sinv
+                dq[dqOff1] = -dq0 * sinv + dq1 * cosv
 
-                let dk0 = dk[off]
-                let dk1 = dk[off + 1]
-                dk[off] = dk0 * cosv + dk1 * sinv
-                dk[off + 1] = -dk0 * sinv + dk1 * cosv
+                let dkOff0 = ropeIndex(seq: t, head: h, i: i0, nHeads: nHeads, headDim: headDim)
+                let dkOff1 = ropeIndex(seq: t, head: h, i: i1, nHeads: nHeads, headDim: headDim)
+                let dk0 = dk[dkOff0]
+                let dk1 = dk[dkOff1]
+                dk[dkOff0] = dk0 * cosv + dk1 * sinv
+                dk[dkOff1] = -dk0 * sinv + dk1 * cosv
             }
         }
     }

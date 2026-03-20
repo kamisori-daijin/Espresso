@@ -139,15 +139,54 @@ private struct RawCoreMLStreamEvent: Decodable {
     }
 }
 
-private struct NativeGPT2TopLevelWeights {
+private struct NativeCoreMLTopLevelWeights {
     let hiddenSize: Int
     let vocabSize: Int
     let finalNormGamma: [Float]
-    let finalNormBeta: [Float]
+    let finalNormBeta: [Float]?
     let lmHead: [Float]
 }
 
-private struct NativeGPT2CoreMLRunResult {
+func normalizeHiddenForCoreMLReference(
+    architecture: MultiModelConfig.Architecture,
+    hidden: [Float],
+    epsilon: Float,
+    gamma: [Float],
+    beta: [Float]?
+) -> [Float] {
+    precondition(hidden.count == gamma.count)
+    var output = [Float](repeating: 0, count: hidden.count)
+
+    switch architecture {
+    case .gpt2:
+        let mean = hidden.reduce(0, +) / Float(hidden.count)
+        var variance: Float = 0
+        for value in hidden {
+            let delta = value - mean
+            variance += delta * delta
+        }
+        variance /= Float(hidden.count)
+        let inverseStd = 1.0 / sqrtf(variance + epsilon)
+
+        for index in hidden.indices {
+            let normalized = (hidden[index] - mean) * inverseStd * gamma[index]
+            output[index] = normalized + (beta?[index] ?? 0)
+        }
+    case .llama:
+        var sumSquares: Float = 0
+        for value in hidden {
+            sumSquares += value * value
+        }
+        let invRms = 1.0 / sqrtf((sumSquares / Float(hidden.count)) + epsilon)
+        for index in hidden.indices {
+            output[index] = hidden[index] * invRms * gamma[index]
+        }
+    }
+
+    return output
+}
+
+private struct NativeCoreMLRunResult {
     let generatedTokens: [TokenID]
     let firstTokenLatencyMs: Double
     let tokensPerSecond: Double
@@ -171,13 +210,14 @@ private struct NativeSplitMix64: RandomNumberGenerator {
     }
 }
 
-private struct NativeGPT2CoreMLReferenceRunner {
+private struct NativeCoreMLReferenceRunner {
     let vocabSize: Int
     let maxSequenceTokens: Int
     let compileTimeMs: Double
     let computeUnits: String
 
     private let hiddenSize: Int
+    private let architecture: MultiModelConfig.Architecture
     private let model: MLModel
     private let inputFeatureName: String
     private let outputFeatureName: String
@@ -185,7 +225,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
     private let inputDataType: MLMultiArrayDataType
     private let epsilon: Float
     private let finalNormGamma: [Float]
-    private let finalNormBeta: [Float]
+    private let finalNormBeta: [Float]?
     private let lmHead: [Float]
 
     private var currentTokens: [TokenID]
@@ -196,6 +236,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
     init(
         modelPath: String,
         weightsDir: String,
+        architecture: MultiModelConfig.Architecture,
         sequenceLength: Int,
         computeUnits: String,
         epsilon: Float = 1e-5
@@ -205,7 +246,10 @@ private struct NativeGPT2CoreMLReferenceRunner {
             throw CLIError.usage("Core ML model path does not exist: \(modelPath)")
         }
 
-        let weights = try loadNativeGPT2TopLevelWeights(weightsDir: weightsDir)
+        let weights = try loadNativeCoreMLTopLevelWeights(
+            weightsDir: weightsDir,
+            architecture: architecture
+        )
         let compileStart = monotonicNow()
         let compiledURL: URL
         do {
@@ -264,6 +308,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
         self.compileTimeMs = monotonicMilliseconds(since: compileStart)
         self.computeUnits = computeUnits
         self.hiddenSize = weights.hiddenSize
+        self.architecture = architecture
         self.model = model
         self.inputFeatureName = inputFeatureName
         self.outputFeatureName = outputFeatureName
@@ -305,7 +350,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
         onEvent?(.compile(compileTimeMs: compileTimeMs, computeUnits: computeUnits, seqLen: maxSequenceTokens))
 
         var aggregatedLatencySamples: [Double] = []
-        var lastMeasured: NativeGPT2CoreMLRunResult?
+        var lastMeasured: NativeCoreMLRunResult?
 
         for iteration in 0..<(warmup + iterations) {
             let emitEvents = iteration == (warmup + iterations - 1) ? onEvent : nil
@@ -348,7 +393,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
         temperature: Float,
         seed: Int,
         onEvent: ((CoreMLStreamEvent) -> Void)?
-    ) throws -> NativeGPT2CoreMLRunResult {
+    ) throws -> NativeCoreMLRunResult {
         try reset()
 
         var generatedTokens: [TokenID] = []
@@ -397,7 +442,7 @@ private struct NativeGPT2CoreMLReferenceRunner {
         }
 
         let totalTimeMs = monotonicMilliseconds(since: generationStart)
-        return NativeGPT2CoreMLRunResult(
+        return NativeCoreMLRunResult(
             generatedTokens: generatedTokens,
             firstTokenLatencyMs: firstTokenLatencyMs,
             tokensPerSecond: throughput(tokensGenerated: generatedTokens.count, totalTimeMs: totalTimeMs),
@@ -515,18 +560,14 @@ private struct NativeGPT2CoreMLReferenceRunner {
     }
 
     private mutating func projectCurrentLogits() {
-        let mean = stepHidden.reduce(0, +) / Float(hiddenSize)
-        var variance: Float = 0
-        for value in stepHidden {
-            let delta = value - mean
-            variance += delta * delta
-        }
-        variance /= Float(hiddenSize)
-        let inverseStd = 1.0 / sqrtf(variance + epsilon)
-
-        for index in 0..<hiddenSize {
-            stepNorm[index] = ((stepHidden[index] - mean) * inverseStd * finalNormGamma[index]) + finalNormBeta[index]
-        }
+        let normalized = normalizeHiddenForCoreMLReference(
+            architecture: architecture,
+            hidden: stepHidden,
+            epsilon: epsilon,
+            gamma: finalNormGamma,
+            beta: finalNormBeta
+        )
+        stepNorm = normalized
 
         stepLogits.withUnsafeMutableBufferPointer { logitsBuffer in
             lmHead.withUnsafeBufferPointer { lmHeadBuffer in
@@ -587,7 +628,119 @@ private struct NativeGPT2CoreMLReferenceRunner {
     }
 }
 
-private func loadNativeGPT2TopLevelWeights(weightsDir: String) throws -> NativeGPT2TopLevelWeights {
+struct ReusableGPT2CoreMLBenchmarkRunner {
+    private var runner: ReusableCoreMLBenchmarkRunner
+    private var shouldReportCompileTime = true
+
+    init(
+        modelPath: String,
+        weightsDir: String,
+        sequenceLength: Int,
+        computeUnits: String
+    ) throws {
+        self.runner = try ReusableCoreMLBenchmarkRunner(
+            modelPath: modelPath,
+            weightsDir: weightsDir,
+            architecture: .gpt2,
+            sequenceLength: sequenceLength,
+            computeUnits: computeUnits
+        )
+    }
+
+    mutating func benchmark(
+        promptTokens: [TokenID],
+        maxTokens: Int,
+        temperature: Float,
+        warmup: Int,
+        iterations: Int,
+        seed: Int
+    ) throws -> CoreMLComparisonResult {
+        let result = try runner.benchmark(
+            promptTokens: promptTokens,
+            maxTokens: maxTokens,
+            temperature: temperature,
+            warmup: warmup,
+            iterations: iterations,
+            seed: seed
+        )
+        defer { shouldReportCompileTime = false }
+        guard shouldReportCompileTime else {
+            return CoreMLComparisonResult(
+                generatedTokens: result.generatedTokens,
+                compileTimeMs: 0,
+                firstTokenLatencyMs: result.firstTokenLatencyMs,
+                tokensPerSecond: result.tokensPerSecond,
+                medianTokenMs: result.medianTokenMs,
+                p95TokenMs: result.p95TokenMs,
+                tokenLatenciesMs: result.tokenLatenciesMs,
+                totalTimeMs: result.totalTimeMs,
+                computeUnits: result.computeUnits,
+                seqLen: result.seqLen
+            )
+        }
+        return result
+    }
+}
+
+struct ReusableCoreMLBenchmarkRunner {
+    private var runner: NativeCoreMLReferenceRunner
+    private var shouldReportCompileTime = true
+
+    init(
+        modelPath: String,
+        weightsDir: String,
+        architecture: MultiModelConfig.Architecture,
+        sequenceLength: Int,
+        computeUnits: String
+    ) throws {
+        self.runner = try NativeCoreMLReferenceRunner(
+            modelPath: modelPath,
+            weightsDir: weightsDir,
+            architecture: architecture,
+            sequenceLength: sequenceLength,
+            computeUnits: computeUnits
+        )
+    }
+
+    mutating func benchmark(
+        promptTokens: [TokenID],
+        maxTokens: Int,
+        temperature: Float,
+        warmup: Int,
+        iterations: Int,
+        seed: Int
+    ) throws -> CoreMLComparisonResult {
+        let result = try runner.benchmark(
+            promptTokens: promptTokens,
+            maxTokens: maxTokens,
+            temperature: temperature,
+            warmup: warmup,
+            iterations: iterations,
+            seed: seed
+        )
+        defer { shouldReportCompileTime = false }
+        guard shouldReportCompileTime else {
+            return CoreMLComparisonResult(
+                generatedTokens: result.generatedTokens,
+                compileTimeMs: 0,
+                firstTokenLatencyMs: result.firstTokenLatencyMs,
+                tokensPerSecond: result.tokensPerSecond,
+                medianTokenMs: result.medianTokenMs,
+                p95TokenMs: result.p95TokenMs,
+                tokenLatenciesMs: result.tokenLatenciesMs,
+                totalTimeMs: result.totalTimeMs,
+                computeUnits: result.computeUnits,
+                seqLen: result.seqLen
+            )
+        }
+        return result
+    }
+}
+
+private func loadNativeCoreMLTopLevelWeights(
+    weightsDir: String,
+    architecture: MultiModelConfig.Architecture
+) throws -> NativeCoreMLTopLevelWeights {
     let root = URL(fileURLWithPath: NSString(string: weightsDir).expandingTildeInPath, isDirectory: true).standardizedFileURL
     var isDirectory: ObjCBool = false
     guard FileManager.default.fileExists(atPath: root.path, isDirectory: &isDirectory), isDirectory.boolValue else {
@@ -596,7 +749,7 @@ private func loadNativeGPT2TopLevelWeights(weightsDir: String) throws -> NativeG
 
     let gammaPath = try requiredHelperFile(
         root: root,
-        candidates: ["final_norm_gamma.bin", "ln_f_gamma.bin", "rms_final.bin"],
+        candidates: ["final_norm_gamma.bin", "ln_f_gamma.bin", "rms_final.bin", "final_norm.bin"],
         label: "final norm gamma"
     )
     let finalNormGamma = try loadBlobWeightTable(at: gammaPath.path)
@@ -604,13 +757,6 @@ private func loadNativeGPT2TopLevelWeights(weightsDir: String) throws -> NativeG
         throw CLIError.runtime("Final norm gamma is empty at \(gammaPath.path)")
     }
     let hiddenSize = finalNormGamma.count
-
-    let betaPath = try requiredHelperFile(
-        root: root,
-        candidates: ["final_norm_beta.bin", "ln_f_beta.bin", "rms_final_beta.bin"],
-        label: "final norm beta"
-    )
-    let finalNormBeta = try loadBlobWeightTable(at: betaPath.path, expectedCount: hiddenSize)
 
     let lmHeadPath = try requiredHelperFile(
         root: root,
@@ -623,7 +769,20 @@ private func loadNativeGPT2TopLevelWeights(weightsDir: String) throws -> NativeG
     }
     let vocabSize = lmHead.count / hiddenSize
 
-    return NativeGPT2TopLevelWeights(
+    let finalNormBeta: [Float]?
+    switch architecture {
+    case .gpt2:
+        let betaPath = try requiredHelperFile(
+            root: root,
+            candidates: ["final_norm_beta.bin", "ln_f_beta.bin", "rms_final_beta.bin"],
+            label: "final norm beta"
+        )
+        finalNormBeta = try loadBlobWeightTable(at: betaPath.path, expectedCount: hiddenSize)
+    case .llama:
+        finalNormBeta = nil
+    }
+
+    return NativeCoreMLTopLevelWeights(
         hiddenSize: hiddenSize,
         vocabSize: vocabSize,
         finalNormGamma: finalNormGamma,
@@ -991,18 +1150,18 @@ func runGPT2CoreMLReference(
         }
     }
 
-    var runner = try NativeGPT2CoreMLReferenceRunner(
-        modelPath: coreMLModelPath,
+    return try runCoreMLReference(
+        defaults: defaults,
+        architecture: .gpt2,
+        coreMLModelPath: coreMLModelPath,
         weightsDir: weightsDir,
-        sequenceLength: sequenceLength,
-        computeUnits: computeUnits
-    )
-    return try runner.benchmark(
         promptTokens: promptTokens,
+        sequenceLength: sequenceLength,
         maxTokens: maxTokens,
         temperature: temperature,
         warmup: warmup,
         iterations: iterations,
+        computeUnits: computeUnits,
         seed: seed
     )
 }
@@ -1108,9 +1267,79 @@ func runGPT2CoreMLReferenceStreaming(
         return completed
     }
 
-    var runner = try NativeGPT2CoreMLReferenceRunner(
+    return try runCoreMLReferenceStreaming(
+        defaults: defaults,
+        architecture: .gpt2,
+        coreMLModelPath: coreMLModelPath,
+        weightsDir: weightsDir,
+        promptTokens: promptTokens,
+        sequenceLength: sequenceLength,
+        maxTokens: maxTokens,
+        temperature: temperature,
+        computeUnits: computeUnits,
+        seed: seed,
+        onEvent: onEvent
+    )
+}
+
+func runCoreMLReference(
+    defaults: DemoDefaults,
+    architecture: MultiModelConfig.Architecture,
+    coreMLModelPath: String,
+    weightsDir: String,
+    promptTokens: [TokenID],
+    sequenceLength: Int,
+    maxTokens: Int,
+    temperature: Float,
+    warmup: Int,
+    iterations: Int,
+    computeUnits: String,
+    seed: Int
+) throws -> CoreMLComparisonResult {
+    _ = defaults
+    guard !promptTokens.isEmpty else {
+        throw CLIError.runtime("Cannot compare Core ML without prompt tokens.")
+    }
+
+    var runner = try NativeCoreMLReferenceRunner(
         modelPath: coreMLModelPath,
         weightsDir: weightsDir,
+        architecture: architecture,
+        sequenceLength: sequenceLength,
+        computeUnits: computeUnits
+    )
+    return try runner.benchmark(
+        promptTokens: promptTokens,
+        maxTokens: maxTokens,
+        temperature: temperature,
+        warmup: warmup,
+        iterations: iterations,
+        seed: seed
+    )
+}
+
+func runCoreMLReferenceStreaming(
+    defaults: DemoDefaults,
+    architecture: MultiModelConfig.Architecture,
+    coreMLModelPath: String,
+    weightsDir: String,
+    promptTokens: [TokenID],
+    sequenceLength: Int,
+    maxTokens: Int,
+    temperature: Float,
+    computeUnits: String,
+    seed: Int,
+    onEvent: @escaping (CoreMLStreamEvent) -> Void
+) throws -> CoreMLComparisonResult {
+    _ = defaults
+    guard !promptTokens.isEmpty else {
+        throw CLIError.runtime("Cannot compare Core ML without prompt tokens.")
+    }
+
+    var runner = try NativeCoreMLReferenceRunner(
+        modelPath: coreMLModelPath,
+        weightsDir: weightsDir,
+        architecture: architecture,
         sequenceLength: sequenceLength,
         computeUnits: computeUnits
     )

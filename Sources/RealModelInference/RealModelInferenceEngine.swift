@@ -196,6 +196,18 @@ public struct RealModelInferenceEngine: ~Copyable {
         return config.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased().contains("qwen")
     }
 
+    enum LlamaGenerationPath: Sendable, Equatable {
+        case hybrid
+        case exactCPU
+    }
+
+    static func llamaGenerationPath(
+        config: MultiModelConfig,
+        environment: [String: String]
+    ) -> LlamaGenerationPath {
+        prefersCPUExactDecode(config: config, environment: environment) ? .exactCPU : .hybrid
+    }
+
     struct TopLevelWeightPaths: Sendable, Equatable {
         let tokenEmbedding: String
         let positionEmbedding: String
@@ -325,6 +337,13 @@ public struct RealModelInferenceEngine: ~Copyable {
         let w3: [Float]
         let qNorm: [Float]?
         let kNorm: [Float]?
+    }
+
+    private struct CachedExactCPULlamaWeights: Sendable {
+        let tokenEmbedding: [Float]
+        let finalNormGamma: [Float]
+        let lmHead: [Float]
+        let layers: [ExactCPULlamaLayerWeights]
     }
 
     private enum LoadedTokenizer {
@@ -776,6 +795,7 @@ public struct RealModelInferenceEngine: ~Copyable {
     private let classifierBlockMaxNorms: [Float]
     private var classifierLogitsScratch: [Float]
     private let classifierStrategy: ClassifierStrategy
+    private var cachedExactCPULlamaWeights: CachedExactCPULlamaWeights?
 
     private init(
         config: MultiModelConfig,
@@ -822,6 +842,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             count: min(Self.classifierArgmaxBlockSize, config.vocab)
         )
         self.classifierStrategy = ClassifierStrategy.select(for: config)
+        self.cachedExactCPULlamaWeights = nil
     }
 
     public static func build(
@@ -893,24 +914,38 @@ public struct RealModelInferenceEngine: ~Copyable {
             maxSeq: config.maxSeq
         )
 
-        // Llama always uses hybrid decode (RoPE requires CPU step between ANE QKV and Metal attention)
         if config.architecture == .llama {
-            let compileStart = DispatchTime.now().uptimeNanoseconds
-            let compileDidRun = try ensureHybridCompiledLlama(bucket: bucket)
-            guard let metalAttention = hybridMetalAttention else {
-                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama")
+            switch Self.llamaGenerationPath(
+                config: config,
+                environment: ProcessInfo.processInfo.environment
+            ) {
+            case .exactCPU:
+                return try generateIncrementalExactCPULlama(
+                    promptTokens: promptTokens,
+                    effectiveMaxTokens: effectiveMaxTokens,
+                    temperature: temperature,
+                    compileTimeMs: 0,
+                    maxSeq: bucket,
+                    onStep: onStep
+                )
+            case .hybrid:
+                let compileStart = DispatchTime.now().uptimeNanoseconds
+                let compileDidRun = try ensureHybridCompiledLlama(bucket: bucket)
+                guard let metalAttention = hybridMetalAttention else {
+                    throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama")
+                }
+                let compileEnd = DispatchTime.now().uptimeNanoseconds
+                let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
+                return try generateIncrementalHybridLlama(
+                    promptTokens: promptTokens,
+                    effectiveMaxTokens: effectiveMaxTokens,
+                    temperature: temperature,
+                    compileTimeMs: compileTimeMs,
+                    maxSeq: bucket,
+                    metalAttention: metalAttention,
+                    onStep: onStep
+                )
             }
-            let compileEnd = DispatchTime.now().uptimeNanoseconds
-            let compileTimeMs = compileDidRun ? Self.milliseconds(from: compileEnd - compileStart) : 0
-            return try generateIncrementalHybridLlama(
-                promptTokens: promptTokens,
-                effectiveMaxTokens: effectiveMaxTokens,
-                temperature: temperature,
-                compileTimeMs: compileTimeMs,
-                maxSeq: bucket,
-                metalAttention: metalAttention,
-                onStep: onStep
-            )
         }
 
         let compileStart = DispatchTime.now().uptimeNanoseconds
@@ -1188,22 +1223,38 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        let compileStart = DispatchTime.now().uptimeNanoseconds
-        let compileDidRun = try engine.ensureHybridCompiledLlama(bucket: bucket)
-        guard let metalAttention = engine.hybridMetalAttention else {
-            throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
+        let result: GenerationResult
+        switch llamaGenerationPath(
+            config: config,
+            environment: ProcessInfo.processInfo.environment
+        ) {
+        case .exactCPU:
+            result = try engine.generateIncrementalExactCPULlama(
+                promptTokens: promptTokens,
+                effectiveMaxTokens: 1,
+                temperature: 0,
+                compileTimeMs: 0,
+                maxSeq: bucket,
+                onStep: nil
+            )
+        case .hybrid:
+            let compileStart = DispatchTime.now().uptimeNanoseconds
+            let compileDidRun = try engine.ensureHybridCompiledLlama(bucket: bucket)
+            guard let metalAttention = engine.hybridMetalAttention else {
+                throw RealModelInferenceError.runtimeFailure("Hybrid Metal attention unavailable for llama testing helper")
+            }
+            let compileEnd = DispatchTime.now().uptimeNanoseconds
+            let compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
+            result = try engine.generateIncrementalHybridLlama(
+                promptTokens: promptTokens,
+                effectiveMaxTokens: 1,
+                temperature: 0,
+                compileTimeMs: compileTimeMs,
+                maxSeq: bucket,
+                metalAttention: metalAttention,
+                onStep: nil
+            )
         }
-        let compileEnd = DispatchTime.now().uptimeNanoseconds
-        let compileTimeMs = compileDidRun ? milliseconds(from: compileEnd - compileStart) : 0
-        let result = try engine.generateIncrementalHybridLlama(
-            promptTokens: promptTokens,
-            effectiveMaxTokens: 1,
-            temperature: 0,
-            compileTimeMs: compileTimeMs,
-            maxSeq: bucket,
-            metalAttention: metalAttention,
-            onStep: nil
-        )
         guard let token = result.tokens.first else {
             throw RealModelInferenceError.runtimeFailure("Testing helper did not emit a next token")
         }
@@ -4515,10 +4566,10 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        if Self.prefersCPUExactDecode(
+        if Self.llamaGenerationPath(
             config: config,
             environment: ProcessInfo.processInfo.environment
-        ) {
+        ) == .exactCPU {
             return try generateIncrementalExactCPULlama(
                 promptTokens: promptTokens,
                 effectiveMaxTokens: effectiveMaxTokens,
@@ -5017,6 +5068,45 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
+    private mutating func loadCachedExactCPULlamaWeights() throws -> CachedExactCPULlamaWeights {
+        if let cachedExactCPULlamaWeights {
+            return cachedExactCPULlamaWeights
+        }
+
+        let topLevelPaths = try Self.resolveLlamaTopLevelWeightPaths(
+            config: config,
+            weightDir: weightDirURL.path
+        )
+        let tokenEmbedding = try Self.loadWeightTablePreferringFloat32Sidecar(
+            at: topLevelPaths.tokenEmbedding,
+            expectedCount: config.vocab * config.dModel
+        )
+        let finalNormGamma = try Self.loadWeightTablePreferringFloat32Sidecar(
+            at: topLevelPaths.finalNormGamma,
+            expectedCount: config.dModel
+        )
+        let lmHead = try Self.loadWeightTablePreferringFloat32Sidecar(
+            at: topLevelPaths.lmHead,
+            expectedCount: config.vocab * config.dModel
+        )
+        let layers = try (0..<config.nLayer).map { layerIndex in
+            let paths = LayerWeightPaths.forLayer(
+                layerIndex,
+                config: config,
+                blobDir: weightDirURL.path
+            )
+            return try Self.loadExactCPULlamaLayerWeights(config: config, paths: paths)
+        }
+        let loadedWeights = CachedExactCPULlamaWeights(
+            tokenEmbedding: tokenEmbedding,
+            finalNormGamma: finalNormGamma,
+            lmHead: lmHead,
+            layers: layers
+        )
+        cachedExactCPULlamaWeights = loadedWeights
+        return loadedWeights
+    }
+
     private mutating func generateIncrementalExactCPULlama(
         promptTokens: [TokenID],
         effectiveMaxTokens: Int,
@@ -5032,24 +5122,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         let maybeRound: ([Float]) -> [Float] = { values in
             roundIntermediatesToFP16 ? Self.roundFloat16Vector(values) : values
         }
-
-        let topLevelPaths = try Self.resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDirURL.path)
-        let tokenEmbedding = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.tokenEmbedding,
-            expectedCount: config.vocab * config.dModel
-        )
-        let finalNormGamma = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.finalNormGamma,
-            expectedCount: config.dModel
-        )
-        let lmHead = try Self.loadWeightTablePreferringFloat32Sidecar(
-            at: topLevelPaths.lmHead,
-            expectedCount: config.vocab * config.dModel
-        )
-        let layers = try (0..<config.nLayer).map { layerIndex in
-            let paths = LayerWeightPaths.forLayer(layerIndex, config: config, blobDir: weightDirURL.path)
-            return try Self.loadExactCPULlamaLayerWeights(config: config, paths: paths)
-        }
+        let exactWeights = try loadCachedExactCPULlamaWeights()
+        let tokenEmbedding = exactWeights.tokenEmbedding
+        let finalNormGamma = exactWeights.finalNormGamma
+        let lmHead = exactWeights.lmHead
+        let layers = exactWeights.layers
 
         var kCaches = Array(
             repeating: [Float](repeating: 0, count: config.kvDim * maxSeq),

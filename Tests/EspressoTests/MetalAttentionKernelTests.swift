@@ -6,6 +6,76 @@ import ANETypes
 @testable import Espresso
 
 final class MetalAttentionKernelTests: XCTestCase {
+    func test_kv_head_mapping_defaults_to_grouped_contiguous() {
+        XCTAssertEqual(
+            MetalAttentionKernel.resolvedKVHeadMappingMode(environment: [:]),
+            .groupedContiguous
+        )
+        XCTAssertEqual(
+            MetalAttentionKernel.kvHeadIndex(
+                queryHead: 0,
+                heads: 16,
+                kvHeads: 8,
+                mode: .groupedContiguous
+            ),
+            0
+        )
+        XCTAssertEqual(
+            MetalAttentionKernel.kvHeadIndex(
+                queryHead: 7,
+                heads: 16,
+                kvHeads: 8,
+                mode: .groupedContiguous
+            ),
+            3
+        )
+        XCTAssertEqual(
+            MetalAttentionKernel.kvHeadIndex(
+                queryHead: 15,
+                heads: 16,
+                kvHeads: 8,
+                mode: .groupedContiguous
+            ),
+            7
+        )
+    }
+
+    func test_kv_head_mapping_supports_modulo_interleaving() {
+        XCTAssertEqual(
+            MetalAttentionKernel.resolvedKVHeadMappingMode(
+                environment: [MetalAttentionKernel.moduloKVHeadMappingEnvKey: "1"]
+            ),
+            .moduloInterleaved
+        )
+        XCTAssertEqual(
+            MetalAttentionKernel.kvHeadIndex(
+                queryHead: 0,
+                heads: 16,
+                kvHeads: 8,
+                mode: .moduloInterleaved
+            ),
+            0
+        )
+        XCTAssertEqual(
+            MetalAttentionKernel.kvHeadIndex(
+                queryHead: 7,
+                heads: 16,
+                kvHeads: 8,
+                mode: .moduloInterleaved
+            ),
+            7
+        )
+        XCTAssertEqual(
+            MetalAttentionKernel.kvHeadIndex(
+                queryHead: 15,
+                heads: 16,
+                kvHeads: 8,
+                mode: .moduloInterleaved
+            ),
+            7
+        )
+    }
+
     func test_metal_attention_matches_reference_on_small_problem() throws {
         let shape = try MetalAttentionShape(heads: 2, headDim: 4, seqLen: 4)
         let q: [Float] = [
@@ -111,6 +181,8 @@ final class MetalAttentionKernelTests: XCTestCase {
 
         let projection = HybridOutputProjectionWeights(
             cacheKey: "test-identity-projection",
+            inputDim: dim,
+            outputDim: dim,
             rowMajorWeights: identityMatrix(dim: dim),
             rowMajorBias: [Float](repeating: 0, count: dim)
         )
@@ -256,6 +328,265 @@ final class MetalAttentionKernelTests: XCTestCase {
         }
     }
 
+    func test_metal_fused_decode_sdpa_into_surface_matches_reference_on_small_problem() throws {
+        let shape = try MetalDecodeAttentionShape(
+            heads: 2,
+            headDim: 4,
+            visibleTokens: 2,
+            cacheStride: 4,
+            laneStride: 4
+        )
+        let dim = shape.heads * shape.headDim
+        let qLane: [Float] = [
+            0.25, -0.50, 0.75, 1.00,
+            -1.00, 0.50, 0.25, -0.25,
+        ]
+        let kTokens: [Float] = [
+            0.50, 0.25, -0.75, 1.00,
+            1.00, -0.50, 0.25, 0.75,
+
+            -0.50, 0.75, 0.25, -1.00,
+            0.25, -0.25, 1.00, 0.50,
+        ]
+        let vTokens: [Float] = [
+            1.00, 0.00, 0.50, -0.50,
+            0.50, 1.00, -0.25, 0.25,
+
+            -0.50, 1.00, 0.25, 0.75,
+            0.75, -0.25, 1.00, -0.50,
+        ]
+
+        var qSurfaceData = [Float](repeating: 0, count: dim * shape.laneStride)
+        var kCacheData = [Float](repeating: 0, count: dim * shape.cacheStride)
+        var vCacheData = [Float](repeating: 0, count: dim * shape.cacheStride)
+        for channel in 0..<dim {
+            qSurfaceData[channel * shape.laneStride] = qLane[channel]
+        }
+        for head in 0..<shape.heads {
+            for token in 0..<shape.visibleTokens {
+                for headOffset in 0..<shape.headDim {
+                    let channel = head * shape.headDim + headOffset
+                    let sourceIndex = (head * shape.visibleTokens + token) * shape.headDim + headOffset
+                    kCacheData[channel * shape.cacheStride + token] = kTokens[sourceIndex]
+                    vCacheData[channel * shape.cacheStride + token] = vTokens[sourceIndex]
+                }
+            }
+        }
+
+        let kernel = try MetalAttentionKernel()
+        let qSurface = makeSurface(bytes: qSurfaceData.count * 2)
+        let kCacheSurface = makeSurface(bytes: kCacheData.count * 2)
+        let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
+        let contextSurface = makeSurface(bytes: dim * shape.laneStride * MemoryLayout<Float>.stride)
+
+        qSurfaceData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        }
+        kCacheData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        }
+        vCacheData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: dim, spatial: shape.cacheStride)
+        }
+
+        try kernel.runFusedDecodeSDPAIntoSurface(
+            qSurface: qSurface,
+            kCacheSurface: kCacheSurface,
+            vCacheSurface: vCacheSurface,
+            contextSurface: contextSurface,
+            shape: shape
+        )
+
+        let actual = try readFP32SpatialSlice(
+            from: contextSurface,
+            spatialIndex: 0,
+            spatial: shape.laneStride,
+            channels: dim
+        )
+        let expected = referenceDecodeContext(
+            qLane: qLane,
+            kCache: kCacheData,
+            vCache: vCacheData,
+            shape: shape
+        )
+        XCTAssertEqual(actual.count, expected.count)
+        for (lhs, rhs) in zip(actual, expected) {
+            XCTAssertEqual(lhs, rhs, accuracy: 1e-4)
+        }
+    }
+
+    func test_metal_fused_decode_sdpa_into_surface_matches_reference_for_gqa() throws {
+        let shape = try MetalDecodeAttentionShape(
+            heads: 4,
+            kvHeads: 2,
+            headDim: 2,
+            visibleTokens: 3,
+            cacheStride: 4,
+            laneStride: 4
+        )
+        let dim = shape.heads * shape.headDim
+        let kvDim = shape.kvHeads * shape.headDim
+        let qLane: [Float] = [
+            0.50, -0.25,
+            1.00, 0.75,
+            -0.50, 0.20,
+            0.10, 0.90,
+        ]
+        var qSurfaceData = [Float](repeating: 0, count: dim * shape.laneStride)
+        var kCacheData = [Float](repeating: 0, count: kvDim * shape.cacheStride)
+        var vCacheData = [Float](repeating: 0, count: kvDim * shape.cacheStride)
+
+        for channel in 0..<dim {
+            qSurfaceData[channel * shape.laneStride] = qLane[channel]
+        }
+
+        let kRows: [[Float]] = [
+            [0.20, -0.10, 0.30],
+            [0.40, 0.60, -0.50],
+            [-0.25, 0.50, 0.75],
+            [0.10, -0.20, 0.90],
+        ]
+        let vRows: [[Float]] = [
+            [1.00, 0.50, -0.25],
+            [0.25, -0.75, 0.80],
+            [-0.40, 0.90, 0.10],
+            [0.60, -0.30, 0.45],
+        ]
+        for channel in 0..<kvDim {
+            for token in 0..<shape.visibleTokens {
+                kCacheData[channel * shape.cacheStride + token] = kRows[channel][token]
+                vCacheData[channel * shape.cacheStride + token] = vRows[channel][token]
+            }
+        }
+
+        let kernel = try MetalAttentionKernel()
+        let qSurface = makeSurface(bytes: qSurfaceData.count * 2)
+        let kCacheSurface = makeSurface(bytes: kCacheData.count * 2)
+        let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
+        let contextSurface = makeSurface(bytes: dim * shape.laneStride * MemoryLayout<Float>.stride)
+
+        qSurfaceData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        }
+        kCacheData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        }
+        vCacheData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        }
+
+        try kernel.runFusedDecodeSDPAIntoSurface(
+            qSurface: qSurface,
+            kCacheSurface: kCacheSurface,
+            vCacheSurface: vCacheSurface,
+            contextSurface: contextSurface,
+            shape: shape
+        )
+
+        let actual = try readFP32SpatialSlice(
+            from: contextSurface,
+            spatialIndex: 0,
+            spatial: shape.laneStride,
+            channels: dim
+        )
+        let expected = referenceDecodeContext(
+            qLane: qLane,
+            kCache: kCacheData,
+            vCache: vCacheData,
+            shape: shape
+        )
+        XCTAssertEqual(actual.count, expected.count)
+        for (lhs, rhs) in zip(actual, expected) {
+            XCTAssertEqual(lhs, rhs, accuracy: 1e-4)
+        }
+    }
+
+    func test_metal_decode_context_into_surface_matches_reference_for_gqa() throws {
+        let shape = try MetalDecodeAttentionShape(
+            heads: 4,
+            kvHeads: 2,
+            headDim: 2,
+            visibleTokens: 3,
+            cacheStride: 4,
+            laneStride: 4
+        )
+        let dim = shape.heads * shape.headDim
+        let kvDim = shape.kvHeads * shape.headDim
+        let qLane: [Float] = [
+            0.50, -0.25,
+            1.00, 0.75,
+            -0.50, 0.20,
+            0.10, 0.90,
+        ]
+        var qSurfaceData = [Float](repeating: 0, count: dim * shape.laneStride)
+        var kCacheData = [Float](repeating: 0, count: kvDim * shape.cacheStride)
+        var vCacheData = [Float](repeating: 0, count: kvDim * shape.cacheStride)
+
+        for channel in 0..<dim {
+            qSurfaceData[channel * shape.laneStride] = qLane[channel]
+        }
+
+        let kRows: [[Float]] = [
+            [0.20, -0.10, 0.30],
+            [0.40, 0.60, -0.50],
+            [-0.25, 0.50, 0.75],
+            [0.10, -0.20, 0.90],
+        ]
+        let vRows: [[Float]] = [
+            [1.00, 0.50, -0.25],
+            [0.25, -0.75, 0.80],
+            [-0.40, 0.90, 0.10],
+            [0.60, -0.30, 0.45],
+        ]
+        for channel in 0..<kvDim {
+            for token in 0..<shape.visibleTokens {
+                kCacheData[channel * shape.cacheStride + token] = kRows[channel][token]
+                vCacheData[channel * shape.cacheStride + token] = vRows[channel][token]
+            }
+        }
+
+        let kernel = try MetalAttentionKernel()
+        let qSurface = makeSurface(bytes: qSurfaceData.count * 2)
+        let kCacheSurface = makeSurface(bytes: kCacheData.count * 2)
+        let vCacheSurface = makeSurface(bytes: vCacheData.count * 2)
+        let contextSurface = makeSurface(bytes: dim * shape.laneStride * MemoryLayout<Float>.stride)
+
+        qSurfaceData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: qSurface, data: src, channels: dim, spatial: shape.laneStride)
+        }
+        kCacheData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: kCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        }
+        vCacheData.withUnsafeBufferPointer { src in
+            SurfaceIO.writeFP16(to: vCacheSurface, data: src, channels: kvDim, spatial: shape.cacheStride)
+        }
+
+        try kernel.runDecodeContextIntoSurface(
+            qSurface: qSurface,
+            kCacheSurface: kCacheSurface,
+            vCacheSurface: vCacheSurface,
+            contextSurface: contextSurface,
+            shape: shape
+        )
+
+        let actual = try readFP32SpatialSlice(
+            from: contextSurface,
+            spatialIndex: 0,
+            spatial: shape.laneStride,
+            channels: dim
+        )
+        let expected = referenceDecodeContext(
+            qLane: qLane,
+            kCache: kCacheData,
+            vCache: vCacheData,
+            shape: shape
+        )
+        XCTAssertEqual(actual.count, expected.count)
+        for (lhs, rhs) in zip(actual, expected) {
+            XCTAssertEqual(lhs, rhs, accuracy: 1e-4)
+        }
+    }
+
     private func requireHardwareBenchmarks(file: StaticString = #filePath, line: UInt = #line) throws {
         guard ProcessInfo.processInfo.environment["ANE_HARDWARE_TESTS"] == "1" else {
             throw XCTSkip("Set ANE_HARDWARE_TESTS=1 to run Metal hardware benchmarks")
@@ -352,11 +683,13 @@ final class MetalAttentionKernelTests: XCTestCase {
 
         for head in 0..<shape.heads {
             var logits = [Float](repeating: 0, count: shape.visibleTokens)
+            let kvHead = head / (shape.heads / shape.kvHeads)
             for token in 0..<shape.visibleTokens {
                 var dot: Float = 0
                 for headOffset in 0..<shape.headDim {
-                    let channel = head * shape.headDim + headOffset
-                    dot += qLane[channel] * kCache[channel * shape.cacheStride + token]
+                    let qChannel = head * shape.headDim + headOffset
+                    let kvChannel = kvHead * shape.headDim + headOffset
+                    dot += qLane[qChannel] * kCache[kvChannel * shape.cacheStride + token]
                 }
                 logits[token] = dot * scale
             }
@@ -372,9 +705,10 @@ final class MetalAttentionKernelTests: XCTestCase {
 
             for headOffset in 0..<shape.headDim {
                 let channel = head * shape.headDim + headOffset
+                let kvChannel = kvHead * shape.headDim + headOffset
                 var accum: Float = 0
                 for token in 0..<shape.visibleTokens {
-                    accum += (weights[token] / denom) * vCache[channel * shape.cacheStride + token]
+                    accum += (weights[token] / denom) * vCache[kvChannel * shape.cacheStride + token]
                 }
                 context[channel] = accum
             }
@@ -395,11 +729,13 @@ final class MetalAttentionKernelTests: XCTestCase {
 
         for head in 0..<shape.heads {
             var logits = [Float](repeating: 0, count: shape.visibleTokens)
+            let kvHead = head / (shape.heads / shape.kvHeads)
             for token in 0..<shape.visibleTokens {
                 var dot: Float = 0
                 for headOffset in 0..<shape.headDim {
-                    let channel = head * shape.headDim + headOffset
-                    dot += qLane[channel] * kCache[channel * shape.cacheStride + token]
+                    let qChannel = head * shape.headDim + headOffset
+                    let kvChannel = kvHead * shape.headDim + headOffset
+                    dot += qLane[qChannel] * kCache[kvChannel * shape.cacheStride + token]
                 }
                 logits[token] = dot * scale
             }
@@ -415,9 +751,10 @@ final class MetalAttentionKernelTests: XCTestCase {
 
             for headOffset in 0..<shape.headDim {
                 let channel = head * shape.headDim + headOffset
+                let kvChannel = kvHead * shape.headDim + headOffset
                 var accum: Float = 0
                 for token in 0..<shape.visibleTokens {
-                    accum += (weights[token] / denom) * vCache[channel * shape.cacheStride + token]
+                    accum += (weights[token] / denom) * vCache[kvChannel * shape.cacheStride + token]
                 }
                 context[channel] = accum
             }

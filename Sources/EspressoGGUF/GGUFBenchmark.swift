@@ -28,12 +28,15 @@ public enum GGUFBenchmark {
         // Load GGUF
         let loadStart = DispatchTime.now()
         let ggufLoader = try GGUFLoader(url: url)
-        let weightMap = try await ggufLoader.load(from: url)
+        _ = try await ggufLoader.load(from: url)
         let loadMs = Double(DispatchTime.now().uptimeNanoseconds - loadStart.uptimeNanoseconds) / 1_000_000
 
         // Convert
         let convertStart = DispatchTime.now()
-        let prepared = try await GGUFModelLoader.prepare(ggufURL: url)
+        let prepared = try await GGUFModelLoader.prepare(
+            ggufURL: url,
+            options: .init(artifactCacheMode: .disabled)
+        )
         let convertMs = Double(DispatchTime.now().uptimeNanoseconds - convertStart.uptimeNanoseconds) / 1_000_000
 
         let totalMs = Double(DispatchTime.now().uptimeNanoseconds - totalStart.uptimeNanoseconds) / 1_000_000

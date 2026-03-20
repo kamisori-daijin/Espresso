@@ -97,4 +97,18 @@ final class DecodeQKVOnlyGeneratorTests: XCTestCase {
         XCTAssertTrue(mil.contains("bv.bin"))
         XCTAssertFalse(mil.contains("wo.bin"))
     }
+
+    func test_decode_qkv_only_generator_uses_custom_norm_epsilon() {
+        let mil = DecodeQKVOnlyGenerator(
+            dim: 1024,
+            qDim: 2048,
+            kvDim: 1024,
+            laneSpatial: 32,
+            architecture: .rmsNormSwiGLU,
+            normEps: 1e-6
+        ).milText
+
+        XCTAssertTrue(mil.contains("0.000001"))
+        XCTAssertFalse(mil.contains("0.00001"))
+    }
 }

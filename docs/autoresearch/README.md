@@ -98,14 +98,14 @@ The script creates a local, ignored `.autoresearch/` directory in the target wor
 - `env.sh`
 - `bench.sh`
 
-It also creates an ignored `autoresearch-results.tsv` log keyed to the real-model throughput metrics.
+It also creates an ignored `autoresearch-results.tsv` audit log keyed to the real-model throughput metrics. Official referee decisions come from `suite-summary.json` and `judge_suite_results.sh`, not from the raw TSV alone.
 
 ## Hardened Contract
 
 The benchmark harness is hardened for trustworthy multi-prompt, multi-run measurement:
 
 - **Prompt suite**: `scripts/benchmark-prompts.txt` defines 3 fixed prompts (short/medium/long) exercising different CoreML sequence-length buckets
-- **Suite runner**: `scripts/run_autoresearch_suite.sh` runs 1 cold + K warm runs across all prompts, aggregates median/min/max per prompt
+- **Suite runner**: `scripts/run_autoresearch_suite.sh` runs 1 cold + K warm runs across all prompts, aggregates median/min/max per prompt, and can forward raw per-invocation rows into `autoresearch-results.tsv`
 - **Judge script**: `scripts/judge_suite_results.sh` evaluates single summaries or compares baseline vs candidate with threshold gating
 
 ### Merge Bar
@@ -116,6 +116,8 @@ A candidate branch is merge-eligible only when:
 2. Candidate shows >= 2% improvement on `espresso_tok_s` median on **every** prompt
 3. The bar holds across all K suite runs (default 3/3)
 4. Only `judge_suite_results.sh --baseline` verdicts count
+
+The TSV is an audit trail for each underlying compare invocation. Use it to inspect prompt-level run history, not as the merge decision source.
 
 ### Suite Workflow
 

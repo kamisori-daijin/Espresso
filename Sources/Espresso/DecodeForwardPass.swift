@@ -1,5 +1,6 @@
 import Foundation
 import IOSurface
+import Metal
 import ANEInterop
 import ANERuntime
 import ANETypes
@@ -141,6 +142,46 @@ enum DecodeRuntimeOptions {
     @inline(__always)
     static var forceFullWindowSync: Bool {
         forceFullWindowSync(env: ProcessInfo.processInfo.environment)
+    }
+
+    @inline(__always)
+    static func useMetalFusedSDPA(env: [String: String]) -> Bool {
+        env["ESPRESSO_DISABLE_METAL_FUSED_SDPA"] != "1"
+    }
+
+    @inline(__always)
+    static var useMetalFusedSDPA: Bool {
+        useMetalFusedSDPA(env: ProcessInfo.processInfo.environment)
+    }
+
+    @inline(__always)
+    static func repackVOutHeadMajor(env: [String: String]) -> Bool {
+        env["ESPRESSO_REPACK_VOUT_HEAD_MAJOR"] == "1"
+    }
+
+    @inline(__always)
+    static var repackVOutHeadMajor: Bool {
+        repackVOutHeadMajor(env: ProcessInfo.processInfo.environment)
+    }
+
+    @inline(__always)
+    static func useCPUDecodeAttention(env: [String: String]) -> Bool {
+        env["ESPRESSO_USE_CPU_DECODE_ATTENTION"] == "1"
+    }
+
+    @inline(__always)
+    static var useCPUDecodeAttention: Bool {
+        useCPUDecodeAttention(env: ProcessInfo.processInfo.environment)
+    }
+
+    @inline(__always)
+    static func cpuDecodeAttentionVDimMajor(env: [String: String]) -> Bool {
+        env["ESPRESSO_CPU_DECODE_ATTENTION_V_DIM_MAJOR"] == "1"
+    }
+
+    @inline(__always)
+    static var cpuDecodeAttentionVDimMajor: Bool {
+        cpuDecodeAttentionVDimMajor(env: ProcessInfo.processInfo.environment)
     }
 }
 
@@ -302,9 +343,17 @@ public struct HybridDecodeSurfaceHandles {
     public let laneSpatial: Int
 
     public let dim: Int
+    public let qDim: Int
     public let kvDim: Int
 
-    public init(kernels: borrowing HybridDecodeKernelSet, logicalMaxSeq: Int? = nil, dim: Int = ModelConfig.dim, kvDim: Int? = nil) throws(ANEError) {
+    public init(
+        kernels: borrowing HybridDecodeKernelSet,
+        logicalMaxSeq: Int? = nil,
+        dim: Int = ModelConfig.dim,
+        qDim: Int? = nil,
+        kvDim: Int? = nil
+    ) throws(ANEError) {
+        let resolvedQDim = qDim ?? dim
         let resolvedKVDim = kvDim ?? dim
         let qkvIn = try kernels.decodeQKVOnly.inputSurface(at: 0)
         let kOut = try kernels.decodeQKVOnly.outputSurface(at: 0)
@@ -321,6 +370,7 @@ public struct HybridDecodeSurfaceHandles {
         }
 
         self.dim = dim
+        self.qDim = resolvedQDim
         self.kvDim = resolvedKVDim
         self.qkvIn = qkvIn
         self.kOut = kOut
@@ -589,6 +639,252 @@ public extension ForwardPass {
         }
     }
 
+    static func repackVOutForSingleTokenExperiment(
+        source: UnsafeBufferPointer<Float>,
+        kvHeads: Int,
+        headDim: Int,
+        laneSpatial: Int,
+        sourceSpatialIndex: Int
+    ) -> [Float] {
+        precondition(kvHeads > 0)
+        precondition(headDim > 0)
+        precondition(laneSpatial > 0)
+        precondition(sourceSpatialIndex >= 0 && sourceSpatialIndex < laneSpatial)
+        precondition(source.count == kvHeads * headDim * laneSpatial)
+
+        var repacked = [Float](repeating: 0, count: kvHeads * headDim)
+        for dimIndex in 0..<headDim {
+            for kvHead in 0..<kvHeads {
+                let sourceChannel = dimIndex * kvHeads + kvHead
+                let sourceIndex = sourceChannel * laneSpatial + sourceSpatialIndex
+                let destinationIndex = kvHead * headDim + dimIndex
+                repacked[destinationIndex] = source[sourceIndex]
+            }
+        }
+        return repacked
+    }
+
+    internal static func cpuDecodeContext(
+        qOut: [Float],
+        kCache: [Float],
+        vCache: [Float],
+        heads: Int,
+        kvHeads: Int,
+        headDim: Int,
+        visibleTokens: Int,
+        cacheStride: Int,
+        useModuloKVHeadMapping: Bool,
+        useVDimMajorInterleave: Bool
+    ) -> [Float] {
+        precondition(heads > 0)
+        precondition(kvHeads > 0)
+        precondition(headDim > 0)
+        precondition(visibleTokens > 0)
+        precondition(cacheStride >= visibleTokens)
+        precondition(qOut.count == heads * headDim)
+        precondition(kCache.count == kvHeads * headDim * cacheStride)
+        precondition(vCache.count == kvHeads * headDim * cacheStride)
+
+        let scale = 1.0 / sqrt(Float(headDim))
+        var context = [Float](repeating: 0, count: heads * headDim)
+        var scores = [Float](repeating: 0, count: visibleTokens)
+        var weights = [Float](repeating: 0, count: visibleTokens)
+
+        for head in 0..<heads {
+            let kvHead = MetalAttentionKernel.kvHeadIndex(
+                queryHead: head,
+                heads: heads,
+                kvHeads: kvHeads,
+                mode: useModuloKVHeadMapping ? .moduloInterleaved : .groupedContiguous
+            )
+            let qBase = head * headDim
+            let kBase = kvHead * headDim
+
+            var maxScore = -Float.infinity
+            for token in 0..<visibleTokens {
+                var dot: Float = 0
+                for dimIndex in 0..<headDim {
+                    dot += qOut[qBase + dimIndex] * kCache[(kBase + dimIndex) * cacheStride + token]
+                }
+                let score = dot * scale
+                scores[token] = score
+                maxScore = max(maxScore, score)
+            }
+
+            var weightSum: Float = 0
+            for token in 0..<visibleTokens {
+                let weight = expf(scores[token] - maxScore)
+                weights[token] = weight
+                weightSum += weight
+            }
+            let invWeightSum = 1.0 / weightSum
+
+            for dimIndex in 0..<headDim {
+                var value: Float = 0
+                let vChannel = useVDimMajorInterleave
+                    ? (dimIndex * kvHeads + kvHead)
+                    : (kBase + dimIndex)
+                for token in 0..<visibleTokens {
+                    value += (weights[token] * invWeightSum) * vCache[vChannel * cacheStride + token]
+                }
+                context[qBase + dimIndex] = value
+            }
+        }
+
+        return context
+    }
+
+    private static func writeCPUDecodeContextIntoSurface(
+        handles: HybridDecodeSurfaceHandles,
+        heads: Int,
+        kvHeads: Int,
+        headDim: Int,
+        visibleTokens: Int,
+        cacheStride: Int
+    ) throws(ANEError) {
+        let qDim = heads * headDim
+        let kvDim = kvHeads * headDim
+        var qOut = [Float](repeating: 0, count: qDim)
+        var kCache = [Float](repeating: 0, count: kvDim * cacheStride)
+        var vCache = [Float](repeating: 0, count: kvDim * cacheStride)
+
+        do {
+            try qOut.withUnsafeMutableBufferPointer { destination in
+                try SurfaceIO.readFP16SpatialSlice(
+                    from: handles.qOut,
+                    channelOffset: 0,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    into: destination,
+                    channels: qDim
+                )
+            }
+            kCache.withUnsafeMutableBufferPointer { destination in
+                SurfaceIO.readFP16(
+                    from: handles.kCacheFull,
+                    into: destination,
+                    channelOffset: 0,
+                    channels: kvDim,
+                    spatial: cacheStride
+                )
+            }
+            vCache.withUnsafeMutableBufferPointer { destination in
+                SurfaceIO.readFP16(
+                    from: handles.vCacheFull,
+                    into: destination,
+                    channelOffset: 0,
+                    channels: kvDim,
+                    spatial: cacheStride
+                )
+            }
+
+            let context = cpuDecodeContext(
+                qOut: qOut,
+                kCache: kCache,
+                vCache: vCache,
+                heads: heads,
+                kvHeads: kvHeads,
+                headDim: headDim,
+                visibleTokens: visibleTokens,
+                cacheStride: cacheStride,
+                useModuloKVHeadMapping: MetalAttentionKernel.resolvedKVHeadMappingMode() == .moduloInterleaved,
+                useVDimMajorInterleave: DecodeRuntimeOptions.cpuDecodeAttentionVDimMajor
+            )
+            try context.withUnsafeBufferPointer { source in
+                try writeFP32SpatialSlice(
+                    to: handles.projectionContextIn,
+                    data: source,
+                    spatialIndex: 0,
+                    spatial: handles.laneSpatial,
+                    channels: qDim
+                )
+            }
+        } catch let error as ANEError {
+            throw error
+        } catch {
+            throw .invalidArguments("CPU decode attention helper failed: \(error)")
+        }
+    }
+
+    private static func updateHybridKVCacheSlices(
+        handles: HybridDecodeSurfaceHandles,
+        tokenIndex: Int,
+        maxSeq: Int,
+        laneSpatial: Int,
+        kvDim: Int,
+        kvHeads: Int,
+        headDim: Int
+    ) throws(ANEError) {
+        do {
+            try SurfaceIO.copyFP16SpatialSlice(
+                dst: handles.kCacheFull,
+                dstChannelOffset: 0,
+                dstSpatialIndex: tokenIndex,
+                dstSpatial: maxSeq,
+                src: handles.kOut,
+                srcChannelOffset: 0,
+                srcSpatialIndex: 0,
+                srcSpatial: laneSpatial,
+                channels: kvDim
+            )
+
+            guard DecodeRuntimeOptions.repackVOutHeadMajor else {
+                try SurfaceIO.copyFP16SpatialSlice(
+                    dst: handles.vCacheFull,
+                    dstChannelOffset: 0,
+                    dstSpatialIndex: tokenIndex,
+                    dstSpatial: maxSeq,
+                    src: handles.vOut,
+                    srcChannelOffset: 0,
+                    srcSpatialIndex: 0,
+                    srcSpatial: laneSpatial,
+                    channels: kvDim
+                )
+                return
+            }
+
+            guard kvHeads > 0, headDim > 0, kvHeads * headDim == kvDim else {
+                throw ANEError.invalidArguments(
+                    "hybrid V-cache repack requires kvDim == kvHeads * headDim, got kvDim=\(kvDim) kvHeads=\(kvHeads) headDim=\(headDim)"
+                )
+            }
+
+            var rawV = [Float](repeating: 0, count: kvDim * laneSpatial)
+            rawV.withUnsafeMutableBufferPointer { destination in
+                SurfaceIO.readFP16(
+                    from: handles.vOut,
+                    into: destination,
+                    channelOffset: 0,
+                    channels: kvDim,
+                    spatial: laneSpatial
+                )
+            }
+            let repacked = rawV.withUnsafeBufferPointer { source in
+                repackVOutForSingleTokenExperiment(
+                    source: source,
+                    kvHeads: kvHeads,
+                    headDim: headDim,
+                    laneSpatial: laneSpatial,
+                    sourceSpatialIndex: 0
+                )
+            }
+            try repacked.withUnsafeBufferPointer { source in
+                try SurfaceIO.writeFP16SpatialSlice(
+                    to: handles.vCacheFull,
+                    channelOffset: 0,
+                    spatialIndex: tokenIndex,
+                    spatial: maxSeq,
+                    data: source,
+                    channels: kvDim
+                )
+            }
+        } catch let error as ANEError {
+            throw error
+        } catch {
+            throw .invalidArguments("hybrid V-cache update helper failed: \(error)")
+        }
+    }
+
     static func initializeDecodeCachesAndMask(
         surfaceHandles: [DecodeSurfaceHandles],
         dim: Int = ModelConfig.dim
@@ -649,11 +945,10 @@ public extension ForwardPass {
         guard let first = surfaceHandles.first else { return }
         let maxSeq = first.maxSeq
         precondition(maxSeq > 0)
-
-        let zeroContext = Array(repeating: Float(0), count: dim * first.laneSpatial)
         for handles in surfaceHandles {
             precondition(handles.maxSeq == maxSeq)
             precondition(handles.laneSpatial == first.laneSpatial)
+            let zeroContext = Array(repeating: Float(0), count: handles.qDim * handles.laneSpatial)
             // Use each handle's own kvDim — matches its cache allocation size
             let handleKVDim = handles.kvDim
             let zeroKVCache = Array(repeating: Float(0), count: handleKVDim * maxSeq)
@@ -705,8 +1000,12 @@ public extension ForwardPass {
         nHeads: Int = ModelConfig.heads,
         nKVHeads: Int? = nil,
         headDim: Int = ModelConfig.headDim,
-        postQKVHook: ((IOSurfaceRef, IOSurfaceRef, Int, Int) throws(ANEError) -> Void)? = nil,
+        preferCPUDecodeAttention: Bool = false,
+        qkvOverride: ((Int, HybridDecodeSurfaceHandles, Int, Int) throws -> Void)? = nil,
+        postQKVHook: ((Int, IOSurfaceRef, IOSurfaceRef, Int, Int) throws -> Void)? = nil,
         readFinalOutputIntoXCur: Bool = true,
+        cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = nil,
+        metalRoPEConfig: MetalAttentionKernel.MetalRoPEConfig? = nil,
         timings: inout HybridDecodeTimingBreakdown
     ) throws(ANEError) {
         precondition(kernels.count > 0)
@@ -743,7 +1042,11 @@ public extension ForwardPass {
             nHeads: nHeads,
             nKVHeads: nKVHeads,
             headDim: headDim,
+            preferCPUDecodeAttention: preferCPUDecodeAttention,
+            qkvOverride: qkvOverride,
             postQKVHook: postQKVHook,
+            cachedBindings: cachedBindings,
+            metalRoPEConfig: metalRoPEConfig,
             timings: &timings
         )
 
@@ -777,12 +1080,19 @@ public extension ForwardPass {
         nHeads: Int = ModelConfig.heads,
         nKVHeads: Int? = nil,
         headDim: Int = ModelConfig.headDim,
-        postQKVHook: ((IOSurfaceRef, IOSurfaceRef, Int, Int) throws(ANEError) -> Void)? = nil,
+        preferCPUDecodeAttention: Bool = false,
+        qkvOverride: ((Int, HybridDecodeSurfaceHandles, Int, Int) throws -> Void)? = nil,
+        postQKVHook: ((Int, IOSurfaceRef, IOSurfaceRef, Int, Int) throws -> Void)? = nil,
+        cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = nil,
+        metalRoPEConfig: MetalAttentionKernel.MetalRoPEConfig? = nil,
         timings: inout HybridDecodeTimingBreakdown
     ) throws(ANEError) {
         precondition(kernels.count > 0)
         precondition(surfaceHandles.count == kernels.count)
         precondition(dim > 0)
+        if let cached = cachedBindings {
+            precondition(cached.count == kernels.count, "cachedBindings count must match kernels count")
+        }
 
         let resolvedKVHeads = nKVHeads ?? nHeads
         let kvDim = resolvedKVHeads * headDim
@@ -795,90 +1105,381 @@ public extension ForwardPass {
         let tokenIndex = try decodeState.beginTokenStep()
         let visibleTokens = tokenIndex + 1
         let laneSpatial = surfaceHandles[0].laneSpatial
+        let useMetalFusedSDPA = DecodeRuntimeOptions.useMetalFusedSDPA
+        let useCPUDecodeAttention = preferCPUDecodeAttention || DecodeRuntimeOptions.useCPUDecodeAttention
         precondition(laneSpatial > 0)
         var t0 = RuntimeClock.now()
 
-        for layerIndex in 0..<kernels.count {
-            let handles = surfaceHandles[layerIndex]
+        let metalShape: MetalDecodeAttentionShape
+        do {
+            metalShape = try MetalDecodeAttentionShape(
+                heads: nHeads,
+                kvHeads: resolvedKVHeads,
+                headDim: headDim,
+                visibleTokens: visibleTokens,
+                cacheStride: maxSeq,
+                laneStride: laneSpatial
+            )
+        } catch {
+            throw .invalidArguments("hybrid metal shape invalid: \(error)")
+        }
 
-            t0 = RuntimeClock.now()
-            do {
-                try kernels[layerIndex].decodeQKVOnly.eval()
-            } catch {
-                throw .invalidArguments("decodeQKVOnly eval failed at layer \(layerIndex), token \(tokenIndex): \(error)")
-            }
-            timings.tAneQKV += RuntimeClock.ms(RuntimeClock.now() - t0)
+        // Pipelined path: overlap Metal SDPA[N] with ANE QKV[N+1]
+        if let cached = cachedBindings, (useMetalFusedSDPA || metalRoPEConfig != nil) {
+            var pendingMetal: MTLCommandBuffer? = nil
 
-            // Optional post-QKV hook (e.g. RoPE for llama models)
-            if let hook = postQKVHook {
+            for layerIndex in 0..<kernels.count {
+                let handles = surfaceHandles[layerIndex]
+
+                // Wait for previous layer's Metal before running its ANE ProjFFN
+                if let cb = pendingMetal {
+                    t0 = RuntimeClock.now()
+                    do {
+                        try metalAttention.waitForMetalCompletion(cb)
+                    } catch {
+                        throw .invalidArguments("Metal SDPA wait failed at layer \(layerIndex - 1): \(error)")
+                    }
+                    timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                    // Run previous layer's ANE ProjFFN (it reads the Metal context output)
+                    t0 = RuntimeClock.now()
+                    do {
+                        try kernels[layerIndex - 1].decodeProjection.eval()
+                        if !kernels[layerIndex - 1].usesFusedPostAttention {
+                            try kernels[layerIndex - 1].decodeFFN.eval()
+                        }
+                    } catch {
+                        throw .invalidArguments("hybrid ProjFFN pipelined failed at layer \(layerIndex - 1): \(error)")
+                    }
+                    timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                    // Chain previous layer's FFN output to this layer's QKV input
+                    t0 = RuntimeClock.now()
+                    do {
+                        try SurfaceIO.copyFP16SpatialSlice(
+                            dst: handles.qkvIn,
+                            dstChannelOffset: 0,
+                            dstSpatialIndex: 0,
+                            dstSpatial: laneSpatial,
+                            src: surfaceHandles[layerIndex - 1].ffnOut,
+                            srcChannelOffset: 0,
+                            srcSpatialIndex: 0,
+                            srcSpatial: laneSpatial,
+                            channels: dim
+                        )
+                    } catch {
+                        throw .invalidArguments("hybrid pipelined chain failed at layer \(layerIndex): \(error)")
+                    }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                }
+
+                // ANE QKV
                 t0 = RuntimeClock.now()
-                try hook(handles.qOut, handles.kOut, laneSpatial, tokenIndex)
-                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                do {
+                    if let qkvOverride {
+                        try qkvOverride(layerIndex, handles, laneSpatial, tokenIndex)
+                    } else {
+                        try kernels[layerIndex].decodeQKVOnly.eval()
+                    }
+                } catch {
+                    throw .invalidArguments("decodeQKVOnly eval failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                }
+                timings.tAneQKV += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                if let ropeConfig = metalRoPEConfig {
+                    // Phase 5: Metal RoPE + KV scatter + SDPA in one command buffer
+                    // CPU KV cache scatter still needed (Metal scatter writes to kCache which
+                    // is the same surface as kCacheFull here), but RoPE moves to Metal.
+                    t0 = RuntimeClock.now()
+                    do {
+                        // CPU KV cache scatter (still needed — Metal scatter requires locked surfaces
+                        // for kOut/vOut which aren't in the cached bindings)
+                        try updateHybridKVCacheSlices(
+                            handles: handles,
+                            tokenIndex: tokenIndex,
+                            maxSeq: maxSeq,
+                            laneSpatial: laneSpatial,
+                            kvDim: kvDim,
+                            kvHeads: resolvedKVHeads,
+                            headDim: headDim
+                        )
+                    } catch {
+                        throw .invalidArguments("hybrid KV cache update failed: \(error)")
+                    }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                    // Submit Metal RoPE + SDPA (non-blocking)
+                    do {
+                        pendingMetal = try metalAttention.submitFullPipelinedDecodeFromCachedBindings(
+                            cached: cached[layerIndex],
+                            shape: metalShape,
+                            ropeConfig: ropeConfig,
+                            tokenIndex: tokenIndex
+                        )
+                    } catch {
+                        throw .invalidArguments("Metal full pipeline submit failed at layer \(layerIndex): \(error)")
+                    }
+                } else {
+                    // RoPE hook (CPU)
+                    if let hook = postQKVHook {
+                        t0 = RuntimeClock.now()
+                        do {
+                            try hook(layerIndex, handles.qOut, handles.kOut, laneSpatial, tokenIndex)
+                        } catch let error as ANEError {
+                            throw error
+                        } catch {
+                            throw .invalidArguments("hybrid post-QKV hook failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                        }
+                        timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                    }
+
+                    // KV cache update (CPU)
+                    t0 = RuntimeClock.now()
+                    do {
+                        try updateHybridKVCacheSlices(
+                            handles: handles,
+                            tokenIndex: tokenIndex,
+                            maxSeq: maxSeq,
+                            laneSpatial: laneSpatial,
+                            kvDim: kvDim,
+                            kvHeads: resolvedKVHeads,
+                            headDim: headDim
+                        )
+                    } catch {
+                        throw .invalidArguments("hybrid KV cache update failed: \(error)")
+                    }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                    // Submit Metal SDPA only (non-blocking)
+                    do {
+                        pendingMetal = try metalAttention.submitFusedDecodeSDPAFromCachedBindings(
+                            cached: cached[layerIndex],
+                            shape: metalShape
+                        )
+                    } catch {
+                        throw .invalidArguments("Metal SDPA submit failed at layer \(layerIndex): \(error)")
+                    }
+                }
             }
 
-            t0 = RuntimeClock.now()
-            do {
-                try SurfaceIO.copyTwoFP16SpatialSlices(
-                    dst0: handles.kCacheFull,
-                    dst0ChannelOffset: 0,
-                    dst0SpatialIndex: tokenIndex,
-                    dst0Spatial: maxSeq,
-                    src0: handles.kOut,
-                    src0ChannelOffset: 0,
-                    src0SpatialIndex: 0,
-                    src0Spatial: laneSpatial,
-                    dst1: handles.vCacheFull,
-                    dst1ChannelOffset: 0,
-                    dst1SpatialIndex: tokenIndex,
-                    dst1Spatial: maxSeq,
-                    src1: handles.vOut,
-                    src1ChannelOffset: 0,
-                    src1SpatialIndex: 0,
-                    src1Spatial: laneSpatial,
-                    channels: kvDim
-                )
-            } catch {
-                throw .invalidArguments("hybrid KV cache update failed: \(error)")
-            }
-            timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
-
-            let metalShape: MetalDecodeAttentionShape
-            do {
-                metalShape = try MetalDecodeAttentionShape(
-                    heads: nHeads,
-                    kvHeads: resolvedKVHeads,
-                    headDim: headDim,
-                    visibleTokens: visibleTokens,
-                    cacheStride: maxSeq,
-                    laneStride: laneSpatial
-                )
-            } catch {
-                throw .invalidArguments("hybrid metal shape invalid: \(error)")
-            }
-
-            do {
+            // Finalize last layer: wait Metal + run ANE ProjFFN
+            if let cb = pendingMetal {
                 t0 = RuntimeClock.now()
-                try metalAttention.runDecodeContextIntoSurface(
-                    qSurface: handles.qOut,
-                    kCacheSurface: handles.kCacheFull,
-                    vCacheSurface: handles.vCacheFull,
-                    contextSurface: handles.projectionContextIn,
-                    shape: metalShape
-                )
+                do {
+                    try metalAttention.waitForMetalCompletion(cb)
+                } catch {
+                    throw .invalidArguments("Metal SDPA final wait failed: \(error)")
+                }
                 timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
 
+                let lastLayer = kernels.count - 1
                 t0 = RuntimeClock.now()
-                try kernels[layerIndex].decodeProjection.eval()
-                if !kernels[layerIndex].usesFusedPostAttention {
-                    try kernels[layerIndex].decodeFFN.eval()
+                do {
+                    try kernels[lastLayer].decodeProjection.eval()
+                    if !kernels[lastLayer].usesFusedPostAttention {
+                        try kernels[lastLayer].decodeFFN.eval()
+                    }
+                } catch {
+                    throw .invalidArguments("hybrid ProjFFN final failed: \(error)")
                 }
-            } catch {
-                let kernelName = kernels[layerIndex].usesFusedPostAttention
-                    ? "decodeProjectionFFN"
-                    : "decodeProjection+decodeFFN"
-                throw .invalidArguments("hybrid \(kernelName) failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
             }
-            timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
+        } else if let cached = cachedBindings {
+            // Serial cached-binding fallback for correctness bisects. This keeps
+            // the fresh per-dispatch surface bindings but bypasses the fused SDPA
+            // kernel and pipelining overlap.
+            for layerIndex in 0..<kernels.count {
+                let handles = surfaceHandles[layerIndex]
+
+                t0 = RuntimeClock.now()
+                do {
+                    if let qkvOverride {
+                        try qkvOverride(layerIndex, handles, laneSpatial, tokenIndex)
+                    } else {
+                        try kernels[layerIndex].decodeQKVOnly.eval()
+                    }
+                } catch {
+                    throw .invalidArguments("decodeQKVOnly eval failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                }
+                timings.tAneQKV += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                if let hook = postQKVHook {
+                    t0 = RuntimeClock.now()
+                    do {
+                        try hook(layerIndex, handles.qOut, handles.kOut, laneSpatial, tokenIndex)
+                    } catch let error as ANEError {
+                        throw error
+                    } catch {
+                        throw .invalidArguments("hybrid post-QKV hook failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                    }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                }
+
+                t0 = RuntimeClock.now()
+                do {
+                    try updateHybridKVCacheSlices(
+                        handles: handles,
+                        tokenIndex: tokenIndex,
+                        maxSeq: maxSeq,
+                        laneSpatial: laneSpatial,
+                        kvDim: kvDim,
+                        kvHeads: resolvedKVHeads,
+                        headDim: headDim
+                    )
+                } catch {
+                    throw .invalidArguments("hybrid KV cache update failed: \(error)")
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                do {
+                    t0 = RuntimeClock.now()
+                    try metalAttention.runDecodeContextFromCachedBindings(
+                        cached: cached[layerIndex],
+                        shape: metalShape
+                    )
+                    timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                    t0 = RuntimeClock.now()
+                    try kernels[layerIndex].decodeProjection.eval()
+                    if !kernels[layerIndex].usesFusedPostAttention {
+                        try kernels[layerIndex].decodeFFN.eval()
+                    }
+                } catch {
+                    let kernelName = kernels[layerIndex].usesFusedPostAttention
+                        ? "decodeProjectionFFN"
+                        : "decodeProjection+decodeFFN"
+                    throw .invalidArguments("hybrid \(kernelName) failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                }
+                timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                if layerIndex + 1 < kernels.count {
+                    t0 = RuntimeClock.now()
+                    do {
+                        try SurfaceIO.copyFP16SpatialSlice(
+                            dst: surfaceHandles[layerIndex + 1].qkvIn,
+                            dstChannelOffset: 0,
+                            dstSpatialIndex: 0,
+                            dstSpatial: laneSpatial,
+                            src: handles.ffnOut,
+                            srcChannelOffset: 0,
+                            srcSpatialIndex: 0,
+                            srcSpatial: laneSpatial,
+                            channels: dim
+                        )
+                    } catch {
+                        throw .invalidArguments("hybrid ffn->next-layer chain failed at layer \(layerIndex): \(error)")
+                    }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                }
+            }
+        } else {
+            // Non-pipelined fallback: serial ANE QKV → Metal SDPA → ANE ProjFFN
+            for layerIndex in 0..<kernels.count {
+                let handles = surfaceHandles[layerIndex]
+
+                t0 = RuntimeClock.now()
+                do {
+                    if let qkvOverride {
+                        try qkvOverride(layerIndex, handles, laneSpatial, tokenIndex)
+                    } else {
+                        try kernels[layerIndex].decodeQKVOnly.eval()
+                    }
+                } catch {
+                    throw .invalidArguments("decodeQKVOnly eval failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                }
+                timings.tAneQKV += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                if let hook = postQKVHook {
+                    t0 = RuntimeClock.now()
+                    do {
+                        try hook(layerIndex, handles.qOut, handles.kOut, laneSpatial, tokenIndex)
+                    } catch let error as ANEError {
+                        throw error
+                    } catch {
+                        throw .invalidArguments("hybrid post-QKV hook failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                    }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                }
+
+                t0 = RuntimeClock.now()
+                do {
+                    try updateHybridKVCacheSlices(
+                        handles: handles,
+                        tokenIndex: tokenIndex,
+                        maxSeq: maxSeq,
+                        laneSpatial: laneSpatial,
+                        kvDim: kvDim,
+                        kvHeads: resolvedKVHeads,
+                        headDim: headDim
+                    )
+                } catch {
+                    throw .invalidArguments("hybrid KV cache update failed: \(error)")
+                }
+                timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                do {
+                    t0 = RuntimeClock.now()
+                    if useCPUDecodeAttention {
+                        try writeCPUDecodeContextIntoSurface(
+                            handles: handles,
+                            heads: nHeads,
+                            kvHeads: resolvedKVHeads,
+                            headDim: headDim,
+                            visibleTokens: visibleTokens,
+                            cacheStride: maxSeq
+                        )
+                    } else if useMetalFusedSDPA {
+                        try metalAttention.runFusedDecodeSDPAIntoSurface(
+                            qSurface: handles.qOut,
+                            kCacheSurface: handles.kCacheFull,
+                            vCacheSurface: handles.vCacheFull,
+                            contextSurface: handles.projectionContextIn,
+                            shape: metalShape
+                        )
+                    } else {
+                        try metalAttention.runDecodeContextIntoSurface(
+                            qSurface: handles.qOut,
+                            kCacheSurface: handles.kCacheFull,
+                            vCacheSurface: handles.vCacheFull,
+                            contextSurface: handles.projectionContextIn,
+                            shape: metalShape
+                        )
+                    }
+                    timings.tMetal += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                    t0 = RuntimeClock.now()
+                    try kernels[layerIndex].decodeProjection.eval()
+                    if !kernels[layerIndex].usesFusedPostAttention {
+                        try kernels[layerIndex].decodeFFN.eval()
+                    }
+                } catch {
+                    let kernelName = kernels[layerIndex].usesFusedPostAttention
+                        ? "decodeProjectionFFN"
+                        : "decodeProjection+decodeFFN"
+                    throw .invalidArguments("hybrid \(kernelName) failed at layer \(layerIndex), token \(tokenIndex): \(error)")
+                }
+                timings.tAneFFN += RuntimeClock.ms(RuntimeClock.now() - t0)
+
+                if layerIndex + 1 < kernels.count {
+                    t0 = RuntimeClock.now()
+                    do {
+                        try SurfaceIO.copyFP16SpatialSlice(
+                            dst: surfaceHandles[layerIndex + 1].qkvIn,
+                            dstChannelOffset: 0,
+                            dstSpatialIndex: 0,
+                            dstSpatial: laneSpatial,
+                            src: handles.ffnOut,
+                            srcChannelOffset: 0,
+                            srcSpatialIndex: 0,
+                            srcSpatial: laneSpatial,
+                            channels: dim
+                        )
+                    } catch {
+                        throw .invalidArguments("hybrid ffn->next-layer chain failed at layer \(layerIndex): \(error)")
+                    }
+                    timings.tIO += RuntimeClock.ms(RuntimeClock.now() - t0)
+                }
+            }
         }
 
         try decodeState.commitTokenStep(expectedIndex: tokenIndex)
@@ -1529,6 +2130,39 @@ private func writeFP32(
         throw .invalidArguments("IOSurface base address unavailable for fp32 write")
     }
     memcpy(IOSurfaceGetBaseAddress(surface), source, byteCount)
+}
+
+private func writeFP32SpatialSlice(
+    to surface: IOSurfaceRef,
+    data: UnsafeBufferPointer<Float>,
+    spatialIndex: Int,
+    spatial: Int,
+    channels: Int
+) throws(ANEError) {
+    guard spatial > 0 else {
+        throw .invalidArguments("FP32 spatial-slice write requires spatial > 0")
+    }
+    guard spatialIndex >= 0 && spatialIndex < spatial else {
+        throw .invalidArguments("FP32 spatial-slice write index \(spatialIndex) is out of bounds for spatial \(spatial)")
+    }
+    guard data.count == channels else {
+        throw .invalidArguments("FP32 spatial-slice write expected \(channels) values, got \(data.count)")
+    }
+    let requiredBytes = channels * spatial * MemoryLayout<Float>.stride
+    guard IOSurfaceGetAllocSize(surface) >= requiredBytes else {
+        throw .invalidArguments("IOSurface too small for \(requiredBytes)-byte fp32 spatial-slice write")
+    }
+    guard IOSurfaceLock(surface, [], nil) == kIOReturnSuccess else {
+        throw .invalidArguments("IOSurface lock failed for fp32 spatial-slice write")
+    }
+    defer { IOSurfaceUnlock(surface, [], nil) }
+    guard let source = data.baseAddress else {
+        throw .invalidArguments("IOSurface base address unavailable for fp32 spatial-slice write")
+    }
+    let baseAddress = IOSurfaceGetBaseAddress(surface).assumingMemoryBound(to: Float.self)
+    for channel in 0..<channels {
+        baseAddress[channel * spatial + spatialIndex] = source[channel]
+    }
 }
 
 public extension ForwardPass {

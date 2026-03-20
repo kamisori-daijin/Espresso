@@ -12,28 +12,34 @@ import ANEGraphIR
 /// Output:
 /// - `x + ffn(norm(x))` where `x = Wo(context) + bias + residual`: `[1, dim, 1, laneSpatial]` fp16
 public struct DecodeProjectionFFNGenerator: MILProgramGenerator {
+    public let contextDim: Int
     public let dim: Int
     public let hiddenDim: Int
     public let laneSpatial: Int
     public let architecture: LayerWeightsArchitecture
+    public let normEps: Float
 
     public init(
+        contextDim: Int? = nil,
         dim: Int = ModelConfig.dim,
         hiddenDim: Int = ModelConfig.hidden,
         laneSpatial: Int = 32,
-        architecture: LayerWeightsArchitecture = .rmsNormSwiGLU
+        architecture: LayerWeightsArchitecture = .rmsNormSwiGLU,
+        normEps: Float = 1e-5
     ) {
         precondition(dim > 0)
         precondition(hiddenDim > 0)
         precondition(laneSpatial > 0)
+        self.contextDim = contextDim ?? dim
         self.dim = dim
         self.hiddenDim = hiddenDim
         self.laneSpatial = laneSpatial
         self.architecture = architecture
+        self.normEps = normEps
     }
 
     public var inputBytes: Int {
-        dim * laneSpatial * MemoryLayout<Float>.stride
+        contextDim * laneSpatial * MemoryLayout<Float>.stride
     }
 
     public var inputByteSizes: [Int] {
@@ -49,10 +55,11 @@ public struct DecodeProjectionFFNGenerator: MILProgramGenerator {
 
     public var milText: String {
         LegacyGraphSupport.emitGraph { graph in
+            let copyXBranches = ProcessInfo.processInfo.environment["ESPRESSO_FUSED_POST_ATTENTION_COPY_X"] == "1"
             let context = try LegacyGraphSupport.input(
                 &graph,
                 name: "context",
-                channels: dim,
+                channels: contextDim,
                 spatial: laneSpatial,
                 dtype: .fp32
             )
@@ -66,25 +73,34 @@ public struct DecodeProjectionFFNGenerator: MILProgramGenerator {
             let projected = try graph.linear(
                 "proj",
                 input: context16,
-                inDim: dim,
+                inDim: contextDim,
                 outDim: dim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wo.bin",
                 biasPath: architecture == .gpt2 ? "@model_path/weights/bo.bin" : nil
             )
             let x = try graph.add("x", x: projected, y: residual)
+            let xForNorm: Int
+            let xForResidual: Int
+            if copyXBranches {
+                let one = try LegacyGraphSupport.scalar(&graph, name: "copy_one", value: 1.0)
+                xForNorm = try graph.mul("x_for_norm", x: x, y: one)
+                xForResidual = try graph.mul("x_for_residual", x: x, y: one)
+            } else {
+                xForNorm = x
+                xForResidual = x
+            }
 
-            let normalized: Int
             let y: Int
 
             switch architecture {
             case .rmsNormSwiGLU:
-                normalized = try graph.rmsNorm(
+                let normalized = try graph.rmsNorm(
                     "norm",
-                    input: x,
+                    input: xForNorm,
                     dim: dim,
                     spatial: laneSpatial,
-                    eps: 0.00001,
+                    eps: normEps,
                     weightPath: "@model_path/weights/rms2.bin"
                 )
                 y = try graph.swigluFFN(
@@ -98,12 +114,12 @@ public struct DecodeProjectionFFNGenerator: MILProgramGenerator {
                     w2Path: "@model_path/weights/w2.bin"
                 )
             case .gpt2:
-                normalized = try graph.layerNorm(
+                let normalized = try graph.layerNorm(
                     "norm",
-                    input: x,
+                    input: xForNorm,
                     dim: dim,
                     spatial: laneSpatial,
-                    eps: 0.00001,
+                    eps: normEps,
                     gammaPath: "@model_path/weights/rms2.bin",
                     betaPath: "@model_path/weights/rms2_beta.bin"
                 )
@@ -121,7 +137,7 @@ public struct DecodeProjectionFFNGenerator: MILProgramGenerator {
                 )
             }
 
-            let out = try graph.add("out", x: x, y: y)
+            let out = try graph.add("out", x: xForResidual, y: y)
             try LegacyGraphSupport.setOutputs(&graph, [("out", out)])
         }
     }

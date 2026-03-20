@@ -72,6 +72,17 @@ final class HybridDecodeKernelSetTests: XCTestCase {
         XCTAssertFalse(specs[2].milText.contains("w3.bin"))
     }
 
+    func test_compile_specs_thread_custom_norm_epsilon_into_hybrid_decode_generators() {
+        let weights = makeHybridTestLayerWeights().withNormEps(1e-6)
+        let specs = HybridDecodeKernelSet.compileSpecs(weights: weights, maxSeq: 17)
+
+        XCTAssertEqual(specs.count, 3)
+        XCTAssertTrue(specs[0].milText.contains("0.000001"))
+        XCTAssertTrue(specs[2].milText.contains("0.000001"))
+        XCTAssertFalse(specs[0].milText.contains("0.00001"))
+        XCTAssertFalse(specs[2].milText.contains("0.00001"))
+    }
+
     func test_hybrid_decode_kernel_set_compiles_on_hardware() throws {
         try requireHybridANEHardware()
         let weights = makeHybridTestLayerWeights()
@@ -84,11 +95,17 @@ final class HybridDecodeKernelSetTests: XCTestCase {
 
 private extension LayerWeights {
     func withArchitecture(_ architecture: LayerWeightsArchitecture) -> LayerWeights {
-        let rewritten = LayerWeights(architecture: architecture, dim: dim, hiddenDim: hiddenDim)
+        let rewritten = LayerWeights(
+            architecture: architecture,
+            dim: dim,
+            hiddenDim: hiddenDim,
+            normEps: normEps
+        )
 
         func copy(_ src: borrowing TensorBuffer, _ dst: borrowing TensorBuffer) {
             dst.withUnsafeMutableBufferPointer { dstPtr in
                 src.withUnsafeBufferPointer { srcPtr in
+                    guard srcPtr.count > 0 else { return }
                     dstPtr.baseAddress?.update(from: srcPtr.baseAddress!, count: srcPtr.count)
                 }
             }
@@ -119,6 +136,48 @@ private extension LayerWeights {
         fill(rewritten.bo, 0.01)
         fill(rewritten.b1, 0.01)
         fill(rewritten.b2, 0.01)
+        return rewritten
+    }
+
+    func withNormEps(_ normEps: Float) -> LayerWeights {
+        let rewritten = LayerWeights(
+            architecture: architecture,
+            dim: dim,
+            hiddenDim: hiddenDim,
+            qDim: qDim,
+            kvDim: kvDim,
+            normEps: normEps,
+            qNormDim: hasQNorm ? qNorm.count : nil,
+            kNormDim: hasKNorm ? kNorm.count : nil
+        )
+
+        func copy(_ src: borrowing TensorBuffer, _ dst: borrowing TensorBuffer) {
+            dst.withUnsafeMutableBufferPointer { dstPtr in
+                src.withUnsafeBufferPointer { srcPtr in
+                    dstPtr.baseAddress?.update(from: srcPtr.baseAddress!, count: srcPtr.count)
+                }
+            }
+        }
+
+        copy(Wq, rewritten.Wq)
+        copy(Wk, rewritten.Wk)
+        copy(Wv, rewritten.Wv)
+        copy(Wo, rewritten.Wo)
+        copy(W1, rewritten.W1)
+        copy(W2, rewritten.W2)
+        copy(W3, rewritten.W3)
+        copy(rmsAtt, rewritten.rmsAtt)
+        copy(rmsFfn, rewritten.rmsFfn)
+        copy(qNorm, rewritten.qNorm)
+        copy(kNorm, rewritten.kNorm)
+        copy(attentionNormBeta, rewritten.attentionNormBeta)
+        copy(ffnNormBeta, rewritten.ffnNormBeta)
+        copy(bq, rewritten.bq)
+        copy(bk, rewritten.bk)
+        copy(bv, rewritten.bv)
+        copy(bo, rewritten.bo)
+        copy(b1, rewritten.b1)
+        copy(b2, rewritten.b2)
         return rewritten
     }
 }

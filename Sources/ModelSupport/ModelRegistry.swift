@@ -72,6 +72,23 @@ public enum ModelRegistry {
         architecture: .llama
     )
 
+    /// Local Llama 3.2 1B artifact compiled for the ctx512 benchmark/debug path.
+    public static let llama3_2_1b_ctx512 = MultiModelConfig(
+        name: "llama3_2_1b_ctx512",
+        nLayer: 16,
+        nHead: 32,
+        nKVHead: 8,
+        dModel: 2_048,
+        headDim: 64,
+        hiddenDim: 8_192,
+        vocab: 128_256,
+        maxSeq: 512,
+        normEps: 1e-5,
+        ropeTheta: 500_000.0,
+        eosToken: 128_001,
+        architecture: .llama
+    )
+
     /// Llama 3.2 3B — GQA (nKVHead=8), SwiGLU, RMSNorm, RoPE theta=500000.
     public static let llama3_2_3b = MultiModelConfig(
         name: "llama3_2_3b",
@@ -95,6 +112,7 @@ public enum ModelRegistry {
         smolLM_135m.name: smolLM_135m,
         tinyLlama_1_1b.name: tinyLlama_1_1b,
         llama3_2_1b.name: llama3_2_1b,
+        llama3_2_1b_ctx512.name: llama3_2_1b_ctx512,
         llama3_2_3b.name: llama3_2_3b,
     ]
 

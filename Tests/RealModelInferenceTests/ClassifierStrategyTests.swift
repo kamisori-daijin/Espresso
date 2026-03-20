@@ -35,7 +35,7 @@ import Espresso
         architecture: .llama
     )
     // 32000 * 2048 = 65_536_000 elements > 16_000_000
-    #expect(ClassifierStrategy.select(for: config) == .cpuTiled)
+    #expect(ClassifierStrategy.select(for: config) == .cpuExact)
 }
 
 @Test func qwen3VocabSelectsCPU() {
@@ -53,7 +53,7 @@ import Espresso
         architecture: .llama
     )
     // 151936 * 1024 = 155_582_464 elements >> 16_000_000
-    #expect(ClassifierStrategy.select(for: config) == .cpuTiled)
+    #expect(ClassifierStrategy.select(for: config) == .cpuExact)
 }
 
 @Test func exactThresholdSelectsANE() {
@@ -75,7 +75,7 @@ import Espresso
 }
 
 @Test func oneOverThresholdSelectsCPU() {
-    // 250_001 * 64 == 16_000_064 > 16_000_000 → should be .cpuTiled
+    // 250_001 * 64 == 16_000_064 > 16_000_000 → should be .cpuExact
     let config = MultiModelConfig(
         name: "boundary-plus-one",
         nLayer: 1,
@@ -89,7 +89,7 @@ import Espresso
         normEps: 1e-5,
         architecture: .llama
     )
-    #expect(ClassifierStrategy.select(for: config) == .cpuTiled)
+    #expect(ClassifierStrategy.select(for: config) == .cpuExact)
 }
 
 @Test func cpuTiledArgmaxCorrectness() {

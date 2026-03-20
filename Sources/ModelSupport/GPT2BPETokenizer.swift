@@ -4,9 +4,15 @@ public enum GPT2BPETokenizerError: Error, Sendable, Equatable {
     case malformedVocabulary
     case emptyVocabulary
     case nonContiguousTokenIDs(expectedCount: Int, actualMaxTokenID: Int)
+    case malformedTokenizerJSON
+    case unsupportedTokenizerModel(String)
+    case invalidPreTokenizerPattern(String)
 }
 
 public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
+    private static let defaultPreTokenizerPattern =
+        "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+"
+
     public let vocabSize: Int
 
     private let encoder: [String: Int]
@@ -15,72 +21,64 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
     private let byteToUnicode: [UnicodeScalar]
     private let unicodeToByte: [UInt32: UInt8]
     private let preTokenizer: NSRegularExpression
+    private let prefixTokenIDs: [Int]
+    private let skippedTokenIDs: Set<Int>
     private let cacheLock = NSLock()
     private var cache: [String: [String]] = [:]
 
-    public init(vocabURL: URL, mergesURL: URL) throws {
+    public convenience init(vocabURL: URL, mergesURL: URL) throws {
         let vocabData = try Data(contentsOf: vocabURL)
         let rawObject = try JSONSerialization.jsonObject(with: vocabData)
         guard let rawVocab = rawObject as? [String: Any] else {
             throw GPT2BPETokenizerError.malformedVocabulary
         }
-        guard !rawVocab.isEmpty else {
-            throw GPT2BPETokenizerError.emptyVocabulary
-        }
-
-        var encoder: [String: Int] = [:]
-        encoder.reserveCapacity(rawVocab.count)
-        for (token, value) in rawVocab {
-            guard let number = value as? NSNumber else {
-                throw GPT2BPETokenizerError.malformedVocabulary
-            }
-            encoder[token] = number.intValue
-        }
-        self.encoder = encoder
-
-        let maxTokenID = encoder.values.max() ?? -1
-        guard maxTokenID >= 0 else {
-            throw GPT2BPETokenizerError.emptyVocabulary
-        }
-        guard maxTokenID + 1 == encoder.count else {
-            throw GPT2BPETokenizerError.nonContiguousTokenIDs(
-                expectedCount: encoder.count,
-                actualMaxTokenID: maxTokenID
-            )
-        }
-        var decoder = Array(repeating: "", count: maxTokenID + 1)
-        for (token, id) in encoder where decoder.indices.contains(id) {
-            decoder[id] = token
-        }
-        self.decoder = decoder
-        self.vocabSize = decoder.count
 
         let merges = try String(contentsOf: mergesURL, encoding: .utf8)
-        var bpeRanks: [TokenPair: Int] = [:]
-        var rank = 0
-        for line in merges.split(separator: "\n").map(String.init) {
-            if line.isEmpty || line.hasPrefix("#") {
-                continue
-            }
-            let pieces = line.split(separator: " ", omittingEmptySubsequences: true)
-            guard pieces.count == 2 else { continue }
-            bpeRanks[TokenPair(String(pieces[0]), String(pieces[1]))] = rank
-            rank += 1
-        }
-        self.bpeRanks = bpeRanks
+        try self.init(
+            encoder: try Self.parseVocabulary(rawVocab),
+            merges: merges.split(separator: "\n").map(String.init),
+            preTokenizerPattern: Self.defaultPreTokenizerPattern,
+            prefixTokenIDs: [],
+            skippedTokenIDs: []
+        )
+    }
 
-        let mapping = Self.makeByteMapping()
-        self.byteToUnicode = mapping.byteToUnicode
-        self.unicodeToByte = mapping.unicodeToByte
-        self.preTokenizer = try NSRegularExpression(
-            pattern: "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+"
+    public convenience init(tokenizerJSONURL: URL) throws {
+        let data = try Data(contentsOf: tokenizerJSONURL)
+        let rawObject = try JSONSerialization.jsonObject(with: data)
+        guard let root = rawObject as? [String: Any],
+              let model = root["model"] as? [String: Any] else {
+            throw GPT2BPETokenizerError.malformedTokenizerJSON
+        }
+
+        let modelType = model["type"] as? String ?? "unknown"
+        guard modelType == "BPE" else {
+            throw GPT2BPETokenizerError.unsupportedTokenizerModel(modelType)
+        }
+
+        guard let rawVocab = model["vocab"] as? [String: Any] else {
+            throw GPT2BPETokenizerError.malformedTokenizerJSON
+        }
+
+        var encoder = try Self.parseVocabulary(rawVocab)
+        let skippedTokenIDs = Self.mergeAddedTokens(from: root, into: &encoder)
+        let merges = try Self.parseTokenizerJSONMerges(model["merges"])
+        let preTokenizerPattern = Self.preTokenizerPattern(from: root) ?? Self.defaultPreTokenizerPattern
+        let prefixTokenIDs = Self.prefixTokenIDs(from: root, encoder: encoder)
+
+        try self.init(
+            encoder: encoder,
+            merges: merges,
+            preTokenizerPattern: preTokenizerPattern,
+            prefixTokenIDs: prefixTokenIDs,
+            skippedTokenIDs: skippedTokenIDs
         )
     }
 
     public func encode(_ text: String) -> [Int] {
         let nsText = text as NSString
         let matches = preTokenizer.matches(in: text, range: NSRange(location: 0, length: nsText.length))
-        var tokens: [Int] = []
+        var tokens = prefixTokenIDs
 
         for match in matches {
             let chunk = nsText.substring(with: match.range)
@@ -97,6 +95,9 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
     public func decode(_ tokens: [Int]) -> String {
         var bytes: [UInt8] = []
         for token in tokens where decoder.indices.contains(token) {
+            if skippedTokenIDs.contains(token) {
+                continue
+            }
             let piece = decoder[token]
             for scalar in piece.unicodeScalars {
                 if let byte = unicodeToByte[scalar.value] {
@@ -107,6 +108,61 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
             }
         }
         return String(decoding: bytes, as: UTF8.self)
+    }
+
+    private init(
+        encoder: [String: Int],
+        merges: [String],
+        preTokenizerPattern: String,
+        prefixTokenIDs: [Int],
+        skippedTokenIDs: Set<Int>
+    ) throws {
+        guard !encoder.isEmpty else {
+            throw GPT2BPETokenizerError.emptyVocabulary
+        }
+        self.encoder = encoder
+
+        let maxTokenID = encoder.values.max() ?? -1
+        guard maxTokenID >= 0 else {
+            throw GPT2BPETokenizerError.emptyVocabulary
+        }
+        guard maxTokenID + 1 == encoder.count else {
+            throw GPT2BPETokenizerError.nonContiguousTokenIDs(
+                expectedCount: encoder.count,
+                actualMaxTokenID: maxTokenID
+            )
+        }
+
+        var decoder = Array(repeating: "", count: maxTokenID + 1)
+        for (token, id) in encoder where decoder.indices.contains(id) {
+            decoder[id] = token
+        }
+        self.decoder = decoder
+        self.vocabSize = decoder.count
+        self.prefixTokenIDs = prefixTokenIDs
+        self.skippedTokenIDs = skippedTokenIDs
+
+        var bpeRanks: [TokenPair: Int] = [:]
+        var rank = 0
+        for line in merges {
+            if line.isEmpty || line.hasPrefix("#") {
+                continue
+            }
+            let pieces = line.split(separator: " ", omittingEmptySubsequences: true)
+            guard pieces.count == 2 else { continue }
+            bpeRanks[TokenPair(String(pieces[0]), String(pieces[1]))] = rank
+            rank += 1
+        }
+        self.bpeRanks = bpeRanks
+
+        let mapping = Self.makeByteMapping()
+        self.byteToUnicode = mapping.byteToUnicode
+        self.unicodeToByte = mapping.unicodeToByte
+        do {
+            self.preTokenizer = try NSRegularExpression(pattern: preTokenizerPattern)
+        } catch {
+            throw GPT2BPETokenizerError.invalidPreTokenizerPattern(preTokenizerPattern)
+        }
     }
 
     private func encodeBytes(of text: String) -> String {
@@ -201,6 +257,125 @@ public final class GPT2BPETokenizer: Tokenizer, @unchecked Sendable {
         }
 
         return (byteToUnicode, unicodeToByte)
+    }
+
+    private static func parseVocabulary(_ rawVocab: [String: Any]) throws -> [String: Int] {
+        guard !rawVocab.isEmpty else {
+            throw GPT2BPETokenizerError.emptyVocabulary
+        }
+
+        var encoder: [String: Int] = [:]
+        encoder.reserveCapacity(rawVocab.count)
+        for (token, value) in rawVocab {
+            guard let number = value as? NSNumber else {
+                throw GPT2BPETokenizerError.malformedVocabulary
+            }
+            encoder[token] = number.intValue
+        }
+        return encoder
+    }
+
+    private static func mergeAddedTokens(from root: [String: Any], into encoder: inout [String: Int]) -> Set<Int> {
+        guard let addedTokens = root["added_tokens"] as? [[String: Any]] else {
+            return []
+        }
+        var skippedTokenIDs = Set<Int>()
+        for token in addedTokens {
+            guard let id = (token["id"] as? NSNumber)?.intValue,
+                  let content = token["content"] as? String else {
+                continue
+            }
+            encoder[content] = id
+            if (token["special"] as? Bool) == true {
+                skippedTokenIDs.insert(id)
+            }
+        }
+        return skippedTokenIDs
+    }
+
+    private static func parseTokenizerJSONMerges(_ rawMerges: Any?) throws -> [String] {
+        guard let rawMerges else {
+            throw GPT2BPETokenizerError.malformedTokenizerJSON
+        }
+        if let merges = rawMerges as? [String] {
+            return merges
+        }
+        if let merges = rawMerges as? [[String]] {
+            return merges.compactMap { merge in
+                guard merge.count == 2 else { return nil }
+                return "\(merge[0]) \(merge[1])"
+            }
+        }
+        throw GPT2BPETokenizerError.malformedTokenizerJSON
+    }
+
+    private static func preTokenizerPattern(from root: [String: Any]) -> String? {
+        if let preTokenizer = root["pre_tokenizer"] as? [String: Any] {
+            return regexPattern(in: preTokenizer)
+        }
+        return nil
+    }
+
+    private static func regexPattern(in preTokenizer: [String: Any]) -> String? {
+        if let pattern = (preTokenizer["pattern"] as? [String: Any])?["Regex"] as? String {
+            return pattern
+        }
+        if let preTokenizers = preTokenizer["pretokenizers"] as? [[String: Any]] {
+            for entry in preTokenizers {
+                if let pattern = regexPattern(in: entry) {
+                    return pattern
+                }
+            }
+        }
+        return nil
+    }
+
+    private static func prefixTokenIDs(from root: [String: Any], encoder: [String: Int]) -> [Int] {
+        if let postProcessor = root["post_processor"] as? [String: Any] {
+            if let prefix = prefixTokenIDs(in: postProcessor), !prefix.isEmpty {
+                return prefix
+            }
+        }
+        if let bosID = encoder["<|begin_of_text|>"] {
+            return [bosID]
+        }
+        return []
+    }
+
+    private static func prefixTokenIDs(in processor: [String: Any]) -> [Int]? {
+        if let processors = processor["processors"] as? [[String: Any]] {
+            for entry in processors {
+                if let prefix = prefixTokenIDs(in: entry) {
+                    return prefix
+                }
+            }
+        }
+
+        if let specialTokens = processor["special_tokens"] as? [String: Any],
+           let bos = specialTokens["<|begin_of_text|>"] as? [String: Any],
+           let rawIDs = bos["ids"] as? [Any] {
+            let ids = rawIDs.compactMap { ($0 as? NSNumber)?.intValue }
+            if !ids.isEmpty {
+                return ids
+            }
+        }
+
+        guard let single = processor["single"] as? [[String: Any]] else {
+            return nil
+        }
+
+        var prefix: [Int] = []
+        for item in single {
+            if let special = item["SpecialToken"] as? [String: Any],
+               let rawIDs = special["ids"] as? [Any] {
+                prefix.append(contentsOf: rawIDs.compactMap { ($0 as? NSNumber)?.intValue })
+                continue
+            }
+            if item["Sequence"] != nil {
+                break
+            }
+        }
+        return prefix
     }
 }
 

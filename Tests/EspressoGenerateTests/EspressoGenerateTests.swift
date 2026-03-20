@@ -1,7 +1,49 @@
 import Foundation
 import Testing
 import ANETypes
+import ModelSupport
 @testable import EspressoGenerate
+
+@Test func test_normalizeHiddenForCoreMLReferenceUsesLayerNormForGPT2() {
+    let hidden: [Float] = [1, 2, 3, 4]
+    let gamma: [Float] = [1, 1, 1, 1]
+    let beta: [Float] = [0.5, 0.5, 0.5, 0.5]
+    let output = normalizeHiddenForCoreMLReference(
+        architecture: .gpt2,
+        hidden: hidden,
+        epsilon: 1e-5,
+        gamma: gamma,
+        beta: beta
+    )
+
+    let mean: Float = 2.5
+    let variance: Float = 1.25
+    let inverseStd = 1.0 / sqrtf(variance + 1e-5)
+    let expected = hidden.map { (($0 - mean) * inverseStd) + 0.5 }
+
+    for index in output.indices {
+        #expect(abs(output[index] - expected[index]) < 1e-5)
+    }
+}
+
+@Test func test_normalizeHiddenForCoreMLReferenceUsesRMSNormForLlama() {
+    let hidden: [Float] = [1, 2, 3, 4]
+    let gamma: [Float] = [1, 1, 1, 1]
+    let output = normalizeHiddenForCoreMLReference(
+        architecture: .llama,
+        hidden: hidden,
+        epsilon: 1e-5,
+        gamma: gamma,
+        beta: nil
+    )
+
+    let rms = sqrtf((1 + 4 + 9 + 16) / 4 + 1e-5)
+    let expected = hidden.map { $0 / rms }
+
+    for index in output.indices {
+        #expect(abs(output[index] - expected[index]) < 1e-5)
+    }
+}
 
 @Test func test_optionsParseSubcommandsAndFlags() throws {
     let options = try Options.parse([
@@ -23,6 +65,214 @@ import ANETypes
     #expect(options.seed == 77)
     #expect(options.maxTokens == 16)
     #expect(options.positionalPrompt == ["Hello"])
+}
+
+@Test func test_optionsParseSuiteFlags() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "suite",
+        "--prompts", "/tmp/prompts.txt",
+        "--runs", "4",
+        "--results-tsv", "/tmp/results.tsv",
+        "--no-cold",
+        "--compare-warmup", "2",
+        "--compare-iterations", "5",
+    ])
+
+    #expect(options.command == .suite)
+    #expect(options.promptsFile == "/tmp/prompts.txt")
+    #expect(options.suiteRuns == 4)
+    #expect(options.resultsTSV == "/tmp/results.tsv")
+    #expect(!options.includeColdRun)
+    #expect(options.compareWarmup == 2)
+    #expect(options.compareIterations == 5)
+}
+
+@Test func test_optionsParseGenerateBenchmarkFlags() throws {
+    let options = try Options.parse([
+        "espresso-generate",
+        "generate",
+        "--benchmark-generate",
+        "--compare-warmup", "2",
+        "--compare-iterations", "4",
+        "--json",
+        "Hello",
+    ])
+
+    #expect(options.command == .generate)
+    #expect(options.benchmarkGenerate)
+    #expect(options.compareWarmup == 2)
+    #expect(options.compareIterations == 4)
+    #expect(options.jsonOutput)
+    #expect(options.positionalPrompt == ["Hello"])
+}
+
+@Test func test_metadataConfigFilePreservesOptionalRopeThetaAndEOSToken() throws {
+    let metadata = MetadataConfigFile(
+        name: "qwen3",
+        nLayer: 28,
+        nHead: 16,
+        nKVHead: 8,
+        dModel: 1024,
+        headDim: 128,
+        hiddenDim: 3072,
+        vocab: 151936,
+        maxSeq: 40960,
+        normEps: 1e-6,
+        ropeTheta: 1_000_000,
+        eosToken: 151645,
+        architecture: "llama"
+    )
+
+    let config = try metadata.asConfig()
+    #expect(config.ropeTheta == 1_000_000)
+    #expect(config.eosToken == 151645)
+}
+
+@Test func test_resolveCoreMLModelPathUsesExplicitPathForLlama() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let weightsDir = root.appendingPathComponent("weights", isDirectory: true)
+    let tokenizerDir = root.appendingPathComponent("tokenizer", isDirectory: true)
+    let explicitModel = root.appendingPathComponent("llama3_2_1b.mlpackage", isDirectory: true)
+    try fileManager.createDirectory(at: weightsDir, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: tokenizerDir, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: explicitModel, withIntermediateDirectories: true)
+
+    let defaults = DemoDefaults(
+        repoRoot: root,
+        workingDirectory: root,
+        stateRoot: root,
+        cacheRoot: root,
+        reportsRoot: root,
+        hfCacheRoot: root,
+        weightsDir: weightsDir,
+        tokenizerDir: tokenizerDir,
+        coreMLDir: root,
+        toolsVenvDir: root,
+        scriptsDir: nil,
+        legacyArtifactsRoot: nil
+    )
+    let invocation = ResolvedInvocation(
+        config: try #require(ModelRegistry.config(named: "llama3_2_1b")),
+        weightsDir: weightsDir.path,
+        tokenizerDir: tokenizerDir.path,
+        prompt: "",
+        maxTokens: 16,
+        temperature: 0,
+        showStats: false,
+        coreMLModelPath: explicitModel.path,
+        coreMLSequenceLength: nil,
+        compareWarmup: 0,
+        compareIterations: 1,
+        coreMLComputeUnits: "cpu_only",
+        allowBootstrap: false,
+        seed: 1234,
+        outputDir: nil
+    )
+
+    let resolved = try resolveCoreMLModelPath(invocation: invocation, defaults: defaults, sequenceLength: 64)
+    #expect(resolved == explicitModel.standardizedFileURL.path)
+
+    try? fileManager.removeItem(at: root)
+}
+
+@Test func test_resolveCoreMLModelPathRejectsLlamaWithoutExplicitModel() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let weightsDir = root.appendingPathComponent("weights", isDirectory: true)
+    let tokenizerDir = root.appendingPathComponent("tokenizer", isDirectory: true)
+    try fileManager.createDirectory(at: weightsDir, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: tokenizerDir, withIntermediateDirectories: true)
+
+    let defaults = DemoDefaults(
+        repoRoot: root,
+        workingDirectory: root,
+        stateRoot: root,
+        cacheRoot: root,
+        reportsRoot: root,
+        hfCacheRoot: root,
+        weightsDir: weightsDir,
+        tokenizerDir: tokenizerDir,
+        coreMLDir: root,
+        toolsVenvDir: root,
+        scriptsDir: nil,
+        legacyArtifactsRoot: nil
+    )
+    let invocation = ResolvedInvocation(
+        config: try #require(ModelRegistry.config(named: "llama3_2_1b")),
+        weightsDir: weightsDir.path,
+        tokenizerDir: tokenizerDir.path,
+        prompt: "",
+        maxTokens: 16,
+        temperature: 0,
+        showStats: false,
+        coreMLModelPath: nil,
+        coreMLSequenceLength: nil,
+        compareWarmup: 0,
+        compareIterations: 1,
+        coreMLComputeUnits: "cpu_only",
+        allowBootstrap: false,
+        seed: 1234,
+        outputDir: nil
+    )
+
+    do {
+        _ = try resolveCoreMLModelPath(invocation: invocation, defaults: defaults, sequenceLength: 64)
+        Issue.record("Expected llama Core ML path resolution to require --coreml-model")
+    } catch let error as CLIError {
+        #expect(error.localizedDescription.contains("--coreml-model"))
+    }
+
+    try? fileManager.removeItem(at: root)
+}
+
+@Test func test_resolveCoreMLModelPathUsesExplicitOverrideForGPT2() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let weightsDir = root.appendingPathComponent("weights", isDirectory: true)
+    let tokenizerDir = root.appendingPathComponent("tokenizer", isDirectory: true)
+    let explicitModel = root.appendingPathComponent("gpt2_seq128.mlpackage", isDirectory: true)
+    try fileManager.createDirectory(at: weightsDir, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: tokenizerDir, withIntermediateDirectories: true)
+    try fileManager.createDirectory(at: explicitModel, withIntermediateDirectories: true)
+
+    let defaults = DemoDefaults(
+        repoRoot: root,
+        workingDirectory: root,
+        stateRoot: root,
+        cacheRoot: root,
+        reportsRoot: root,
+        hfCacheRoot: root,
+        weightsDir: weightsDir,
+        tokenizerDir: tokenizerDir,
+        coreMLDir: root,
+        toolsVenvDir: root,
+        scriptsDir: nil,
+        legacyArtifactsRoot: nil
+    )
+    let invocation = ResolvedInvocation(
+        config: try #require(ModelRegistry.config(named: "gpt2_124m")),
+        weightsDir: weightsDir.path,
+        tokenizerDir: tokenizerDir.path,
+        prompt: "",
+        maxTokens: 16,
+        temperature: 0,
+        showStats: false,
+        coreMLModelPath: explicitModel.path,
+        coreMLSequenceLength: nil,
+        compareWarmup: 0,
+        compareIterations: 1,
+        coreMLComputeUnits: "cpu_only",
+        allowBootstrap: true,
+        seed: 1234,
+        outputDir: nil
+    )
+
+    let resolved = try resolveCoreMLModelPath(invocation: invocation, defaults: defaults, sequenceLength: 128)
+    #expect(resolved == explicitModel.standardizedFileURL.path)
+
+    try? fileManager.removeItem(at: root)
 }
 
 @Test func test_shouldUseDefaultGPT2DemoWhenNoWeightsProvided() {
@@ -247,4 +497,170 @@ import ANETypes
     #expect(
         resolvedANECompileCachePolicy(environment: ["ANE_COMPILE_CACHE_POLICY": "preferCached"]) == "preferCached"
     )
+}
+
+@Test func test_loadPromptSuiteParsesCommentsAndPrompts() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let promptsURL = root.appendingPathComponent("prompts.txt")
+    try """
+    # benchmark prompts
+    intro:Hello there
+
+    story:Once upon a time: the lights flickered
+    """.write(to: promptsURL, atomically: true, encoding: .utf8)
+
+    let prompts = try loadPromptSuite(from: promptsURL.path)
+    #expect(prompts == [
+        PromptSuiteEntry(id: "intro", text: "Hello there"),
+        PromptSuiteEntry(id: "story", text: "Once upon a time: the lights flickered"),
+    ])
+}
+
+@Test func test_loadPromptSuiteRejectsDuplicateIDs() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+    let promptsURL = root.appendingPathComponent("prompts.txt")
+    try """
+    intro:Hello
+    intro:World
+    """.write(to: promptsURL, atomically: true, encoding: .utf8)
+
+    do {
+        _ = try loadPromptSuite(from: promptsURL.path)
+        Issue.record("Expected duplicate prompt IDs to fail")
+    } catch let error as CLIError {
+        guard case let .usage(message) = error else {
+            Issue.record("Expected usage error, got \(error)")
+            return
+        }
+        #expect(message.contains("Duplicate prompt id"))
+    }
+}
+
+@Test func test_resolvedSuiteCoreMLSequenceLengthRoundsAndClamps() throws {
+    #expect(
+        try resolvedSuiteCoreMLSequenceLength(
+            explicitSequenceLength: nil,
+            promptTokenCounts: [8, 23],
+            maxTokens: 64,
+            maxModelSequenceLength: 256
+        ) == 128
+    )
+    #expect(
+        try resolvedSuiteCoreMLSequenceLength(
+            explicitSequenceLength: nil,
+            promptTokenCounts: [129],
+            maxTokens: 64,
+            maxModelSequenceLength: 200
+        ) == 193
+    )
+}
+
+@Test func test_makePromptSuiteSummaryAggregatesPerPromptVerdicts() {
+    let promptOrder = [
+        PromptSuiteEntry(id: "alpha", text: "Hello"),
+        PromptSuiteEntry(id: "beta", text: "World"),
+    ]
+    let reports = [
+        PromptSuiteRunRecord(
+            promptID: "alpha",
+            report: CompareReport(
+                model: "gpt2_124m",
+                prompt: "Hello",
+                maxTokens: 16,
+                seed: 1234,
+                espresso: BackendRunMetrics(
+                    backend: "espresso",
+                    text: "Hello",
+                    generatedTokens: [1],
+                    promptTokens: [10],
+                    compileTimeMs: 50,
+                    firstTokenLatencyMs: 10,
+                    tokensPerSecond: 100,
+                    medianTokenMs: 10,
+                    p95TokenMs: 12,
+                    totalTimeMs: 20,
+                    tokenLatenciesMs: [10]
+                ),
+                coreML: BackendRunMetrics(
+                    backend: "coreml",
+                    text: "Hello",
+                    generatedTokens: [1],
+                    promptTokens: [10],
+                    compileTimeMs: 40,
+                    firstTokenLatencyMs: 12,
+                    tokensPerSecond: 80,
+                    medianTokenMs: 12,
+                    p95TokenMs: 14,
+                    totalTimeMs: 24,
+                    tokenLatenciesMs: [12]
+                ),
+                tokenMatch: true,
+                textMatch: true,
+                coreMLComputeUnits: "cpu_and_neural_engine",
+                coreMLSequenceLength: 64,
+                espressoPower: nil,
+                coreMLPower: nil,
+                outputDirectory: "/tmp/alpha"
+            )
+        ),
+        PromptSuiteRunRecord(
+            promptID: "beta",
+            report: CompareReport(
+                model: "gpt2_124m",
+                prompt: "World",
+                maxTokens: 16,
+                seed: 1234,
+                espresso: BackendRunMetrics(
+                    backend: "espresso",
+                    text: "World a",
+                    generatedTokens: [2],
+                    promptTokens: [11],
+                    compileTimeMs: 0,
+                    firstTokenLatencyMs: 11,
+                    tokensPerSecond: 90,
+                    medianTokenMs: 11,
+                    p95TokenMs: 13,
+                    totalTimeMs: 21,
+                    tokenLatenciesMs: [11]
+                ),
+                coreML: BackendRunMetrics(
+                    backend: "coreml",
+                    text: "World b",
+                    generatedTokens: [3],
+                    promptTokens: [11],
+                    compileTimeMs: 0,
+                    firstTokenLatencyMs: 13,
+                    tokensPerSecond: 95,
+                    medianTokenMs: 13,
+                    p95TokenMs: 15,
+                    totalTimeMs: 22,
+                    tokenLatenciesMs: [13]
+                ),
+                tokenMatch: false,
+                textMatch: false,
+                coreMLComputeUnits: "cpu_and_neural_engine",
+                coreMLSequenceLength: 64,
+                espressoPower: nil,
+                coreMLPower: nil,
+                outputDirectory: "/tmp/beta"
+            )
+        ),
+    ]
+
+    let summary = makePromptSuiteSummary(
+        promptOrder: promptOrder,
+        reports: reports,
+        commit: "abc123",
+        timestamp: "2026-03-18T00:00:00Z",
+        config: PromptSuiteConfig(runs: 1, warmup: 1, iterations: 3, maxTokens: 16)
+    )
+
+    #expect(summary.perPrompt.count == 2)
+    #expect(summary.aggregate.nPrompts == 2)
+    #expect(summary.aggregate.totalRuns == 2)
+    #expect(!summary.aggregate.allTokenMatch)
+    #expect(!summary.aggregate.allTextMatch)
+    #expect(!summary.verdict.allCorrectnessGatesPass)
 }

@@ -15,9 +15,10 @@ import ANETypes
 }
 
 @Test func registryContainsAllSixModels() {
-    #expect(ModelRegistry.all.count == 6)
+    #expect(ModelRegistry.all.count == 7)
     #expect(ModelRegistry.all["smolLM_135m"]?.nKVHead == 3)
     #expect(ModelRegistry.all["tinyLlama_1_1b"]?.nHead == 32)
+    #expect(ModelRegistry.all["llama3_2_1b_ctx512"]?.maxSeq == 512)
 }
 
 @Test func llama3_2_1bConfigIsCorrect() throws {
@@ -67,4 +68,24 @@ import ANETypes
 
     #expect(config.dModel == 64)
     #expect(ModelConfig.dim == 768)
+}
+
+@Test func multiModelConfigSupportsExpandedAttentionDimension() {
+    let config = MultiModelConfig(
+        name: "qwen3-shape",
+        nLayer: 28,
+        nHead: 16,
+        nKVHead: 8,
+        dModel: 1024,
+        headDim: 128,
+        hiddenDim: 3072,
+        vocab: 151_936,
+        maxSeq: 40960,
+        normEps: 1e-6,
+        architecture: .llama
+    )
+
+    #expect(config.attentionDim == 2048)
+    #expect(config.kvDim == 1024)
+    #expect(config.dModel != config.attentionDim)
 }

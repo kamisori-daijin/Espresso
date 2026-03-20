@@ -27,6 +27,8 @@ source .autoresearch/env.sh
 .autoresearch/bench.sh
 ```
 
+`.autoresearch/bench.sh` appends raw compare rows to `autoresearch-results.tsv` and writes suite artifacts under `results/autoresearch/`. Only `suite-summary.json` plus the judge verdict are authoritative.
+
 ### Hardened Referee Process
 
 1. **Baseline**: run `run_autoresearch_suite.sh` on `main`, save `suite-summary.json`

@@ -66,7 +66,7 @@ struct QwenGGUFRegressionTests {
         return (fixture, prepared)
     }
 
-    private func assertFreshArtifactHelloContinuation(
+    private func assertPreparedArtifactRegressionGate(
         modelEnvKey: String,
         defaultModelPath: String
     ) async throws {
@@ -76,89 +76,50 @@ struct QwenGGUFRegressionTests {
         )
 
         #expect(FileManager.default.fileExists(atPath: prepared.weightDir))
-        #expect(prepared.weightDir.contains("espresso_gguf_"))
+        #expect(
+            prepared.weightDir.contains("espresso_gguf_")
+                || prepared.weightDir.contains("/gguf-prepared/")
+        )
 
         var engine = try RealModelInferenceEngine.build(
             config: prepared.config,
             weightDir: prepared.weightDir,
             tokenizerDir: fixture.tokenizerDir.path
         )
-        let result = try engine.generate(
+        let coldStart = try engine.generate(
+            prompt: QwenGGUFRegressionSupport.helloPrompt,
+            maxTokens: 1,
+            temperature: 0
+        )
+        #expect(coldStart.tokens == [QwenGGUFRegressionSupport.helloFirstToken])
+        #expect(coldStart.text == "Hello Answer")
+
+        let latePrefix = try engine.generate(
+            prompt: QwenGGUFRegressionSupport.latePrefixPrompt,
+            maxTokens: 1,
+            temperature: 0
+        )
+        #expect(latePrefix.promptTokens == QwenGGUFRegressionSupport.latePrefixTokens)
+        #expect(latePrefix.tokens == [QwenGGUFRegressionSupport.latePrefixExpectedToken])
+        #expect(!RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16(env: [:]))
+
+        let hello = try engine.generate(
             prompt: QwenGGUFRegressionSupport.helloPrompt,
             maxTokens: QwenGGUFRegressionSupport.helloContinuationTokens.count,
             temperature: 0
         )
 
-        #expect(result.tokens == QwenGGUFRegressionSupport.helloContinuationTokens)
-        #expect(result.tokens.first == QwenGGUFRegressionSupport.helloFirstToken)
-        #expect(result.text == QwenGGUFRegressionSupport.helloContinuationText)
-    }
-
-    private func assertLatePrefixNextToken(
-        modelEnvKey: String,
-        defaultModelPath: String
-    ) async throws {
-        let (_, prepared) = try await preparedModel(
-            modelEnvKey: modelEnvKey,
-            defaultModelPath: defaultModelPath
-        )
-
-        let token = try RealModelInferenceEngine.generateNextTokenForTesting(
-            config: prepared.config,
-            weightDir: prepared.weightDir,
-            promptTokens: QwenGGUFRegressionSupport.latePrefixTokens
-        )
-
-        #expect(token == QwenGGUFRegressionSupport.latePrefixExpectedToken)
-    }
-
-    private func assertExactCPULatePrefixNextToken(
-        modelEnvKey: String,
-        defaultModelPath: String
-    ) async throws {
-        let (_, prepared) = try await preparedModel(
-            modelEnvKey: modelEnvKey,
-            defaultModelPath: defaultModelPath
-        )
-
-        let token = try RealModelInferenceEngine.generateNextTokenExactCPUForTesting(
-            config: prepared.config,
-            weightDir: prepared.weightDir,
-            promptTokens: QwenGGUFRegressionSupport.latePrefixTokens
-        )
-
-        #expect(!RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16(env: [:]))
-        #expect(token == QwenGGUFRegressionSupport.latePrefixExpectedToken)
+        #expect(hello.tokens == QwenGGUFRegressionSupport.helloContinuationTokens)
+        #expect(hello.tokens.first == QwenGGUFRegressionSupport.helloFirstToken)
+        #expect(hello.text == QwenGGUFRegressionSupport.helloContinuationText)
     }
 
     @Test(
-        "Qwen 0.6B fresh artifact Hello continuation matches raw GGUF golden",
+        "Qwen 0.6B prepared artifact Hello and late-prefix parity match raw GGUF golden",
         .enabled(if: qwen060BRegressionEnabled)
     )
-    func qwen060BFreshArtifactHelloContinuationMatchesGolden() async throws {
-        try await assertFreshArtifactHelloContinuation(
-            modelEnvKey: "QWEN_0_6B_GGUF_MODEL_PATH",
-            defaultModelPath: defaultQwen060BModelPath
-        )
-    }
-
-    @Test(
-        "Qwen 0.6B fresh artifact late-prefix token matches raw GGUF golden",
-        .enabled(if: qwen060BRegressionEnabled)
-    )
-    func qwen060BFreshArtifactLatePrefixTokenMatchesGolden() async throws {
-        try await assertLatePrefixNextToken(
-            modelEnvKey: "QWEN_0_6B_GGUF_MODEL_PATH",
-            defaultModelPath: defaultQwen060BModelPath
-        )
-    }
-
-    @Test(
-        "Qwen 0.6B exact CPU late-prefix token keeps FP32 intermediates by default",
-        .enabled(if: qwen060BRegressionEnabled)
-    )
-    func qwen060BExactCPULatePrefixTokenMatchesGolden() async throws {
-        try await assertExactCPULatePrefixNextToken(
+    func qwen060BPreparedArtifactRegressionGateMatchesGolden() async throws {
+        try await assertPreparedArtifactRegressionGate(
             modelEnvKey: "QWEN_0_6B_GGUF_MODEL_PATH",
             defaultModelPath: defaultQwen060BModelPath
         )

@@ -20,6 +20,7 @@ Usage:
   ./espresso demo [prompt...]
   ./espresso compare [options] [prompt...]
   ./espresso bench [options] [prompt...]
+  ./espresso suite [options]
   ./espresso generate [options] [prompt...]
   ./espresso doctor
   ./espresso prepare
@@ -30,6 +31,7 @@ Examples:
   ./espresso "Hello from Espresso"
   ./espresso compare --no-power "Hello"
   ./espresso bench --output-dir ./reports "Hello"
+  ./espresso suite --prompts ./scripts/benchmark-prompts.txt --no-power
   ./espresso doctor
 
 Notes:
@@ -59,7 +61,7 @@ if [[ $# -eq 0 ]]; then
 fi
 
 case "$1" in
-  demo|compare|bench|generate|doctor)
+  demo|compare|bench|suite|generate|doctor)
     run_generate "$@"
     ;;
   prepare)

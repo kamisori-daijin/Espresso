@@ -9,6 +9,7 @@ enum CommandName: String {
     case generate
     case compare
     case bench
+    case suite
     case doctor
 }
 
@@ -31,12 +32,17 @@ struct Options {
     var coreMLSequenceLength: Int? = Options.parseNonNegativeIntEnv("ESPRESSO_COREML_SEQ_LEN")
     var compareWarmup: Int = Options.parseNonNegativeIntEnv("ESPRESSO_COMPARE_WARMUP") ?? 1
     var compareIterations: Int = Options.parsePositiveIntEnv("ESPRESSO_COMPARE_ITERATIONS") ?? 3
+    var suiteRuns: Int = Options.parsePositiveIntEnv("ESPRESSO_SUITE_RUNS") ?? 3
     var seed: Int = Options.parseIntEnv("ESPRESSO_COMPARE_SEED") ?? 1234
     var coreMLComputeUnits: String = ProcessInfo.processInfo.environment["ESPRESSO_COREML_COMPUTE_UNITS"] ?? "cpu_and_neural_engine"
     var showStats = true
     var listModels = false
     var prepareDemo = false
+    var promptsFile: String?
+    var resultsTSV: String?
     var allowBootstrap = true
+    var includeColdRun = true
+    var benchmarkGenerate = false
     var showHelp = false
     var forceTUI = false
     var disableTUI = false
@@ -99,6 +105,11 @@ struct Options {
                     try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index),
                     flag: flag
                 )
+            case "--runs":
+                options.suiteRuns = try parsePositiveInt(
+                    try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index),
+                    flag: flag
+                )
             case "--coreml-compute-units":
                 options.coreMLComputeUnits = try parseCoreMLComputeUnits(
                     try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
@@ -110,12 +121,20 @@ struct Options {
                 )
             case "--output-dir":
                 options.outputDir = try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
+            case "--prompts":
+                options.promptsFile = try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
+            case "--results-tsv":
+                options.resultsTSV = try value(for: flag, inlineValue: inlineValue, argv: argv, index: &index)
             case "--prepare-demo":
                 options.prepareDemo = true
             case "--no-bootstrap":
                 options.allowBootstrap = false
+            case "--no-cold":
+                options.includeColdRun = false
             case "--no-stats":
                 options.showStats = false
+            case "--benchmark-generate":
+                options.benchmarkGenerate = true
             case "--list-models":
                 options.listModels = true
             case "--tui":
@@ -254,7 +273,7 @@ enum CLIError: Error, LocalizedError {
     }
 }
 
-private struct MetadataConfigFile: Decodable {
+struct MetadataConfigFile: Decodable {
     let name: String
     let nLayer: Int
     let nHead: Int
@@ -265,6 +284,8 @@ private struct MetadataConfigFile: Decodable {
     let vocab: Int
     let maxSeq: Int
     let normEps: Float
+    let ropeTheta: Float?
+    let eosToken: Int?
     let architecture: String
 
     func asConfig() throws -> MultiModelConfig {
@@ -288,6 +309,8 @@ private struct MetadataConfigFile: Decodable {
             vocab: vocab,
             maxSeq: maxSeq,
             normEps: normEps,
+            ropeTheta: ropeTheta ?? 10_000.0,
+            eosToken: eosToken.flatMap(TokenID.init),
             architecture: parsedArchitecture
         )
     }
@@ -305,10 +328,75 @@ struct ResolvedInvocation {
     let coreMLSequenceLength: Int?
     let compareWarmup: Int
     let compareIterations: Int
+    let benchmarkGenerate: Bool
     let coreMLComputeUnits: String
     let allowBootstrap: Bool
     let seed: Int
     let outputDir: String?
+
+    init(
+        config: MultiModelConfig,
+        weightsDir: String,
+        tokenizerDir: String,
+        prompt: String,
+        maxTokens: Int,
+        temperature: Float,
+        showStats: Bool,
+        coreMLModelPath: String?,
+        coreMLSequenceLength: Int?,
+        compareWarmup: Int,
+        compareIterations: Int,
+        benchmarkGenerate: Bool = false,
+        coreMLComputeUnits: String,
+        allowBootstrap: Bool,
+        seed: Int,
+        outputDir: String?
+    ) {
+        self.config = config
+        self.weightsDir = weightsDir
+        self.tokenizerDir = tokenizerDir
+        self.prompt = prompt
+        self.maxTokens = maxTokens
+        self.temperature = temperature
+        self.showStats = showStats
+        self.coreMLModelPath = coreMLModelPath
+        self.coreMLSequenceLength = coreMLSequenceLength
+        self.compareWarmup = compareWarmup
+        self.compareIterations = compareIterations
+        self.benchmarkGenerate = benchmarkGenerate
+        self.coreMLComputeUnits = coreMLComputeUnits
+        self.allowBootstrap = allowBootstrap
+        self.seed = seed
+        self.outputDir = outputDir
+    }
+}
+
+extension ResolvedInvocation {
+    func with(
+        prompt: String? = nil,
+        compareWarmup: Int? = nil,
+        compareIterations: Int? = nil,
+        outputDir: String? = nil
+    ) -> ResolvedInvocation {
+        ResolvedInvocation(
+            config: config,
+            weightsDir: weightsDir,
+            tokenizerDir: tokenizerDir,
+            prompt: prompt ?? self.prompt,
+            maxTokens: maxTokens,
+            temperature: temperature,
+            showStats: showStats,
+            coreMLModelPath: coreMLModelPath,
+            coreMLSequenceLength: coreMLSequenceLength,
+            compareWarmup: compareWarmup ?? self.compareWarmup,
+            compareIterations: compareIterations ?? self.compareIterations,
+            benchmarkGenerate: benchmarkGenerate,
+            coreMLComputeUnits: coreMLComputeUnits,
+            allowBootstrap: allowBootstrap,
+            seed: seed,
+            outputDir: outputDir ?? self.outputDir
+        )
+    }
 }
 
 struct BackendRunMetrics: Sendable {
@@ -342,7 +430,12 @@ struct CompareReport: Sendable {
 }
 
 private struct CLITokenizer: @unchecked Sendable {
+    let encodeImpl: (String) throws -> [Int]
     let decodeImpl: ([Int]) -> String
+
+    func encode(_ text: String) throws -> [Int] {
+        try encodeImpl(text)
+    }
 
     func decode(_ tokens: [Int]) -> String {
         decodeImpl(tokens)
@@ -432,21 +525,23 @@ private func printUsage() {
       espresso-generate generate [options] [prompt...]
       espresso-generate compare [options] [prompt...]
       espresso-generate bench [options] [prompt...]
+      espresso-generate suite [options]
       espresso-generate doctor [--json]
       espresso-generate [options] [prompt...]
 
     Commands:
       demo       First-run GPT-2 experience. Boots assets if needed and runs live compare in a TTY.
       generate   Run Espresso ANE generation only.
-      compare    Compare Espresso against the same GPT-2 Core ML baseline. Use --live or --bench.
+      compare    Compare Espresso against a Core ML baseline. Use --live or --bench.
       bench      Run a fair sequential benchmark, export JSON/CSV/Markdown, and capture power when available.
+      suite      Run a multi-prompt compare suite in one process and reuse the Core ML baseline across prompts.
       doctor     Validate hardware, scripts, caches, demo assets, Python tooling, and power telemetry support.
 
     Common options:
       -m, --model NAME         ModelRegistry key or alias
       -w, --weights DIR        Weights directory
       -t, --tokenizer DIR      Tokenizer directory or tokenizer asset path
-          --coreml-model PATH  Override the exported GPT-2 Core ML baseline
+          --coreml-model PATH  Override the exported Core ML baseline (required for non-GPT2 models)
       -p, --prompt TEXT        Prompt text; otherwise use trailing args or piped stdin
       -n, --max-tokens N       Max new tokens (default: 128)
           --temperature FLOAT  Sampling temperature; 0 = greedy (default: 0)
@@ -456,6 +551,10 @@ private func printUsage() {
           --compare-warmup N   Warmup iterations for sequential compare/bench (default: 1)
           --compare-iterations N
                                Measured iterations for sequential compare/bench (default: 3)
+          --runs N             Warm runs per prompt for suite mode (default: 3)
+          --prompts FILE       Prompt suite file for suite mode (id:prompt_text per line)
+          --results-tsv PATH   Append per-run suite measurements to a TSV file
+          --no-cold            Skip the suite cold run
           --coreml-seq-len N   Override the fixed Core ML sequence length used for compare/export
           --coreml-compute-units all|cpu_and_neural_engine|cpu_and_gpu|cpu_only
           --tui                Force the live terminal dashboard
@@ -468,6 +567,7 @@ private func printUsage() {
           --list-models        Print available models and exit
           --no-bootstrap       Do not auto-install/download demo dependencies or assets
           --no-stats           Suppress timing stats on stderr
+          --benchmark-generate Reuse one Espresso engine and report warm generate metrics using --compare-warmup/--compare-iterations
       -h, --help               Show this help
 
     Environment:
@@ -483,6 +583,7 @@ private func printUsage() {
       ESPRESSO_COREML_COMPUTE_UNITS
       ESPRESSO_COMPARE_WARMUP
       ESPRESSO_COMPARE_ITERATIONS
+      ESPRESSO_SUITE_RUNS
       ESPRESSO_COMPARE_SEED
       ESPRESSO_MAX_TOKENS
       ESPRESSO_TEMPERATURE
@@ -496,6 +597,7 @@ private func printUsage() {
       espresso-generate demo
       espresso-generate compare --live "Hello"
       espresso-generate bench --output-dir ./reports/gpt2 "Hello"
+      espresso-generate suite --prompts ./scripts/benchmark-prompts.txt --no-power
     """
     print(usage)
 }
@@ -504,7 +606,7 @@ private func printAvailableModels() {
     print("Available models:")
     for name in ModelRegistry.all.keys.sorted() {
         guard let config = ModelRegistry.all[name] else { continue }
-        let status = config.architecture == .gpt2 ? "ready" : "RoPE pending"
+        let status = "ready"
         let paddedName = name.padding(toLength: 16, withPad: " ", startingAt: 0)
         let paddedArchitecture = architectureLabel(config.architecture).padding(toLength: 5, withPad: " ", startingAt: 0)
         print("  \(paddedName)  arch=\(paddedArchitecture)  layers=\(config.nLayer)  dModel=\(config.dModel)  maxSeq=\(config.maxSeq)  \(status)")
@@ -568,12 +670,24 @@ private func hasSentencePieceAssets(in directory: URL) -> Bool {
     return fileManager.fileExists(atPath: directory.appendingPathComponent("tokenizer.bin").path)
 }
 
+private func hasTokenizerJSONAssets(in directory: URL) -> Bool {
+    FileManager.default.fileExists(atPath: directory.appendingPathComponent("tokenizer.json").path)
+}
+
+private func hasBPEPairAssets(in directory: URL) -> Bool {
+    let fileManager = FileManager()
+    return fileManager.fileExists(atPath: directory.appendingPathComponent("vocab.json").path) &&
+        fileManager.fileExists(atPath: directory.appendingPathComponent("merges.txt").path)
+}
+
 private func directoryHasTokenizerAssets(_ directory: URL, for config: MultiModelConfig) -> Bool {
     switch config.architecture {
     case .gpt2:
         return hasGPT2TokenizerAssets(in: directory)
     case .llama:
-        return hasSentencePieceAssets(in: directory)
+        return hasSentencePieceAssets(in: directory) ||
+            hasTokenizerJSONAssets(in: directory) ||
+            hasBPEPairAssets(in: directory)
     }
 }
 
@@ -628,6 +742,12 @@ private func normalizeTokenizerLocation(_ rawPath: String, config: MultiModelCon
             if url.lastPathComponent == "tokenizer.bin", hasSentencePieceAssets(in: parent) {
                 return parent.path
             }
+            if url.lastPathComponent == "tokenizer.json", hasTokenizerJSONAssets(in: parent) {
+                return parent.path
+            }
+            if ["vocab.json", "merges.txt"].contains(url.lastPathComponent), hasBPEPairAssets(in: parent) {
+                return parent.path
+            }
         }
         throw CLIError.usage("Tokenizer path must point to a tokenizer directory or one of its primary assets.")
     }
@@ -657,7 +777,7 @@ private func resolveTokenizerDirectory(
         )
     case .llama:
         throw CLIError.usage(
-            "Unable to locate SentencePiece tokenizer assets. Pass --tokenizer or place tokenizer.bin near the weights."
+            "Unable to locate llama tokenizer assets. Pass --tokenizer or place tokenizer.bin, tokenizer.json, or vocab.json + merges.txt near the weights."
         )
     }
 }
@@ -687,7 +807,7 @@ func implicitPrompt(
     switch command {
     case .demo, .compare:
         return defaultDemoPrompt
-    case .generate, .bench, .doctor:
+    case .generate, .bench, .suite, .doctor:
         return nil
     }
 }
@@ -715,11 +835,24 @@ private func loadTokenizer(config: MultiModelConfig, tokenizerDir: String) throw
         let vocabURL = tokenizerDirURL.appendingPathComponent("vocab.json")
         let mergesURL = tokenizerDirURL.appendingPathComponent("merges.txt")
         let tokenizer = try GPT2BPETokenizer(vocabURL: vocabURL, mergesURL: mergesURL)
-        return CLITokenizer(decodeImpl: tokenizer.decode)
+        return CLITokenizer(encodeImpl: tokenizer.encode, decodeImpl: tokenizer.decode)
     case .llama:
-        let tokenizerURL = tokenizerDirURL.appendingPathComponent("tokenizer.bin")
-        let tokenizer = try SentencePieceTokenizer(modelURL: tokenizerURL)
-        return CLITokenizer(decodeImpl: tokenizer.decode)
+        let sentencePieceURL = tokenizerDirURL.appendingPathComponent("tokenizer.bin")
+        if FileManager.default.fileExists(atPath: sentencePieceURL.path) {
+            let tokenizer = try SentencePieceTokenizer(modelURL: sentencePieceURL)
+            return CLITokenizer(encodeImpl: tokenizer.encode, decodeImpl: tokenizer.decode)
+        }
+
+        let tokenizerJSONURL = tokenizerDirURL.appendingPathComponent("tokenizer.json")
+        if FileManager.default.fileExists(atPath: tokenizerJSONURL.path) {
+            let tokenizer = try GPT2BPETokenizer(tokenizerJSONURL: tokenizerJSONURL)
+            return CLITokenizer(encodeImpl: tokenizer.encode, decodeImpl: tokenizer.decode)
+        }
+
+        let vocabURL = tokenizerDirURL.appendingPathComponent("vocab.json")
+        let mergesURL = tokenizerDirURL.appendingPathComponent("merges.txt")
+        let tokenizer = try GPT2BPETokenizer(vocabURL: vocabURL, mergesURL: mergesURL)
+        return CLITokenizer(encodeImpl: tokenizer.encode, decodeImpl: tokenizer.decode)
     }
 }
 
@@ -764,7 +897,7 @@ private func shouldUseTUI(command: CommandName, options: Options) -> Bool {
         return true
     case .compare:
         return !options.preferBenchCompare
-    case .generate, .bench, .doctor:
+    case .generate, .bench, .suite, .doctor:
         return false
     }
 }
@@ -793,7 +926,7 @@ private func resolveInvocation(from options: Options, demoDefaults: DemoDefaults
         weightsDirURL: weightsDirURL,
         config: config
     )
-    let prompt = command == .doctor ? "" : try resolvePrompt(options, command: command)
+    let prompt = (command == .doctor || command == .suite) ? "" : try resolvePrompt(options, command: command)
     return ResolvedInvocation(
         config: config,
         weightsDir: weightsDir,
@@ -806,6 +939,7 @@ private func resolveInvocation(from options: Options, demoDefaults: DemoDefaults
         coreMLSequenceLength: options.coreMLSequenceLength,
         compareWarmup: options.compareWarmup,
         compareIterations: options.compareIterations,
+        benchmarkGenerate: options.benchmarkGenerate,
         coreMLComputeUnits: options.coreMLComputeUnits,
         allowBootstrap: options.allowBootstrap,
         seed: options.seed,
@@ -954,26 +1088,25 @@ private func runCoreMLGeneration(
     let sequenceLength = invocation.coreMLSequenceLength ?? nextPowerOfTwo(
         min(invocation.config.maxSeq, promptTokens.count + max(invocation.maxTokens, 1))
     )
-    let coreMLModelPath = try ensureGPT2CoreMLModel(
+    let coreMLModelPath = try resolveCoreMLModelPath(
+        invocation: invocation,
         defaults: defaults,
-        weightsDir: invocation.weightsDir,
-        sequenceLength: sequenceLength,
-        explicitModelPath: invocation.coreMLModelPath,
-        allowBootstrap: invocation.allowBootstrap
+        sequenceLength: sequenceLength
     )
-    let result = try runGPT2CoreMLReference(
-        defaults: defaults,
-        coreMLModelPath: coreMLModelPath,
+    var runner = try ReusableCoreMLBenchmarkRunner(
+        modelPath: coreMLModelPath,
         weightsDir: invocation.weightsDir,
-        promptTokens: promptTokens,
+        architecture: invocation.config.architecture,
         sequenceLength: sequenceLength,
+        computeUnits: invocation.coreMLComputeUnits
+    )
+    let result = try runner.benchmark(
+        promptTokens: promptTokens,
         maxTokens: invocation.maxTokens,
         temperature: invocation.temperature,
         warmup: invocation.compareWarmup,
         iterations: invocation.compareIterations,
-        computeUnits: invocation.coreMLComputeUnits,
-        seed: invocation.seed,
-        allowBootstrap: invocation.allowBootstrap
+        seed: invocation.seed
     )
     let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
     let generatedTokens = try result.generatedTokens.map(validateToken)
@@ -1668,21 +1801,7 @@ private func millisecondsSince(_ started: UInt64) -> Double {
 
 private func encodePromptTokens(_ prompt: String, config: MultiModelConfig, tokenizerDir: String) throws -> [TokenID] {
     let tokenizer = try loadTokenizer(config: config, tokenizerDir: tokenizerDir)
-    let decoded = tokenizer.decode // silence unused? no
-    _ = decoded
-    switch config.architecture {
-    case .gpt2:
-        let tokenizerDirURL = URL(fileURLWithPath: tokenizerDir, isDirectory: true)
-        let tokenizer = try GPT2BPETokenizer(
-            vocabURL: tokenizerDirURL.appendingPathComponent("vocab.json"),
-            mergesURL: tokenizerDirURL.appendingPathComponent("merges.txt")
-        )
-        return try tokenizer.encode(prompt).map(validateToken)
-    case .llama:
-        let tokenizerDirURL = URL(fileURLWithPath: tokenizerDir, isDirectory: true)
-        let tokenizer = try SentencePieceTokenizer(modelURL: tokenizerDirURL.appendingPathComponent("tokenizer.bin"))
-        return try tokenizer.encode(prompt).map(validateToken)
-    }
+    return try tokenizer.encode(prompt).map(validateToken)
 }
 
 private func metricsOrZero(_ value: Double, fallback: Double) -> Double {
@@ -1690,6 +1809,9 @@ private func metricsOrZero(_ value: Double, fallback: Double) -> Double {
 }
 
 private func runGenerate(invocation: ResolvedInvocation) throws -> BackendRunMetrics {
+    if invocation.benchmarkGenerate {
+        return try runEspressoBenchmark(invocation: invocation)
+    }
     var engine = try makeEspressoEngine(invocation: invocation)
     return try runEspressoGeneration(engine: &engine, invocation: invocation)
 }
@@ -1714,6 +1836,329 @@ private func runCompareOrBench(
         coreMLPower: coreMLMeasured.power,
         outputDirectory: nil
     )
+}
+
+private func finalizedCompareReport(_ report: CompareReport, outputDirectory: String) -> CompareReport {
+    CompareReport(
+        model: report.model,
+        prompt: report.prompt,
+        maxTokens: report.maxTokens,
+        seed: report.seed,
+        espresso: report.espresso,
+        coreML: report.coreML,
+        tokenMatch: report.tokenMatch,
+        textMatch: report.textMatch,
+        coreMLComputeUnits: report.coreMLComputeUnits,
+        coreMLSequenceLength: report.coreMLSequenceLength,
+        espressoPower: report.espressoPower,
+        coreMLPower: report.coreMLPower,
+        outputDirectory: outputDirectory
+    )
+}
+
+private func coreMLMetrics(
+    from result: CoreMLComparisonResult,
+    tokenizer: CLITokenizer,
+    promptTokens: [TokenID]
+) throws -> BackendRunMetrics {
+    let generatedTokens = try result.generatedTokens.map(validateToken)
+    return BackendRunMetrics(
+        backend: "coreml",
+        text: tokenizer.decode((promptTokens + generatedTokens).map(Int.init)),
+        generatedTokens: generatedTokens,
+        promptTokens: promptTokens,
+        compileTimeMs: result.compileTimeMs,
+        firstTokenLatencyMs: result.firstTokenLatencyMs,
+        tokensPerSecond: result.tokensPerSecond,
+        medianTokenMs: result.medianTokenMs,
+        p95TokenMs: result.p95TokenMs,
+        totalTimeMs: result.totalTimeMs,
+        tokenLatenciesMs: result.tokenLatenciesMs
+    )
+}
+
+private func suiteDirectoryTimestamp() -> String {
+    let formatter = DateFormatter()
+    formatter.calendar = Calendar(identifier: .gregorian)
+    formatter.locale = posixLocale
+    formatter.timeZone = TimeZone(secondsFromGMT: 0)
+    formatter.dateFormat = "yyyyMMdd-HHmmss"
+    return formatter.string(from: Date())
+}
+
+private func suiteSummaryTimestamp() -> String {
+    ISO8601DateFormatter().string(from: Date())
+}
+
+private func gitShortCommit(repoRoot: URL?) -> String {
+    guard let repoRoot else {
+        return "unknown"
+    }
+
+    let process = Process()
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = ["-C", repoRoot.path, "rev-parse", "--short", "HEAD"]
+    let stdout = Pipe()
+    process.standardOutput = stdout
+    process.standardError = Pipe()
+
+    do {
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            return "unknown"
+        }
+        return String(decoding: stdout.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    } catch {
+        return "unknown"
+    }
+}
+
+private func resolvePromptSuiteOutputDirectory(defaults: DemoDefaults, requestedOutputDir: String?) -> URL {
+    if let requestedOutputDir, !requestedOutputDir.isEmpty {
+        return URL(fileURLWithPath: NSString(string: requestedOutputDir).expandingTildeInPath, isDirectory: true)
+            .standardizedFileURL
+    }
+
+    let baseDirectory: URL
+    if let repoRoot = defaults.repoRoot {
+        baseDirectory = repoRoot.appendingPathComponent("results/autoresearch", isDirectory: true)
+    } else {
+        baseDirectory = defaults.reportsRoot
+    }
+    return baseDirectory.appendingPathComponent("suite-\(suiteDirectoryTimestamp())", isDirectory: true)
+}
+
+func resolveCoreMLModelPath(
+    invocation: ResolvedInvocation,
+    defaults: DemoDefaults,
+    sequenceLength: Int
+) throws -> String {
+    if let explicitModelPath = invocation.coreMLModelPath, !explicitModelPath.isEmpty {
+        let expanded = NSString(string: explicitModelPath).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: expanded) else {
+            throw CLIError.usage("Core ML model path does not exist: \(explicitModelPath)")
+        }
+        return URL(fileURLWithPath: expanded).standardizedFileURL.path
+    }
+
+    switch invocation.config.architecture {
+    case .gpt2:
+        return try ensureGPT2CoreMLModel(
+            defaults: defaults,
+            weightsDir: invocation.weightsDir,
+            sequenceLength: sequenceLength,
+            explicitModelPath: nil,
+            allowBootstrap: invocation.allowBootstrap
+        )
+    case .llama:
+        throw CLIError.usage(
+            "Model \(invocation.config.name) requires --coreml-model PATH to an exported Core ML package."
+        )
+    }
+}
+
+private func prepareResultsTSV(at path: String?) throws -> URL? {
+    guard let path, !path.isEmpty else {
+        return nil
+    }
+
+    let url = URL(fileURLWithPath: NSString(string: path).expandingTildeInPath).standardizedFileURL
+    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if !FileManager.default.fileExists(atPath: url.path) {
+        try (promptSuiteResultsTSVHeader() + "\n").write(to: url, atomically: true, encoding: .utf8)
+    }
+    return url
+}
+
+private func appendLine(_ line: String, to url: URL) throws {
+    let existing = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+    let separator = existing.isEmpty || existing.hasSuffix("\n") ? "" : "\n"
+    try (existing + separator + line + "\n").write(to: url, atomically: true, encoding: .utf8)
+}
+
+private func runPromptSuiteCompare(
+    invocation: ResolvedInvocation,
+    tokenizer: CLITokenizer,
+    promptTokens: [TokenID],
+    engine: inout RealModelInferenceEngine,
+    coreMLRunner: inout ReusableCoreMLBenchmarkRunner,
+    sequenceLength: Int,
+    powerEnabled: Bool
+) throws -> CompareReport {
+    let espressoMeasured = try maybeMeasurePower(enabled: powerEnabled) {
+        try aggregateBenchmarkRuns(warmup: invocation.compareWarmup, iterations: invocation.compareIterations) {
+            try runEspressoGeneration(engine: &engine, invocation: invocation)
+        }
+    }
+    let coreMLMeasured = try maybeMeasurePower(enabled: powerEnabled) {
+        let result = try coreMLRunner.benchmark(
+            promptTokens: promptTokens,
+            maxTokens: invocation.maxTokens,
+            temperature: invocation.temperature,
+            warmup: invocation.compareWarmup,
+            iterations: invocation.compareIterations,
+            seed: invocation.seed
+        )
+        return try coreMLMetrics(from: result, tokenizer: tokenizer, promptTokens: promptTokens)
+    }
+    return compareReport(
+        invocation: invocation,
+        espresso: espressoMeasured.result,
+        coreML: coreMLMeasured.result,
+        coreMLSequenceLength: sequenceLength,
+        espressoPower: espressoMeasured.power,
+        coreMLPower: coreMLMeasured.power,
+        outputDirectory: nil
+    )
+}
+
+private func runPromptSuite(
+    invocation: ResolvedInvocation,
+    options: Options,
+    defaults: DemoDefaults,
+    powerEnabled: Bool
+) throws -> Int32 {
+    guard let promptsFile = options.promptsFile, !promptsFile.isEmpty else {
+        throw CLIError.usage("Suite mode requires --prompts FILE.")
+    }
+
+    let prompts = try loadPromptSuite(from: promptsFile)
+    let tokenizer = try loadTokenizer(config: invocation.config, tokenizerDir: invocation.tokenizerDir)
+    let promptTokensByID = try Dictionary(uniqueKeysWithValues: prompts.map { prompt in
+        (prompt.id, try tokenizer.encode(prompt.text).map(validateToken))
+    })
+    let promptTokenCounts = prompts.compactMap { promptTokensByID[$0.id]?.count }
+    let sequenceLength = try resolvedSuiteCoreMLSequenceLength(
+        explicitSequenceLength: invocation.coreMLSequenceLength,
+        promptTokenCounts: promptTokenCounts,
+        maxTokens: invocation.maxTokens,
+        maxModelSequenceLength: invocation.config.maxSeq
+    )
+    let coreMLModelPath = try resolveCoreMLModelPath(
+        invocation: invocation,
+        defaults: defaults,
+        sequenceLength: sequenceLength
+    )
+
+    let outputRoot = resolvePromptSuiteOutputDirectory(defaults: defaults, requestedOutputDir: invocation.outputDir)
+    try FileManager.default.createDirectory(at: outputRoot, withIntermediateDirectories: true)
+
+    let commit = gitShortCommit(repoRoot: defaults.repoRoot)
+    let timestamp = suiteSummaryTimestamp()
+    let config = PromptSuiteConfig(
+        runs: options.suiteRuns,
+        warmup: invocation.compareWarmup,
+        iterations: invocation.compareIterations,
+        maxTokens: invocation.maxTokens
+    )
+    let metadata = PromptSuiteMetadata(
+        commit: commit,
+        timestamp: timestamp,
+        promptsFile: NSString(string: promptsFile).expandingTildeInPath,
+        promptIDs: prompts.map(\.id),
+        runs: options.suiteRuns,
+        warmup: invocation.compareWarmup,
+        iterations: invocation.compareIterations,
+        maxTokens: invocation.maxTokens,
+        coldRun: options.includeColdRun
+    )
+    let encoder = JSONEncoder()
+    encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+    try encoder.encode(metadata).write(to: outputRoot.appendingPathComponent("metadata.json"))
+
+    let resultsTSVURL = try prepareResultsTSV(at: options.resultsTSV)
+    var engine = try makeEspressoEngine(invocation: invocation)
+    var coreMLRunner = try ReusableCoreMLBenchmarkRunner(
+        modelPath: coreMLModelPath,
+        weightsDir: invocation.weightsDir,
+        architecture: invocation.config.architecture,
+        sequenceLength: sequenceLength,
+        computeUnits: invocation.coreMLComputeUnits
+    )
+
+    if options.includeColdRun, let coldPrompt = prompts.first, let coldTokens = promptTokensByID[coldPrompt.id] {
+        let coldInvocation = invocation.with(prompt: coldPrompt.text, compareWarmup: 0, compareIterations: 1)
+        let coldReport = try runPromptSuiteCompare(
+            invocation: coldInvocation,
+            tokenizer: tokenizer,
+            promptTokens: coldTokens,
+            engine: &engine,
+            coreMLRunner: &coreMLRunner,
+            sequenceLength: sequenceLength,
+            powerEnabled: powerEnabled
+        )
+        _ = try writeCompareArtifacts(
+            report: coldReport,
+            defaults: defaults,
+            requestedOutputDir: outputRoot.appendingPathComponent("cold/\(coldPrompt.id)", isDirectory: true).path
+        )
+    }
+
+    var records: [PromptSuiteRunRecord] = []
+    records.reserveCapacity(prompts.count * options.suiteRuns)
+    for runIndex in 1...options.suiteRuns {
+        for prompt in prompts {
+            guard let promptTokens = promptTokensByID[prompt.id] else {
+                throw CLIError.runtime("Missing prompt tokens for suite entry \(prompt.id)")
+            }
+            let promptInvocation = invocation.with(prompt: prompt.text)
+            let report = try runPromptSuiteCompare(
+                invocation: promptInvocation,
+                tokenizer: tokenizer,
+                promptTokens: promptTokens,
+                engine: &engine,
+                coreMLRunner: &coreMLRunner,
+                sequenceLength: sequenceLength,
+                powerEnabled: powerEnabled
+            )
+            let requestedOutputDir = outputRoot
+                .appendingPathComponent("run-\(runIndex)", isDirectory: true)
+                .appendingPathComponent(prompt.id, isDirectory: true)
+                .path
+            let outputDirectory = try writeCompareArtifacts(
+                report: report,
+                defaults: defaults,
+                requestedOutputDir: requestedOutputDir
+            )
+            let finalized = finalizedCompareReport(report, outputDirectory: outputDirectory)
+            records.append(PromptSuiteRunRecord(promptID: prompt.id, report: finalized))
+            if let resultsTSVURL {
+                try appendLine(
+                    promptSuiteResultsTSVRow(
+                        timestamp: timestamp,
+                        commit: commit,
+                        promptID: prompt.id,
+                        outputDirectory: outputDirectory,
+                        report: finalized
+                    ),
+                    to: resultsTSVURL
+                )
+            }
+        }
+    }
+
+    let summary = makePromptSuiteSummary(
+        promptOrder: prompts,
+        reports: records,
+        commit: commit,
+        timestamp: timestamp,
+        config: config
+    )
+    let summaryURL = outputRoot.appendingPathComponent("suite-summary.json")
+    try encoder.encode(summary).write(to: summaryURL)
+
+    if options.jsonOutput {
+        print(String(decoding: try Data(contentsOf: summaryURL), as: UTF8.self))
+    } else {
+        for line in promptSuiteSummaryLines(summary) {
+            print(line)
+        }
+        stderrLine("suite_dir=\(outputRoot.path)")
+    }
+
+    return summary.verdict.allCorrectnessGatesPass ? 0 : 1
 }
 
 enum EspressoGenerateCLI {
@@ -1752,34 +2197,28 @@ enum EspressoGenerateCLI {
             switch command {
             case .generate:
                 let result = try runGenerate(invocation: invocation)
-                print(result.text)
-                if invocation.showStats {
-                    printGenerateStats(invocation, result: result)
+                if options.jsonOutput {
+                    let payload = try JSONSerialization.data(withJSONObject: [
+                        "model": invocation.config.name,
+                        "backend": backendPayload(result),
+                    ], options: [.prettyPrinted, .sortedKeys])
+                    print(String(decoding: payload, as: UTF8.self))
+                } else {
+                    print(result.text)
+                    if invocation.showStats {
+                        printGenerateStats(invocation, result: result)
+                    }
                 }
                 return 0
             case .demo, .compare:
-                let useTUI = shouldUseTUI(command: command, options: options)
+                let useTUI = invocation.config.architecture == .gpt2 && shouldUseTUI(command: command, options: options)
                 let report = if useTUI {
                     try runLiveCompare(invocation: invocation, defaults: defaults, powerEnabled: powerEnabled)
                 } else {
                     try runCompareOrBench(invocation: invocation, defaults: defaults, powerEnabled: powerEnabled)
                 }
                 let outputDirectory = try writeCompareArtifacts(report: report, defaults: defaults, requestedOutputDir: invocation.outputDir)
-                let finalized = CompareReport(
-                    model: report.model,
-                    prompt: report.prompt,
-                    maxTokens: report.maxTokens,
-                    seed: report.seed,
-                    espresso: report.espresso,
-                    coreML: report.coreML,
-                    tokenMatch: report.tokenMatch,
-                    textMatch: report.textMatch,
-                    coreMLComputeUnits: report.coreMLComputeUnits,
-                    coreMLSequenceLength: report.coreMLSequenceLength,
-                    espressoPower: report.espressoPower,
-                    coreMLPower: report.coreMLPower,
-                    outputDirectory: outputDirectory
-                )
+                let finalized = finalizedCompareReport(report, outputDirectory: outputDirectory)
                 if options.jsonOutput {
                     let payload = try JSONSerialization.data(withJSONObject: [
                         "model": finalized.model,
@@ -1800,21 +2239,7 @@ enum EspressoGenerateCLI {
             case .bench:
                 let report = try runCompareOrBench(invocation: invocation, defaults: defaults, powerEnabled: powerEnabled)
                 let outputDirectory = try writeCompareArtifacts(report: report, defaults: defaults, requestedOutputDir: invocation.outputDir)
-                let finalized = CompareReport(
-                    model: report.model,
-                    prompt: report.prompt,
-                    maxTokens: report.maxTokens,
-                    seed: report.seed,
-                    espresso: report.espresso,
-                    coreML: report.coreML,
-                    tokenMatch: report.tokenMatch,
-                    textMatch: report.textMatch,
-                    coreMLComputeUnits: report.coreMLComputeUnits,
-                    coreMLSequenceLength: report.coreMLSequenceLength,
-                    espressoPower: report.espressoPower,
-                    coreMLPower: report.coreMLPower,
-                    outputDirectory: outputDirectory
-                )
+                let finalized = finalizedCompareReport(report, outputDirectory: outputDirectory)
                 if options.jsonOutput {
                     let payload = try JSONSerialization.data(withJSONObject: [
                         "report_dir": outputDirectory,
@@ -1826,6 +2251,13 @@ enum EspressoGenerateCLI {
                     printCompareSummary(finalized)
                 }
                 return 0
+            case .suite:
+                return try runPromptSuite(
+                    invocation: invocation,
+                    options: options,
+                    defaults: defaults,
+                    powerEnabled: powerEnabled
+                )
             case .doctor:
                 return try runDoctor(defaults: defaults, options: options)
             }

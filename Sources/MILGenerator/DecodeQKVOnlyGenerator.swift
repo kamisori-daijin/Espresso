@@ -19,22 +19,28 @@ import ANEGraphIR
 /// - `vNew`: `[1, kvDim, 1, laneSpatial]`
 public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
     public let dim: Int
+    public let qDim: Int
     public let kvDim: Int
     public let laneSpatial: Int
     public let architecture: LayerWeightsArchitecture
+    public let normEps: Float
 
     public init(
         dim: Int = ModelConfig.dim,
+        qDim: Int? = nil,
         kvDim: Int? = nil,
         laneSpatial: Int = 32,
-        architecture: LayerWeightsArchitecture = .rmsNormSwiGLU
+        architecture: LayerWeightsArchitecture = .rmsNormSwiGLU,
+        normEps: Float = 1e-5
     ) {
         precondition(dim > 0)
         precondition(laneSpatial > 0)
         self.dim = dim
+        self.qDim = qDim ?? dim
         self.kvDim = kvDim ?? dim
         self.laneSpatial = laneSpatial
         self.architecture = architecture
+        self.normEps = normEps
     }
 
     public var inputBytes: Int { dim * laneSpatial * 2 }
@@ -47,7 +53,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
     public var outputByteSizes: [Int] {
         [
             kvDim * laneSpatial * 2,
-            dim * laneSpatial * 2,
+            qDim * laneSpatial * 2,
             kvDim * laneSpatial * 2,
         ]
     }
@@ -64,7 +70,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                     input: x,
                     dim: dim,
                     spatial: laneSpatial,
-                    eps: 0.00001,
+                    eps: normEps,
                     weightPath: "@model_path/weights/rms1.bin"
                 )
             case .gpt2:
@@ -73,7 +79,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                     input: x,
                     dim: dim,
                     spatial: laneSpatial,
-                    eps: 0.00001,
+                    eps: normEps,
                     gammaPath: "@model_path/weights/rms1.bin",
                     betaPath: "@model_path/weights/rms1_beta.bin"
                 )
@@ -83,7 +89,7 @@ public struct DecodeQKVOnlyGenerator: MILProgramGenerator {
                 "q",
                 input: normalized,
                 inDim: dim,
-                outDim: dim,
+                outDim: qDim,
                 spatial: laneSpatial,
                 weightPath: "@model_path/weights/wq.bin",
                 biasPath: architecture == .gpt2 ? "@model_path/weights/bq.bin" : nil

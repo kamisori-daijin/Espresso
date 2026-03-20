@@ -15,6 +15,9 @@ public struct MultiModelConfig: Sendable, Equatable {
     public let eosToken: TokenID?
     public let architecture: Architecture
 
+    public var attentionDim: Int { nHead * headDim }
+    public var kvDim: Int { nKVHead * headDim }
+
     public enum Architecture: Sendable, Equatable {
         case gpt2
         case llama

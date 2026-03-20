@@ -99,6 +99,50 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
 }
 
 public final class MetalAttentionKernel {
+    static let moduloKVHeadMappingEnvKey = "ESPRESSO_METAL_KV_HEAD_MODULO"
+
+    enum KVHeadMappingMode: Sendable, Equatable {
+        case groupedContiguous
+        case moduloInterleaved
+    }
+
+    static func resolvedKVHeadMappingMode(
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> KVHeadMappingMode {
+        guard let rawValue = environment[moduloKVHeadMappingEnvKey] else {
+            return .groupedContiguous
+        }
+        switch rawValue.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "1", "true", "yes", "on":
+            return .moduloInterleaved
+        default:
+            return .groupedContiguous
+        }
+    }
+
+    static func kvHeadIndex(
+        queryHead: Int,
+        heads: Int,
+        kvHeads: Int,
+        mode: KVHeadMappingMode
+    ) -> Int {
+        switch mode {
+        case .groupedContiguous:
+            return queryHead / (heads / kvHeads)
+        case .moduloInterleaved:
+            return queryHead % kvHeads
+        }
+    }
+
+    private static var decodeKVHeadExpression: String {
+        switch resolvedKVHeadMappingMode() {
+        case .groupedContiguous:
+            return "head / (params.heads / params.kvHeads)"
+        case .moduloInterleaved:
+            return "head % params.kvHeads"
+        }
+    }
+
     private struct AttentionParams {
         var heads: UInt32
         var headDim: UInt32
@@ -110,7 +154,7 @@ public final class MetalAttentionKernel {
         var pad3: Float = 0
     }
 
-    private final class SurfaceBinding {
+    fileprivate final class SurfaceBinding {
         let surface: IOSurfaceRef
         let buffer: MTLBuffer
 
@@ -230,6 +274,39 @@ public final class MetalAttentionKernel {
         var pad1: Float = 0
     }
 
+    private struct RoPEParams {
+        var nHeads: UInt32
+        var nKVHeads: UInt32
+        var headDim: UInt32
+        var position: UInt32
+        var laneStride: UInt32
+        var theta: Float
+        var pad0: UInt32 = 0
+        var pad1: UInt32 = 0
+    }
+
+    private struct KVScatterParams {
+        var kvDim: UInt32
+        var tokenIndex: UInt32
+        var cacheStride: UInt32
+        var laneStride: UInt32
+    }
+
+    /// RoPE configuration for Metal-side rotation.
+    public struct MetalRoPEConfig {
+        public let nHeads: Int
+        public let nKVHeads: Int
+        public let headDim: Int
+        public let theta: Float
+
+        public init(nHeads: Int, nKVHeads: Int, headDim: Int, theta: Float) {
+            self.nHeads = nHeads
+            self.nKVHeads = nKVHeads
+            self.headDim = headDim
+            self.theta = theta
+        }
+    }
+
     private final class DecodeScratch {
         let scoresBuffer: MTLBuffer
         let weightsBuffer: MTLBuffer
@@ -263,6 +340,9 @@ public final class MetalAttentionKernel {
     private let decodeOutputPipeline: MTLComputePipelineState
     private let decodeOutputStridedPipeline: MTLComputePipelineState
     private let decodeProjectionPipeline: MTLComputePipelineState
+    private let fusedDecodeSDPAPipeline: MTLComputePipelineState
+    private let ropeDecodePipeline: MTLComputePipelineState
+    private let kvCacheScatterPipeline: MTLComputePipelineState
     private var decodeScratchBuffers: [Int: DecodeScratch] = [:]
     private var projectionBuffers: [String: DecodeProjectionBuffers] = [:]
 
@@ -302,6 +382,15 @@ public final class MetalAttentionKernel {
         guard let decodeProjectionFunction = library.makeFunction(name: "decode_output_projection") else {
             throw .libraryBuildFailed("missing decode_output_projection")
         }
+        guard let fusedDecodeSDPAFunction = library.makeFunction(name: "fused_decode_sdpa") else {
+            throw .libraryBuildFailed("missing fused_decode_sdpa")
+        }
+        guard let ropeDecodeFunction = library.makeFunction(name: "rope_decode") else {
+            throw .libraryBuildFailed("missing rope_decode")
+        }
+        guard let kvCacheScatterFunction = library.makeFunction(name: "kv_cache_scatter") else {
+            throw .libraryBuildFailed("missing kv_cache_scatter")
+        }
 
         do {
             logitsPipeline = try device.makeComputePipelineState(function: logitsFunction)
@@ -311,6 +400,9 @@ public final class MetalAttentionKernel {
             decodeOutputPipeline = try device.makeComputePipelineState(function: decodeOutputFunction)
             decodeOutputStridedPipeline = try device.makeComputePipelineState(function: decodeOutputStridedFunction)
             decodeProjectionPipeline = try device.makeComputePipelineState(function: decodeProjectionFunction)
+            fusedDecodeSDPAPipeline = try device.makeComputePipelineState(function: fusedDecodeSDPAFunction)
+            ropeDecodePipeline = try device.makeComputePipelineState(function: ropeDecodeFunction)
+            kvCacheScatterPipeline = try device.makeComputePipelineState(function: kvCacheScatterFunction)
         } catch {
             throw .pipelineBuildFailed(String(describing: error))
         }
@@ -391,27 +483,28 @@ public final class MetalAttentionKernel {
         shape: MetalDecodeAttentionShape,
         projection: HybridOutputProjectionWeights
     ) throws(MetalAttentionError) {
-        let dim = shape.heads * shape.headDim
+        let attentionDim = shape.heads * shape.headDim
         let kvDim = shape.kvHeads * shape.headDim
-        guard projection.rowMajorWeights.count == dim * dim else {
+        guard projection.rowMajorWeights.count == projection.outputDim * projection.inputDim else {
             throw .invalidInputCount(
-                "output projection count \(projection.rowMajorWeights.count) != expected \(dim * dim)"
+                "output projection count \(projection.rowMajorWeights.count) != expected \(projection.outputDim * projection.inputDim)"
             )
         }
-        guard projection.rowMajorBias.count == dim else {
+        guard projection.rowMajorBias.count == projection.outputDim else {
             throw .invalidInputCount(
-                "output projection bias count \(projection.rowMajorBias.count) != expected \(dim)"
+                "output projection bias count \(projection.rowMajorBias.count) != expected \(projection.outputDim)"
             )
         }
 
-        let laneElementCount = dim * shape.laneStride
+        let qLaneElementCount = attentionDim * shape.laneStride
         let kvCacheElementCount = kvDim * shape.cacheStride
-        let qBinding = try SurfaceBinding(surface: qSurface, elementCount: laneElementCount, device: device)
+        let outputLaneElementCount = projection.outputDim * shape.laneStride
+        let qBinding = try SurfaceBinding(surface: qSurface, elementCount: qLaneElementCount, device: device)
         let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: kvCacheElementCount, device: device)
         let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: kvCacheElementCount, device: device)
-        let residualBinding = try SurfaceBinding(surface: residualSurface, elementCount: laneElementCount, device: device)
-        let outputBinding = try SurfaceBinding(surface: outputSurface, elementCount: laneElementCount, device: device)
-        let scratch = try decodeScratch(for: shape, dim: dim)
+        let residualBinding = try SurfaceBinding(surface: residualSurface, elementCount: outputLaneElementCount, device: device)
+        let outputBinding = try SurfaceBinding(surface: outputSurface, elementCount: outputLaneElementCount, device: device)
+        let scratch = try decodeScratch(for: shape, dim: attentionDim)
         let projectionBuffers = try decodeProjectionBuffers(for: projection)
         try encodeDecodeAndWait(
             qBinding: qBinding,
@@ -481,6 +574,456 @@ public final class MetalAttentionKernel {
             outputPipeline: decodeOutputStridedPipeline,
             scratch: scratch,
             shape: shape
+        )
+    }
+
+    // MARK: - Cached Surface Metadata (Phase 1 optimization)
+
+    fileprivate final class TransientAttentionBindings {
+        let qBinding: SurfaceBinding
+        let kBinding: SurfaceBinding
+        let vBinding: SurfaceBinding
+        let contextBinding: SurfaceBinding
+
+        init(cached: CachedLayerBindings, device: MTLDevice) throws(MetalAttentionError) {
+            qBinding = try SurfaceBinding(
+                surface: cached.qSurface,
+                byteCount: cached.qByteCount,
+                device: device
+            )
+            kBinding = try SurfaceBinding(
+                surface: cached.kCacheSurface,
+                byteCount: cached.kvCacheByteCount,
+                device: device
+            )
+            vBinding = try SurfaceBinding(
+                surface: cached.vCacheSurface,
+                byteCount: cached.kvCacheByteCount,
+                device: device
+            )
+            contextBinding = try SurfaceBinding(
+                surface: cached.contextSurface,
+                byteCount: cached.contextByteCount,
+                device: device
+            )
+        }
+
+        var all: [SurfaceBinding] {
+            [qBinding, kBinding, vBinding, contextBinding]
+        }
+    }
+
+    fileprivate final class TransientKVCacheBindings {
+        let kBinding: SurfaceBinding
+        let vBinding: SurfaceBinding
+
+        init(cached: CachedLayerBindings, device: MTLDevice) throws(MetalAttentionError) {
+            kBinding = try SurfaceBinding(
+                surface: cached.kCacheSurface,
+                byteCount: cached.kvCacheByteCount,
+                device: device
+            )
+            vBinding = try SurfaceBinding(
+                surface: cached.vCacheSurface,
+                byteCount: cached.kvCacheByteCount,
+                device: device
+            )
+        }
+
+        var all: [SurfaceBinding] {
+            [kBinding, vBinding]
+        }
+    }
+
+    fileprivate final class RetainedSurfaceBindings: @unchecked Sendable {
+        let bindings: [SurfaceBinding]
+
+        init(_ bindings: [SurfaceBinding]) {
+            self.bindings = bindings
+        }
+    }
+
+    /// Cached per-layer surface metadata for decode bindings.
+    /// Mutable IOSurfaces are rebound per dispatch so Metal never holds a
+    /// long-lived `MTLBuffer(bytesNoCopy:)` across ANE/CPU writes.
+    public final class CachedLayerBindings {
+        fileprivate let qSurface: IOSurfaceRef
+        fileprivate let kCacheSurface: IOSurfaceRef
+        fileprivate let vCacheSurface: IOSurfaceRef
+        fileprivate let contextSurface: IOSurfaceRef
+        fileprivate let qByteCount: Int
+        fileprivate let kvCacheByteCount: Int
+        fileprivate let contextByteCount: Int
+
+        public init(
+            qSurface: IOSurfaceRef,
+            kCacheSurface: IOSurfaceRef,
+            vCacheSurface: IOSurfaceRef,
+            contextSurface: IOSurfaceRef,
+            dim: Int,
+            kvDim: Int,
+            laneStride: Int,
+            cacheStride: Int,
+            device: MTLDevice
+        ) throws(MetalAttentionError) {
+            let laneElementCount = dim * laneStride
+            let kvCacheElementCount = kvDim * cacheStride
+            _ = device
+            self.qSurface = qSurface
+            self.kCacheSurface = kCacheSurface
+            self.vCacheSurface = vCacheSurface
+            self.contextSurface = contextSurface
+            self.qByteCount = laneElementCount * MemoryLayout<UInt16>.stride
+            self.kvCacheByteCount = kvCacheElementCount * MemoryLayout<UInt16>.stride
+            self.contextByteCount = laneElementCount * MemoryLayout<Float>.stride
+        }
+
+        fileprivate func makeTransientAttentionBindings(device: MTLDevice) throws(MetalAttentionError) -> TransientAttentionBindings {
+            try TransientAttentionBindings(cached: self, device: device)
+        }
+
+        fileprivate func makeTransientKVCacheBindings(device: MTLDevice) throws(MetalAttentionError) -> TransientKVCacheBindings {
+            try TransientKVCacheBindings(cached: self, device: device)
+        }
+    }
+
+    private static func retain(bindings: [SurfaceBinding], until commandBuffer: MTLCommandBuffer) {
+        let retained = RetainedSurfaceBindings(bindings)
+        commandBuffer.addCompletedHandler { _ in
+            _ = retained
+        }
+    }
+
+    /// Cache immutable surface metadata for a layer's decode surfaces. Call once at engine init time.
+    public func createCachedLayerBindings(
+        qSurface: IOSurfaceRef,
+        kCacheSurface: IOSurfaceRef,
+        vCacheSurface: IOSurfaceRef,
+        contextSurface: IOSurfaceRef,
+        dim: Int,
+        kvDim: Int,
+        laneStride: Int,
+        cacheStride: Int
+    ) throws(MetalAttentionError) -> CachedLayerBindings {
+        try CachedLayerBindings(
+            qSurface: qSurface,
+            kCacheSurface: kCacheSurface,
+            vCacheSurface: vCacheSurface,
+            contextSurface: contextSurface,
+            dim: dim,
+            kvDim: kvDim,
+            laneStride: laneStride,
+            cacheStride: cacheStride,
+            device: device
+        )
+    }
+
+    /// Fast-path decode using cached surface metadata. Mutable surfaces are rebound
+    /// on demand so each dispatch gets fresh Metal views over the latest contents.
+    public func runDecodeContextFromCachedBindings(
+        cached: CachedLayerBindings,
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) {
+        let dim = shape.heads * shape.headDim
+        let scratch = try decodeScratch(for: shape, dim: dim)
+        let bindings = try cached.makeTransientAttentionBindings(device: device)
+        try encodeDecodeContextAndWait(
+            qBinding: bindings.qBinding,
+            kBinding: bindings.kBinding,
+            vBinding: bindings.vBinding,
+            contextBuffer: bindings.contextBinding.buffer,
+            outputPipeline: decodeOutputStridedPipeline,
+            scratch: scratch,
+            shape: shape
+        )
+    }
+
+    // MARK: - Fused SDPA (Phase 3 optimization)
+
+    /// Fused decode SDPA from cached bindings: single Metal dispatch per head
+    /// instead of 3 separate dispatches (logits, softmax, output).
+    public func runFusedDecodeSDPAFromCachedBindings(
+        cached: CachedLayerBindings,
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) {
+        let bindings = try cached.makeTransientAttentionBindings(device: device)
+        try encodeFusedDecodeSDPAAndWait(
+            qBinding: bindings.qBinding,
+            kBinding: bindings.kBinding,
+            vBinding: bindings.vBinding,
+            contextBuffer: bindings.contextBinding.buffer,
+            shape: shape
+        )
+    }
+
+    /// Fused decode SDPA from raw surfaces (creates temporary bindings).
+    public func runFusedDecodeSDPAIntoSurface(
+        qSurface: IOSurfaceRef,
+        kCacheSurface: IOSurfaceRef,
+        vCacheSurface: IOSurfaceRef,
+        contextSurface: IOSurfaceRef,
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) {
+        let dim = shape.heads * shape.headDim
+        let kvDim = shape.kvHeads * shape.headDim
+        let laneElementCount = dim * shape.laneStride
+        let kvCacheElementCount = kvDim * shape.cacheStride
+        let qBinding = try SurfaceBinding(surface: qSurface, elementCount: laneElementCount, device: device)
+        let kBinding = try SurfaceBinding(surface: kCacheSurface, elementCount: kvCacheElementCount, device: device)
+        let vBinding = try SurfaceBinding(surface: vCacheSurface, elementCount: kvCacheElementCount, device: device)
+        let contextBinding = try SurfaceBinding(
+            surface: contextSurface,
+            byteCount: laneElementCount * MemoryLayout<Float>.stride,
+            device: device
+        )
+        try encodeFusedDecodeSDPAAndWait(
+            qBinding: qBinding,
+            kBinding: kBinding,
+            vBinding: vBinding,
+            contextBuffer: contextBinding.buffer,
+            shape: shape
+        )
+    }
+
+    private func encodeFusedDecodeSDPA(
+        qBinding: SurfaceBinding,
+        kBinding: SurfaceBinding,
+        vBinding: SurfaceBinding,
+        contextBuffer: MTLBuffer,
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) -> MTLCommandBuffer {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+
+        let decodeParams = DecodeParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            visibleTokens: UInt32(shape.visibleTokens),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride),
+            kvHeads: UInt32(shape.kvHeads),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        encoder.setComputePipelineState(fusedDecodeSDPAPipeline)
+        encoder.setBuffer(qBinding.buffer, offset: 0, index: 0)
+        encoder.setBuffer(kBinding.buffer, offset: 0, index: 1)
+        encoder.setBuffer(vBinding.buffer, offset: 0, index: 2)
+        encoder.setBuffer(contextBuffer, offset: 0, index: 3)
+        withUnsafeBytes(of: decodeParams) { rawBytes in
+            encoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
+        }
+        // Threadgroup memory for scores: visibleTokens floats
+        let tgMemSize = shape.visibleTokens * MemoryLayout<Float>.stride
+        encoder.setThreadgroupMemoryLength(tgMemSize, index: 0)
+
+        let tgWidth = min(shape.visibleTokens, fusedDecodeSDPAPipeline.maxTotalThreadsPerThreadgroup)
+        encoder.dispatchThreadgroups(
+            MTLSize(width: shape.heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1)
+        )
+        encoder.endEncoding()
+        return commandBuffer
+    }
+
+    private func encodeFusedDecodeSDPAAndWait(
+        qBinding: SurfaceBinding,
+        kBinding: SurfaceBinding,
+        vBinding: SurfaceBinding,
+        contextBuffer: MTLBuffer,
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) {
+        let commandBuffer = try encodeFusedDecodeSDPA(
+            qBinding: qBinding, kBinding: kBinding, vBinding: vBinding,
+            contextBuffer: contextBuffer, shape: shape
+        )
+        commandBuffer.commit()
+        commandBuffer.waitUntilCompleted()
+        if commandBuffer.status != .completed {
+            throw .commandExecutionFailed(commandBuffer.error?.localizedDescription ?? "status=\(commandBuffer.status.rawValue)")
+        }
+    }
+
+    // MARK: - Pipelined Submission (Phase 4)
+
+    /// Submit fused SDPA without waiting — returns the committed command buffer.
+    /// Caller must call `waitForMetalCompletion(_:)` before reading the context surface.
+    public func submitFusedDecodeSDPAFromCachedBindings(
+        cached: CachedLayerBindings,
+        shape: MetalDecodeAttentionShape
+    ) throws(MetalAttentionError) -> MTLCommandBuffer {
+        let bindings = try cached.makeTransientAttentionBindings(device: device)
+        let cb = try encodeFusedDecodeSDPA(
+            qBinding: bindings.qBinding,
+            kBinding: bindings.kBinding,
+            vBinding: bindings.vBinding,
+            contextBuffer: bindings.contextBinding.buffer,
+            shape: shape
+        )
+        Self.retain(bindings: bindings.all, until: cb)
+        cb.commit()
+        return cb
+    }
+
+    /// Wait for a previously submitted command buffer to complete.
+    public func waitForMetalCompletion(_ commandBuffer: MTLCommandBuffer) throws(MetalAttentionError) {
+        commandBuffer.waitUntilCompleted()
+        if commandBuffer.status != .completed {
+            throw .commandExecutionFailed(
+                commandBuffer.error?.localizedDescription ?? "status=\(commandBuffer.status.rawValue)"
+            )
+        }
+    }
+
+    // MARK: - Fused RoPE + KV Scatter + SDPA (Phase 5)
+
+    /// Submit a single command buffer that encodes:
+    /// 1. RoPE rotation on Q and K surfaces in-place
+    /// 2. KV cache scatter (copy K,V at lane 0 to cache at tokenIndex)
+    /// 3. Fused SDPA (Q*K^T, softmax, weighted V)
+    /// Returns the committed (non-blocking) command buffer.
+    public func submitFullPipelinedDecodeFromCachedBindings(
+        cached: CachedLayerBindings,
+        shape: MetalDecodeAttentionShape,
+        ropeConfig: MetalRoPEConfig,
+        tokenIndex: Int
+    ) throws(MetalAttentionError) -> MTLCommandBuffer {
+        guard let commandBuffer = commandQueue.makeCommandBuffer() else {
+            throw .commandBufferUnavailable
+        }
+        let bindings = try cached.makeTransientAttentionBindings(device: device)
+
+        // Encode RoPE
+        let ropeParams = RoPEParams(
+            nHeads: UInt32(ropeConfig.nHeads),
+            nKVHeads: UInt32(ropeConfig.nKVHeads),
+            headDim: UInt32(ropeConfig.headDim),
+            position: UInt32(tokenIndex),
+            laneStride: UInt32(shape.laneStride),
+            theta: ropeConfig.theta
+        )
+        guard let ropeEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        ropeEncoder.setComputePipelineState(ropeDecodePipeline)
+        ropeEncoder.setBuffer(bindings.qBinding.buffer, offset: 0, index: 0)
+        ropeEncoder.setBuffer(bindings.kBinding.buffer, offset: 0, index: 1)  // K output surface (also kCache src)
+        withUnsafeBytes(of: ropeParams) { rawBytes in
+            ropeEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 2)
+        }
+        let maxHeads = max(ropeConfig.nHeads, ropeConfig.nKVHeads)
+        let halfDim = ropeConfig.headDim / 2
+        ropeEncoder.dispatchThreads(
+            MTLSize(width: halfDim, height: maxHeads, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(halfDim, ropeDecodePipeline.threadExecutionWidth),
+                height: 1,
+                depth: 1
+            )
+        )
+        ropeEncoder.endEncoding()
+
+        // Encode KV Cache Scatter
+        // Note: kBinding here is the K *output* surface from ANE QKV, not the cache.
+        // We need separate bindings for K/V source and K/V cache destination.
+        // But CachedLayerBindings.kBinding IS the kCache. We need the K output surface binding.
+        // For Phase 5, the Q surface from cached contains the Q output (rotated by RoPE above),
+        // and kBinding/vBinding are the K/V cache surfaces.
+        // The K/V outputs from ANE are on separate surfaces not in CachedLayerBindings.
+        // So we need to pass them separately.
+        // Actually, looking at the architecture: CachedLayerBindings holds qOut, kCacheFull, vCacheFull, projectionContextIn.
+        // The K/V output surfaces are handles.kOut and handles.vOut, NOT cached.
+        // We need the K/V output surfaces to scatter FROM.
+        // This means Phase 5 needs a different API that takes K/V output surfaces too.
+
+        // For now, just encode SDPA (RoPE is done, KV scatter still needs K/V output bindings)
+        // We'll handle KV scatter in the decode loop where we have access to kOut/vOut surfaces.
+
+        // Encode fused SDPA
+        let decodeParams = DecodeParams(
+            heads: UInt32(shape.heads),
+            headDim: UInt32(shape.headDim),
+            visibleTokens: UInt32(shape.visibleTokens),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride),
+            kvHeads: UInt32(shape.kvHeads),
+            scale: 1.0 / sqrt(Float(shape.headDim))
+        )
+        guard let sdpaEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        sdpaEncoder.setComputePipelineState(fusedDecodeSDPAPipeline)
+        sdpaEncoder.setBuffer(bindings.qBinding.buffer, offset: 0, index: 0)
+        sdpaEncoder.setBuffer(bindings.kBinding.buffer, offset: 0, index: 1)
+        sdpaEncoder.setBuffer(bindings.vBinding.buffer, offset: 0, index: 2)
+        sdpaEncoder.setBuffer(bindings.contextBinding.buffer, offset: 0, index: 3)
+        withUnsafeBytes(of: decodeParams) { rawBytes in
+            sdpaEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
+        }
+        let tgMemSize = shape.visibleTokens * MemoryLayout<Float>.stride
+        sdpaEncoder.setThreadgroupMemoryLength(tgMemSize, index: 0)
+        let tgWidth = min(shape.visibleTokens, fusedDecodeSDPAPipeline.maxTotalThreadsPerThreadgroup)
+        sdpaEncoder.dispatchThreadgroups(
+            MTLSize(width: shape.heads, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(width: tgWidth, height: 1, depth: 1)
+        )
+        sdpaEncoder.endEncoding()
+
+        Self.retain(bindings: bindings.all, until: commandBuffer)
+        commandBuffer.commit()
+        return commandBuffer
+    }
+
+    /// Encode KV cache scatter into an existing command buffer.
+    /// Called separately because K/V output surfaces are not in CachedLayerBindings.
+    public func encodeKVCacheScatter(
+        commandBuffer: MTLCommandBuffer,
+        kOutputSurface: IOSurfaceRef,
+        vOutputSurface: IOSurfaceRef,
+        kCacheBinding: CachedLayerBindings,
+        shape: MetalDecodeAttentionShape,
+        kvDim: Int,
+        tokenIndex: Int
+    ) throws(MetalAttentionError) {
+        let kvOutputElementCount = kvDim * shape.laneStride
+        let kOutBinding = try SurfaceBinding(surface: kOutputSurface, elementCount: kvOutputElementCount, device: device)
+        let vOutBinding = try SurfaceBinding(surface: vOutputSurface, elementCount: kvOutputElementCount, device: device)
+        let cacheBindings = try kCacheBinding.makeTransientKVCacheBindings(device: device)
+
+        let params = KVScatterParams(
+            kvDim: UInt32(kvDim),
+            tokenIndex: UInt32(tokenIndex),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride)
+        )
+        guard let encoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        encoder.setComputePipelineState(kvCacheScatterPipeline)
+        encoder.setBuffer(kOutBinding.buffer, offset: 0, index: 0)
+        encoder.setBuffer(vOutBinding.buffer, offset: 0, index: 1)
+        encoder.setBuffer(cacheBindings.kBinding.buffer, offset: 0, index: 2)
+        encoder.setBuffer(cacheBindings.vBinding.buffer, offset: 0, index: 3)
+        withUnsafeBytes(of: params) { rawBytes in
+            encoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
+        }
+        encoder.dispatchThreads(
+            MTLSize(width: kvDim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(kvDim, kvCacheScatterPipeline.threadExecutionWidth),
+                height: 1,
+                depth: 1
+            )
+        )
+        encoder.endEncoding()
+
+        Self.retain(
+            bindings: [kOutBinding, vOutBinding] + cacheBindings.all,
+            until: commandBuffer
         )
     }
 
@@ -910,7 +1453,9 @@ public final class MetalAttentionKernel {
         return Double(nanos) / 1_000_000.0
     }
 
-    private static let shaderSource = """
+    private static var shaderSource: String {
+        let decodeKVHeadExpression = Self.decodeKVHeadExpression
+        return """
     #include <metal_stdlib>
     using namespace metal;
 
@@ -1027,7 +1572,7 @@ public final class MetalAttentionKernel {
             return;
         }
 
-        uint kvHead = head / (params.heads / params.kvHeads);
+        uint kvHead = \(decodeKVHeadExpression);
         float dot = 0.0f;
         uint qHeadOffset = head * params.headDim;
         uint kHeadOffset = kvHead * params.headDim;
@@ -1053,7 +1598,7 @@ public final class MetalAttentionKernel {
             return;
         }
 
-        uint kvHead = head / (params.heads / params.kvHeads);
+        uint kvHead = \(decodeKVHeadExpression);
         uint vChannel = kvHead * params.headDim + dim;
         float accum = 0.0f;
         uint weightBase = head * params.visibleTokens;
@@ -1078,7 +1623,7 @@ public final class MetalAttentionKernel {
             return;
         }
 
-        uint kvHead = head / (params.heads / params.kvHeads);
+        uint kvHead = \(decodeKVHeadExpression);
         uint vChannel = kvHead * params.headDim + dim;
         float accum = 0.0f;
         uint weightBase = head * params.visibleTokens;
@@ -1114,5 +1659,150 @@ public final class MetalAttentionKernel {
         uint laneIndex = dim * params.laneStride;
         output[laneIndex] = half(accum + bias[dim] + float(residual[laneIndex]));
     }
+
+    // RoPE rotation applied to Q and K surfaces in-place.
+    // Llama-family RoPE uses half-split pairs: (0, halfDim), (1, halfDim+1), ...
+    // Grid: (headDim/2, max(nHeads, nKVHeads), 1)
+    struct RoPEParams {
+        uint nHeads;
+        uint nKVHeads;
+        uint headDim;
+        uint position;
+        uint laneStride;
+        float theta;
+        uint pad0;
+        uint pad1;
+    };
+
+    kernel void rope_decode(
+        device half *q [[buffer(0)]],
+        device half *k [[buffer(1)]],
+        constant RoPEParams &params [[buffer(2)]],
+        uint2 gid [[thread_position_in_grid]]
+    ) {
+        uint dimPair = gid.x;   // 0..<headDim/2
+        uint headIdx = gid.y;   // 0..<max(nHeads, nKVHeads)
+        uint halfDim = params.headDim / 2;
+        if (dimPair >= halfDim) return;
+
+        float freqBase = pow(params.theta, -float(dimPair) / float(halfDim));
+        float angle = float(params.position) * freqBase;
+        float cosA = cos(angle);
+        float sinA = sin(angle);
+
+        uint d0 = dimPair;
+        uint d1 = dimPair + halfDim;
+
+        // Apply to Q if headIdx < nHeads
+        if (headIdx < params.nHeads) {
+            uint qIdx0 = (headIdx * params.headDim + d0) * params.laneStride;
+            uint qIdx1 = (headIdx * params.headDim + d1) * params.laneStride;
+            float q0 = float(q[qIdx0]);
+            float q1 = float(q[qIdx1]);
+            q[qIdx0] = half(q0 * cosA - q1 * sinA);
+            q[qIdx1] = half(q0 * sinA + q1 * cosA);
+        }
+
+        // Apply to K if headIdx < nKVHeads
+        if (headIdx < params.nKVHeads) {
+            uint kIdx0 = (headIdx * params.headDim + d0) * params.laneStride;
+            uint kIdx1 = (headIdx * params.headDim + d1) * params.laneStride;
+            float k0 = float(k[kIdx0]);
+            float k1 = float(k[kIdx1]);
+            k[kIdx0] = half(k0 * cosA - k1 * sinA);
+            k[kIdx1] = half(k0 * sinA + k1 * cosA);
+        }
+    }
+
+    // KV cache scatter: copy K and V outputs at lane 0 into their cache at tokenIndex.
+    // Grid: (kvDim, 1, 1) — one thread per channel.
+    struct KVScatterParams {
+        uint kvDim;
+        uint tokenIndex;
+        uint cacheStride;
+        uint laneStride;
+    };
+
+    kernel void kv_cache_scatter(
+        const device half *kSrc [[buffer(0)]],
+        const device half *vSrc [[buffer(1)]],
+        device half *kCache [[buffer(2)]],
+        device half *vCache [[buffer(3)]],
+        constant KVScatterParams &params [[buffer(4)]],
+        uint gid [[thread_position_in_grid]]
+    ) {
+        uint ch = gid;
+        if (ch >= params.kvDim) return;
+        uint srcIdx = ch * params.laneStride;  // lane 0 of source surface
+        uint dstIdx = ch * params.cacheStride + params.tokenIndex;
+        kCache[dstIdx] = kSrc[srcIdx];
+        vCache[dstIdx] = vSrc[srcIdx];
+    }
+
+    // Fused decode SDPA: Q*K^T, softmax, weighted V sum in one dispatch per head.
+    // One threadgroup per head. Uses threadgroup memory for the scores vector.
+    // Grid: (heads, 1, 1), Threadgroup: (min(visibleTokens, 256), 1, 1)
+    kernel void fused_decode_sdpa(
+        const device half *q [[buffer(0)]],
+        const device half *kCache [[buffer(1)]],
+        const device half *vCache [[buffer(2)]],
+        device float *context [[buffer(3)]],
+        constant DecodeParams &params [[buffer(4)]],
+        uint head [[threadgroup_position_in_grid]],
+        uint tid [[thread_index_in_threadgroup]],
+        uint tgSize [[threads_per_threadgroup]],
+        threadgroup float *scores [[threadgroup_buffer(0)]]
+    ) {
+        if (head >= params.heads) return;
+
+        uint kvHead = \(decodeKVHeadExpression);
+        uint qHeadOffset = head * params.headDim;
+        uint kHeadOffset = kvHead * params.headDim;
+
+        // Step 1: Compute Q*K^T scores (cooperative across threads in threadgroup)
+        for (uint token = tid; token < params.visibleTokens; token += tgSize) {
+            float dot = 0.0f;
+            for (uint d = 0; d < params.headDim; ++d) {
+                uint qIndex = (qHeadOffset + d) * params.laneStride;
+                uint kIndex = (kHeadOffset + d) * params.cacheStride + token;
+                dot += float(q[qIndex]) * float(kCache[kIndex]);
+            }
+            scores[token] = dot * params.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 2: Softmax (single-thread reduction for correctness, visibleTokens is small for decode)
+        if (tid == 0) {
+            float maxScore = -INFINITY;
+            for (uint t = 0; t < params.visibleTokens; ++t) {
+                maxScore = max(maxScore, scores[t]);
+            }
+            float denom = 0.0f;
+            for (uint t = 0; t < params.visibleTokens; ++t) {
+                float val = exp(scores[t] - maxScore);
+                scores[t] = val;
+                denom += val;
+            }
+            float invDenom = denom > 0.0f ? (1.0f / denom) : 0.0f;
+            for (uint t = 0; t < params.visibleTokens; ++t) {
+                scores[t] *= invDenom;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Step 3: Weighted V sum (cooperative across headDim)
+        uint vHeadOffset = kvHead * params.headDim;
+        for (uint d = tid; d < params.headDim; d += tgSize) {
+            uint vChannel = vHeadOffset + d;
+            uint valueBase = vChannel * params.cacheStride;
+            float accum = 0.0f;
+            for (uint t = 0; t < params.visibleTokens; ++t) {
+                accum += scores[t] * float(vCache[valueBase + t]);
+            }
+            uint outChannel = head * params.headDim + d;
+            context[outChannel * params.laneStride] = accum;
+        }
+    }
     """
+    }
 }
