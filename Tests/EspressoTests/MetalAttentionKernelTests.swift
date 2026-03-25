@@ -76,6 +76,25 @@ final class MetalAttentionKernelTests: XCTestCase {
         )
     }
 
+    func test_persistent_cached_bindings_env_defaults_off() {
+        XCTAssertFalse(MetalAttentionKernel.persistentCachedBindingsEnabled(environment: [:]))
+        XCTAssertTrue(
+            MetalAttentionKernel.persistentCachedBindingsEnabled(
+                environment: [MetalAttentionKernel.persistentHybridCachedBindingsEnvKey: "1"]
+            )
+        )
+        XCTAssertTrue(
+            MetalAttentionKernel.persistentCachedBindingsEnabled(
+                environment: [MetalAttentionKernel.persistentHybridCachedBindingsEnvKey: "true"]
+            )
+        )
+        XCTAssertFalse(
+            MetalAttentionKernel.persistentCachedBindingsEnabled(
+                environment: [MetalAttentionKernel.persistentHybridCachedBindingsEnvKey: "0"]
+            )
+        )
+    }
+
     func test_metal_attention_matches_reference_on_small_problem() throws {
         let shape = try MetalAttentionShape(heads: 2, headDim: 4, seqLen: 4)
         let q: [Float] = [
