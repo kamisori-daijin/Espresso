@@ -100,7 +100,6 @@ public struct MetalDecodeAttentionShape: Sendable, Equatable {
 
 public final class MetalAttentionKernel {
     static let moduloKVHeadMappingEnvKey = "ESPRESSO_METAL_KV_HEAD_MODULO"
-    static let persistentHybridCachedBindingsEnvKey = "ESPRESSO_ENABLE_PERSISTENT_HYBRID_CACHED_BINDINGS"
 
     enum KVHeadMappingMode: Sendable, Equatable {
         case groupedContiguous
@@ -118,17 +117,6 @@ public final class MetalAttentionKernel {
             return .moduloInterleaved
         default:
             return .groupedContiguous
-        }
-    }
-
-    static func persistentCachedBindingsEnabled(
-        environment: [String: String] = ProcessInfo.processInfo.environment
-    ) -> Bool {
-        switch environment[persistentHybridCachedBindingsEnvKey]?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "1", "true", "yes", "on":
-            return true
-        default:
-            return false
         }
     }
 
@@ -659,7 +647,6 @@ public final class MetalAttentionKernel {
     /// Mutable IOSurfaces are rebound per dispatch so Metal never holds a
     /// long-lived `MTLBuffer(bytesNoCopy:)` across ANE/CPU writes.
     public final class CachedLayerBindings {
-        fileprivate let persistentBindingsLock = NSLock()
         fileprivate let qSurface: IOSurfaceRef
         fileprivate let kOutputSurface: IOSurfaceRef?
         fileprivate let vOutputSurface: IOSurfaceRef?
@@ -670,10 +657,6 @@ public final class MetalAttentionKernel {
         fileprivate let kvOutputByteCount: Int
         fileprivate let kvCacheByteCount: Int
         fileprivate let contextByteCount: Int
-        fileprivate let reusePersistentBindings: Bool
-        fileprivate var persistentAttentionBindings: TransientAttentionBindings?
-        fileprivate var persistentKVCacheBindings: TransientKVCacheBindings?
-        fileprivate var persistentKVOutputBindings: TransientKVOutputBindings?
 
         public init(
             qSurface: IOSurfaceRef,
@@ -701,55 +684,19 @@ public final class MetalAttentionKernel {
             self.kvOutputByteCount = kvDim * laneStride * MemoryLayout<UInt16>.stride
             self.kvCacheByteCount = kvCacheElementCount * MemoryLayout<UInt16>.stride
             self.contextByteCount = laneElementCount * MemoryLayout<Float>.stride
-            self.reusePersistentBindings = MetalAttentionKernel.persistentCachedBindingsEnabled()
         }
 
         fileprivate func makeTransientAttentionBindings(device: MTLDevice) throws(MetalAttentionError) -> TransientAttentionBindings {
-            if reusePersistentBindings {
-                persistentBindingsLock.lock()
-                defer { persistentBindingsLock.unlock() }
-                if let persistentAttentionBindings {
-                    return persistentAttentionBindings
-                }
-                let bindings = try TransientAttentionBindings(cached: self, device: device)
-                persistentAttentionBindings = bindings
-                return bindings
-            }
-            return try TransientAttentionBindings(cached: self, device: device)
+            try TransientAttentionBindings(cached: self, device: device)
         }
 
         fileprivate func makeTransientKVCacheBindings(device: MTLDevice) throws(MetalAttentionError) -> TransientKVCacheBindings {
-            if reusePersistentBindings {
-                persistentBindingsLock.lock()
-                defer { persistentBindingsLock.unlock() }
-                if let persistentKVCacheBindings {
-                    return persistentKVCacheBindings
-                }
-                let bindings = try TransientKVCacheBindings(cached: self, device: device)
-                persistentKVCacheBindings = bindings
-                return bindings
-            }
-            return try TransientKVCacheBindings(cached: self, device: device)
+            try TransientKVCacheBindings(cached: self, device: device)
         }
 
         fileprivate func makeTransientKVOutputBindings(device: MTLDevice) throws(MetalAttentionError) -> TransientKVOutputBindings? {
             guard let kOutputSurface, let vOutputSurface else {
                 return nil
-            }
-            if reusePersistentBindings {
-                persistentBindingsLock.lock()
-                defer { persistentBindingsLock.unlock() }
-                if let persistentKVOutputBindings {
-                    return persistentKVOutputBindings
-                }
-                let bindings = try TransientKVOutputBindings(
-                    kOutputSurface: kOutputSurface,
-                    vOutputSurface: vOutputSurface,
-                    byteCount: kvOutputByteCount,
-                    device: device
-                )
-                persistentKVOutputBindings = bindings
-                return bindings
             }
             return try TransientKVOutputBindings(
                 kOutputSurface: kOutputSurface,
