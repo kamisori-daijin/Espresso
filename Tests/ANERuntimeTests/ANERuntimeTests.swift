@@ -377,6 +377,69 @@ private func decodePassthroughProbeMIL(dim: Int, laneSpatial: Int, maxSeq: Int, 
     return lines.joined(separator: "\n")
 }
 
+final class ANECompileStatsSnapshotTests: XCTestCase {
+    func test_subtracting_preserves_label_breakdown() {
+        let before = ANECompileStatsSnapshot(
+            attemptCount: 2,
+            successCount: 1,
+            failureCount: 1,
+            retryCount: 1,
+            labelStats: [
+                "hybrid.decodeProjectionFFN.cold": ANECompileLabelStatsSnapshot(
+                    attemptCount: 2,
+                    successCount: 1,
+                    failureCount: 1,
+                    retryCount: 1
+                )
+            ]
+        )
+        let after = ANECompileStatsSnapshot(
+            attemptCount: 5,
+            successCount: 2,
+            failureCount: 3,
+            retryCount: 2,
+            labelStats: [
+                "hybrid.decodeProjectionFFN.cold": ANECompileLabelStatsSnapshot(
+                    attemptCount: 4,
+                    successCount: 1,
+                    failureCount: 3,
+                    retryCount: 2
+                ),
+                "hybrid.decodeQKVOnly.delta": ANECompileLabelStatsSnapshot(
+                    attemptCount: 1,
+                    successCount: 1,
+                    failureCount: 0,
+                    retryCount: 0
+                ),
+            ]
+        )
+
+        let delta = after.subtracting(before)
+        XCTAssertEqual(delta.attemptCount, 3)
+        XCTAssertEqual(delta.successCount, 1)
+        XCTAssertEqual(delta.failureCount, 2)
+        XCTAssertEqual(delta.retryCount, 1)
+        XCTAssertEqual(
+            delta.labelStats["hybrid.decodeProjectionFFN.cold"],
+            ANECompileLabelStatsSnapshot(
+                attemptCount: 2,
+                successCount: 0,
+                failureCount: 2,
+                retryCount: 1
+            )
+        )
+        XCTAssertEqual(
+            delta.labelStats["hybrid.decodeQKVOnly.delta"],
+            ANECompileLabelStatsSnapshot(
+                attemptCount: 1,
+                successCount: 1,
+                failureCount: 0,
+                retryCount: 0
+            )
+        )
+    }
+}
+
 final class ANERuntimeTests: XCTestCase {
     func test_ane_error_conforms_to_sendable_and_error() {
         func requireErrorAndSendable<T: Error & Sendable>(_: T.Type) {}

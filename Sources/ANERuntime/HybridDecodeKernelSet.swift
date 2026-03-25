@@ -308,6 +308,7 @@ public struct HybridDecodeKernelSet: ~Copyable {
 
     private static func compile(spec: CompileSpec, donorHexId: String?) throws(ANEError) -> ANEKernel {
         let donorDisabled = ProcessInfo.processInfo.environment["ESPRESSO_DISABLE_HYBRID_DONOR_DELTA"] == "1"
+        let compileLabelPrefix = "hybrid.\(spec.kind.rawValue)"
         if !donorDisabled, let donorHexId, !donorHexId.isEmpty {
             do {
                 return try ANEKernel(
@@ -315,6 +316,7 @@ public struct HybridDecodeKernelSet: ~Copyable {
                     weights: spec.weights,
                     inputSizes: spec.inputSizes,
                     outputSizes: spec.outputSizes,
+                    compileLabel: "\(compileLabelPrefix).delta",
                     donorHexId: donorHexId
                 )
             } catch {
@@ -326,7 +328,8 @@ public struct HybridDecodeKernelSet: ~Copyable {
             milText: spec.milText,
             weights: spec.weights,
             inputSizes: spec.inputSizes,
-            outputSizes: spec.outputSizes
+            outputSizes: spec.outputSizes,
+            compileLabel: "\(compileLabelPrefix).cold"
         )
     }
 

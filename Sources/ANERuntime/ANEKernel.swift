@@ -111,6 +111,7 @@ public struct ANEKernel: ~Copyable {
 
     static func compileWithRetry(
         checkBudget: Bool,
+        compileLabel: String? = nil,
         compileAttempt: () -> OpaquePointer?,
         lastCompileError: () -> Int32 = { ane_interop_last_compile_error() },
         sleepAfterFailedAttempt: (Int) -> Void = ANECompileRetryPolicy.sleepAfterFailedAttempt,
@@ -120,7 +121,7 @@ public struct ANEKernel: ~Copyable {
 
         while true {
             let handle: OpaquePointer?
-            ANECompileStats.recordAttempt()
+            ANECompileStats.recordAttempt(label: compileLabel)
             if checkBudget {
                 CompileGate.lock.lock()
                 if CompileBudget.isExhausted {
@@ -134,7 +135,7 @@ public struct ANEKernel: ~Copyable {
             }
 
             if let handle {
-                ANECompileStats.recordSuccess()
+                ANECompileStats.recordSuccess(label: compileLabel)
                 return handle
             }
 
@@ -143,7 +144,7 @@ public struct ANEKernel: ~Copyable {
                 lastCompileError: error,
                 attemptIndex: attemptIndex
             )
-            ANECompileStats.recordFailure(willRetry: shouldRetry)
+            ANECompileStats.recordFailure(label: compileLabel, willRetry: shouldRetry)
             guard shouldRetry else {
                 return nil
             }
@@ -170,6 +171,24 @@ public struct ANEKernel: ~Copyable {
         weights: [(path: String, data: Data)],
         inputSizes: [Int],
         outputSizes: [Int],
+        checkBudget: Bool = true
+    ) throws(ANEError) {
+        try self.init(
+            milText: milText,
+            weights: weights,
+            inputSizes: inputSizes,
+            outputSizes: outputSizes,
+            compileLabel: nil,
+            checkBudget: checkBudget
+        )
+    }
+
+    public init(
+        milText: String,
+        weights: [(path: String, data: Data)],
+        inputSizes: [Int],
+        outputSizes: [Int],
+        compileLabel: String? = nil,
         checkBudget: Bool = true
     ) throws(ANEError) {
         guard weights.count <= Int(Int32.max),
@@ -254,6 +273,7 @@ public struct ANEKernel: ~Copyable {
 
         let rawHandle = try Self.compileWithRetry(
             checkBudget: checkBudget,
+            compileLabel: compileLabel,
             compileAttempt: compileHandle
         )
 
@@ -270,6 +290,24 @@ public struct ANEKernel: ~Copyable {
         weights: [(path: String, data: Data)],
         inputSizes: [Int],
         outputSizes: [Int],
+        donorHexId: String
+    ) throws(ANEError) {
+        try self.init(
+            milText: milText,
+            weights: weights,
+            inputSizes: inputSizes,
+            outputSizes: outputSizes,
+            compileLabel: nil,
+            donorHexId: donorHexId
+        )
+    }
+
+    public init(
+        milText: String,
+        weights: [(path: String, data: Data)],
+        inputSizes: [Int],
+        outputSizes: [Int],
+        compileLabel: String? = nil,
         donorHexId: String
     ) throws(ANEError) {
         guard !donorHexId.isEmpty else {
@@ -360,6 +398,7 @@ public struct ANEKernel: ~Copyable {
 
         let rawHandle = try Self.compileWithRetry(
             checkBudget: false,
+            compileLabel: compileLabel,
             compileAttempt: reloadHandle
         )
 

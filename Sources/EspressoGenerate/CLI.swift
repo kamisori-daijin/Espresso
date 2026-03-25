@@ -414,6 +414,7 @@ struct BackendRunMetrics: Sendable {
     let tokenLatenciesMs: [Double]
     let compileRetryCount: Int
     let compileFailureCount: Int
+    let compileBreakdown: [String: ANECompileLabelStatsSnapshot]?
     let exactHeadBackend: String?
     let cachedBindingsEnabled: Bool?
 
@@ -431,6 +432,7 @@ struct BackendRunMetrics: Sendable {
         tokenLatenciesMs: [Double],
         compileRetryCount: Int = 0,
         compileFailureCount: Int = 0,
+        compileBreakdown: [String: ANECompileLabelStatsSnapshot]? = nil,
         exactHeadBackend: String? = nil,
         cachedBindingsEnabled: Bool? = nil
     ) {
@@ -447,6 +449,7 @@ struct BackendRunMetrics: Sendable {
         self.tokenLatenciesMs = tokenLatenciesMs
         self.compileRetryCount = compileRetryCount
         self.compileFailureCount = compileFailureCount
+        self.compileBreakdown = compileBreakdown
         self.exactHeadBackend = exactHeadBackend
         self.cachedBindingsEnabled = cachedBindingsEnabled
     }
@@ -512,6 +515,15 @@ private final class LockedValueBox<Value>: @unchecked Sendable {
 }
 
 private let posixLocale = Locale(identifier: "en_US_POSIX")
+
+private func formatCompileBreakdown(_ breakdown: [String: ANECompileLabelStatsSnapshot]) -> String {
+    breakdown.keys.sorted().compactMap { key in
+        guard let stats = breakdown[key] else {
+            return nil
+        }
+        return "\(key):a\(stats.attemptCount)/s\(stats.successCount)/f\(stats.failureCount)/r\(stats.retryCount)"
+    }.joined(separator: ",")
+}
 private let defaultDemoPrompt = "Hello"
 private let explicitModelAliases: [String: String] = [
     "gpt2": "gpt2_124m",
@@ -1047,6 +1059,7 @@ private func runEspressoGeneration(
         }
     )
     let compileStatsAfter = ANECompileStats.snapshot()
+    let compileStatsDelta = compileStatsAfter.subtracting(compileStatsBefore)
     return BackendRunMetrics(
         backend: "espresso",
         text: result.text,
@@ -1059,8 +1072,9 @@ private func runEspressoGeneration(
         p95TokenMs: percentile(tokenLatenciesMs, percentile: 0.95),
         totalTimeMs: totalTimeMs,
         tokenLatenciesMs: tokenLatenciesMs,
-        compileRetryCount: compileStatsAfter.retryCount - compileStatsBefore.retryCount,
-        compileFailureCount: compileStatsAfter.failureCount - compileStatsBefore.failureCount,
+        compileRetryCount: compileStatsDelta.retryCount,
+        compileFailureCount: compileStatsDelta.failureCount,
+        compileBreakdown: compileStatsDelta.labelStats.isEmpty ? nil : compileStatsDelta.labelStats,
         exactHeadBackend: result.exactHeadBackend,
         cachedBindingsEnabled: result.cachedBindingsEnabled
     )
@@ -1084,6 +1098,7 @@ func aggregateBenchmarkRuns(
     var aggregatedLatencySamples: [Double] = []
     var compileRetryCount = 0
     var compileFailureCount = 0
+    var compileBreakdown: [String: ANECompileLabelStatsSnapshot]?
     var exactHeadBackend: String?
     var cachedBindingsEnabled: Bool?
 
@@ -1093,6 +1108,7 @@ func aggregateBenchmarkRuns(
             compileTimeMs = metrics.compileTimeMs
             compileRetryCount = metrics.compileRetryCount
             compileFailureCount = metrics.compileFailureCount
+            compileBreakdown = metrics.compileBreakdown
         }
         exactHeadBackend = exactHeadBackend ?? metrics.exactHeadBackend
         cachedBindingsEnabled = cachedBindingsEnabled ?? metrics.cachedBindingsEnabled
@@ -1120,6 +1136,7 @@ func aggregateBenchmarkRuns(
         tokenLatenciesMs: lastMeasured.tokenLatenciesMs,
         compileRetryCount: compileRetryCount != 0 ? compileRetryCount : lastMeasured.compileRetryCount,
         compileFailureCount: compileFailureCount != 0 ? compileFailureCount : lastMeasured.compileFailureCount,
+        compileBreakdown: compileBreakdown ?? lastMeasured.compileBreakdown,
         exactHeadBackend: exactHeadBackend ?? lastMeasured.exactHeadBackend,
         cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled
     )
@@ -1288,6 +1305,9 @@ private func printGenerateStats(_ invocation: ResolvedInvocation, result: Backen
     if let cachedBindingsEnabled = result.cachedBindingsEnabled {
         stderrLine("cached_bindings_enabled=\(cachedBindingsEnabled)")
     }
+    if let compileBreakdown = result.compileBreakdown, !compileBreakdown.isEmpty {
+        stderrLine("compile_breakdown=\(formatCompileBreakdown(compileBreakdown))")
+    }
     stderrLine("weights=\(invocation.weightsDir)")
     stderrLine("tokenizer=\(invocation.tokenizerDir)")
 }
@@ -1334,6 +1354,9 @@ private func printCompareSummary(_ report: CompareReport) {
     }
     if let cachedBindingsEnabled = report.espresso.cachedBindingsEnabled {
         stderrLine("espresso_cached_bindings_enabled=\(cachedBindingsEnabled)")
+    }
+    if let compileBreakdown = report.espresso.compileBreakdown, !compileBreakdown.isEmpty {
+        stderrLine("espresso_compile_breakdown=\(formatCompileBreakdown(compileBreakdown))")
     }
     if let espressoPower = report.espressoPower, espressoPower.sampleCount > 0 {
         stderrLine(
@@ -1444,6 +1467,14 @@ private func backendPayload(_ backend: BackendRunMetrics) -> [String: Any] {
         "generated_tokens": backend.generatedTokens.map(Int.init),
         "token_latencies_ms": backend.tokenLatenciesMs,
         "text": backend.text,
+        "compile_breakdown": backend.compileBreakdown?.mapValues { stats in
+            [
+                "attempt_count": stats.attemptCount,
+                "success_count": stats.successCount,
+                "failure_count": stats.failureCount,
+                "retry_count": stats.retryCount,
+            ]
+        } ?? NSNull(),
         "exact_head_backend": backend.exactHeadBackend ?? NSNull(),
         "cached_bindings_enabled": backend.cachedBindingsEnabled ?? NSNull(),
     ]
