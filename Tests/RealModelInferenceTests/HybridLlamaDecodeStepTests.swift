@@ -175,6 +175,12 @@ import ModelSupport
         RealModelInferenceEngine.supportsHybridCachedBindings(
             config: storiesConfig,
             environment: [:]
+        ) == true
+    )
+    #expect(
+        RealModelInferenceEngine.supportsHybridCachedBindings(
+            config: otherLlamaConfig,
+            environment: [:]
         ) == false
     )
     #expect(

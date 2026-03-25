@@ -124,6 +124,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             return false
         }
         if config.architecture == .llama {
+            if config.name == "stories110m" {
+                return true
+            }
             return environment["ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS"] == "1"
         }
         return true
