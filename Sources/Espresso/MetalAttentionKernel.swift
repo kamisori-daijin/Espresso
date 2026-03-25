@@ -648,15 +648,20 @@ public final class MetalAttentionKernel {
     /// long-lived `MTLBuffer(bytesNoCopy:)` across ANE/CPU writes.
     public final class CachedLayerBindings {
         fileprivate let qSurface: IOSurfaceRef
+        fileprivate let kOutputSurface: IOSurfaceRef?
+        fileprivate let vOutputSurface: IOSurfaceRef?
         fileprivate let kCacheSurface: IOSurfaceRef
         fileprivate let vCacheSurface: IOSurfaceRef
         fileprivate let contextSurface: IOSurfaceRef
         fileprivate let qByteCount: Int
+        fileprivate let kvOutputByteCount: Int
         fileprivate let kvCacheByteCount: Int
         fileprivate let contextByteCount: Int
 
         public init(
             qSurface: IOSurfaceRef,
+            kOutputSurface: IOSurfaceRef? = nil,
+            vOutputSurface: IOSurfaceRef? = nil,
             kCacheSurface: IOSurfaceRef,
             vCacheSurface: IOSurfaceRef,
             contextSurface: IOSurfaceRef,
@@ -670,10 +675,13 @@ public final class MetalAttentionKernel {
             let kvCacheElementCount = kvDim * cacheStride
             _ = device
             self.qSurface = qSurface
+            self.kOutputSurface = kOutputSurface
+            self.vOutputSurface = vOutputSurface
             self.kCacheSurface = kCacheSurface
             self.vCacheSurface = vCacheSurface
             self.contextSurface = contextSurface
             self.qByteCount = laneElementCount * MemoryLayout<UInt16>.stride
+            self.kvOutputByteCount = kvDim * laneStride * MemoryLayout<UInt16>.stride
             self.kvCacheByteCount = kvCacheElementCount * MemoryLayout<UInt16>.stride
             self.contextByteCount = laneElementCount * MemoryLayout<Float>.stride
         }
@@ -684,6 +692,37 @@ public final class MetalAttentionKernel {
 
         fileprivate func makeTransientKVCacheBindings(device: MTLDevice) throws(MetalAttentionError) -> TransientKVCacheBindings {
             try TransientKVCacheBindings(cached: self, device: device)
+        }
+
+        fileprivate func makeTransientKVOutputBindings(device: MTLDevice) throws(MetalAttentionError) -> TransientKVOutputBindings? {
+            guard let kOutputSurface, let vOutputSurface else {
+                return nil
+            }
+            return try TransientKVOutputBindings(
+                kOutputSurface: kOutputSurface,
+                vOutputSurface: vOutputSurface,
+                byteCount: kvOutputByteCount,
+                device: device
+            )
+        }
+    }
+
+    fileprivate final class TransientKVOutputBindings {
+        let kOutBinding: SurfaceBinding
+        let vOutBinding: SurfaceBinding
+
+        init(
+            kOutputSurface: IOSurfaceRef,
+            vOutputSurface: IOSurfaceRef,
+            byteCount: Int,
+            device: MTLDevice
+        ) throws(MetalAttentionError) {
+            kOutBinding = try SurfaceBinding(surface: kOutputSurface, byteCount: byteCount, device: device)
+            vOutBinding = try SurfaceBinding(surface: vOutputSurface, byteCount: byteCount, device: device)
+        }
+
+        var all: [SurfaceBinding] {
+            [kOutBinding, vOutBinding]
         }
     }
 
@@ -697,6 +736,8 @@ public final class MetalAttentionKernel {
     /// Cache immutable surface metadata for a layer's decode surfaces. Call once at engine init time.
     public func createCachedLayerBindings(
         qSurface: IOSurfaceRef,
+        kOutputSurface: IOSurfaceRef? = nil,
+        vOutputSurface: IOSurfaceRef? = nil,
         kCacheSurface: IOSurfaceRef,
         vCacheSurface: IOSurfaceRef,
         contextSurface: IOSurfaceRef,
@@ -707,6 +748,8 @@ public final class MetalAttentionKernel {
     ) throws(MetalAttentionError) -> CachedLayerBindings {
         try CachedLayerBindings(
             qSurface: qSurface,
+            kOutputSurface: kOutputSurface,
+            vOutputSurface: vOutputSurface,
             kCacheSurface: kCacheSurface,
             vCacheSurface: vCacheSurface,
             contextSurface: contextSurface,
@@ -895,7 +938,10 @@ public final class MetalAttentionKernel {
         guard let commandBuffer = commandQueue.makeCommandBuffer() else {
             throw .commandBufferUnavailable
         }
-        let bindings = try cached.makeTransientAttentionBindings(device: device)
+        let attentionBindings = try cached.makeTransientAttentionBindings(device: device)
+        guard let kvOutputBindings = try cached.makeTransientKVOutputBindings(device: device) else {
+            throw .invalidInputCount("cached bindings are missing K/V output surfaces required for Metal RoPE fast path")
+        }
 
         // Encode RoPE
         let ropeParams = RoPEParams(
@@ -910,8 +956,8 @@ public final class MetalAttentionKernel {
             throw .commandEncoderUnavailable
         }
         ropeEncoder.setComputePipelineState(ropeDecodePipeline)
-        ropeEncoder.setBuffer(bindings.qBinding.buffer, offset: 0, index: 0)
-        ropeEncoder.setBuffer(bindings.kBinding.buffer, offset: 0, index: 1)  // K output surface (also kCache src)
+        ropeEncoder.setBuffer(attentionBindings.qBinding.buffer, offset: 0, index: 0)
+        ropeEncoder.setBuffer(kvOutputBindings.kOutBinding.buffer, offset: 0, index: 1)
         withUnsafeBytes(of: ropeParams) { rawBytes in
             ropeEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 2)
         }
@@ -927,21 +973,34 @@ public final class MetalAttentionKernel {
         )
         ropeEncoder.endEncoding()
 
-        // Encode KV Cache Scatter
-        // Note: kBinding here is the K *output* surface from ANE QKV, not the cache.
-        // We need separate bindings for K/V source and K/V cache destination.
-        // But CachedLayerBindings.kBinding IS the kCache. We need the K output surface binding.
-        // For Phase 5, the Q surface from cached contains the Q output (rotated by RoPE above),
-        // and kBinding/vBinding are the K/V cache surfaces.
-        // The K/V outputs from ANE are on separate surfaces not in CachedLayerBindings.
-        // So we need to pass them separately.
-        // Actually, looking at the architecture: CachedLayerBindings holds qOut, kCacheFull, vCacheFull, projectionContextIn.
-        // The K/V output surfaces are handles.kOut and handles.vOut, NOT cached.
-        // We need the K/V output surfaces to scatter FROM.
-        // This means Phase 5 needs a different API that takes K/V output surfaces too.
-
-        // For now, just encode SDPA (RoPE is done, KV scatter still needs K/V output bindings)
-        // We'll handle KV scatter in the decode loop where we have access to kOut/vOut surfaces.
+        // Encode KV scatter from ANE K/V outputs into the cache surfaces.
+        let scatterParams = KVScatterParams(
+            kvDim: UInt32(shape.kvHeads * shape.headDim),
+            tokenIndex: UInt32(tokenIndex),
+            cacheStride: UInt32(shape.cacheStride),
+            laneStride: UInt32(shape.laneStride)
+        )
+        guard let scatterEncoder = commandBuffer.makeComputeCommandEncoder() else {
+            throw .commandEncoderUnavailable
+        }
+        scatterEncoder.setComputePipelineState(kvCacheScatterPipeline)
+        scatterEncoder.setBuffer(kvOutputBindings.kOutBinding.buffer, offset: 0, index: 0)
+        scatterEncoder.setBuffer(kvOutputBindings.vOutBinding.buffer, offset: 0, index: 1)
+        scatterEncoder.setBuffer(attentionBindings.kBinding.buffer, offset: 0, index: 2)
+        scatterEncoder.setBuffer(attentionBindings.vBinding.buffer, offset: 0, index: 3)
+        withUnsafeBytes(of: scatterParams) { rawBytes in
+            scatterEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
+        }
+        let kvDim = shape.kvHeads * shape.headDim
+        scatterEncoder.dispatchThreads(
+            MTLSize(width: kvDim, height: 1, depth: 1),
+            threadsPerThreadgroup: MTLSize(
+                width: min(kvDim, kvCacheScatterPipeline.threadExecutionWidth),
+                height: 1,
+                depth: 1
+            )
+        )
+        scatterEncoder.endEncoding()
 
         // Encode fused SDPA
         let decodeParams = DecodeParams(
@@ -957,10 +1016,10 @@ public final class MetalAttentionKernel {
             throw .commandEncoderUnavailable
         }
         sdpaEncoder.setComputePipelineState(fusedDecodeSDPAPipeline)
-        sdpaEncoder.setBuffer(bindings.qBinding.buffer, offset: 0, index: 0)
-        sdpaEncoder.setBuffer(bindings.kBinding.buffer, offset: 0, index: 1)
-        sdpaEncoder.setBuffer(bindings.vBinding.buffer, offset: 0, index: 2)
-        sdpaEncoder.setBuffer(bindings.contextBinding.buffer, offset: 0, index: 3)
+        sdpaEncoder.setBuffer(attentionBindings.qBinding.buffer, offset: 0, index: 0)
+        sdpaEncoder.setBuffer(attentionBindings.kBinding.buffer, offset: 0, index: 1)
+        sdpaEncoder.setBuffer(attentionBindings.vBinding.buffer, offset: 0, index: 2)
+        sdpaEncoder.setBuffer(attentionBindings.contextBinding.buffer, offset: 0, index: 3)
         withUnsafeBytes(of: decodeParams) { rawBytes in
             sdpaEncoder.setBytes(rawBytes.baseAddress!, length: rawBytes.count, index: 4)
         }
@@ -973,7 +1032,7 @@ public final class MetalAttentionKernel {
         )
         sdpaEncoder.endEncoding()
 
-        Self.retain(bindings: bindings.all, until: commandBuffer)
+        Self.retain(bindings: attentionBindings.all + kvOutputBindings.all, until: commandBuffer)
         commandBuffer.commit()
         return commandBuffer
     }

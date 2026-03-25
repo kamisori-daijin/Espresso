@@ -4027,6 +4027,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 do {
                     let binding = try metalAttention.createCachedLayerBindings(
                         qSurface: handles.qOut,
+                        kOutputSurface: handles.kOut,
+                        vOutputSurface: handles.vOut,
                         kCacheSurface: handles.kCacheFull,
                         vCacheSurface: handles.vCacheFull,
                         contextSurface: handles.projectionContextIn,
@@ -4658,6 +4660,8 @@ public struct RealModelInferenceEngine: ~Copyable {
                 do {
                     let binding = try metalAttention.createCachedLayerBindings(
                         qSurface: handles.qOut,
+                        kOutputSurface: handles.kOut,
+                        vOutputSurface: handles.vOut,
                         kCacheSurface: handles.kCacheFull,
                         vCacheSurface: handles.vCacheFull,
                         contextSurface: handles.projectionContextIn,
@@ -4783,14 +4787,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             )
         }
 
-        // Cached layer bindings currently expose qOut + kCache/vCache surfaces, not qOut + kOut/vOut.
-        // Running in-place Metal RoPE against the cache binding corrupts KV cache layout because the
-        // RoPE kernel indexes K with laneStride while the cache is laid out with cacheStride.
-        // Keep the cached-binding SDPA path, but use the safe CPU RoPE hook until the Metal fast
-        // path is rewired to the per-token K/V output surfaces.
         let metalRoPEConfig: MetalAttentionKernel.MetalRoPEConfig? = Self.supportsLlamaMetalRoPEFastPath(
             cachedBindingsAvailable: cachedBindings != nil && !hasAnyQKNorm,
-            kBindingContainsKVCache: true
+            kBindingContainsKVCache: false
         )
             ? MetalAttentionKernel.MetalRoPEConfig(
                 nHeads: nHeads, nKVHeads: nKVHeads, headDim: headDim, theta: theta
