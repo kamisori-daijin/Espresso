@@ -21,6 +21,8 @@ public struct GenerationResult: Sendable {
     public let tokensPerSecond: Double
     public let compileTimeMs: Double
     public let firstTokenLatencyMs: Double
+    public let exactHeadBackend: String
+    public let cachedBindingsEnabled: Bool
 
     public init(
         text: String,
@@ -28,7 +30,9 @@ public struct GenerationResult: Sendable {
         promptTokens: [TokenID],
         tokensPerSecond: Double,
         compileTimeMs: Double,
-        firstTokenLatencyMs: Double
+        firstTokenLatencyMs: Double,
+        exactHeadBackend: String = "unknown",
+        cachedBindingsEnabled: Bool = false
     ) {
         self.text = text
         self.tokens = tokens
@@ -36,6 +40,8 @@ public struct GenerationResult: Sendable {
         self.tokensPerSecond = tokensPerSecond
         self.compileTimeMs = compileTimeMs
         self.firstTokenLatencyMs = firstTokenLatencyMs
+        self.exactHeadBackend = exactHeadBackend
+        self.cachedBindingsEnabled = cachedBindingsEnabled
     }
 }
 
@@ -111,20 +117,50 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     static func supportsHybridCachedBindings(
-        architecture: MultiModelConfig.Architecture,
+        config: MultiModelConfig,
         environment: [String: String]
     ) -> Bool {
         if environment["ESPRESSO_DISABLE_HYBRID_CACHED_BINDINGS"] == "1" {
             return false
         }
-        // The long-lived IOSurface binding lifetime bug is fixed in MetalAttentionKernel,
-        // but Llama still diverges from the Hugging Face long-form greedy baseline after
-        // the short prefix ladder. Keep the cached path gated off by default until the
-        // remaining long-horizon decode drift is resolved.
-        if architecture == .llama {
+        if config.architecture == .llama {
             return environment["ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS"] == "1"
         }
         return true
+    }
+
+    static func resolveClassifierStrategy(
+        config: MultiModelConfig,
+        hasExactFloat32LMHead: Bool,
+        environment: [String: String]
+    ) -> ClassifierStrategy {
+        if let forced = forcedExactHeadBackend(environment: environment) {
+            return forced
+        }
+        return ClassifierStrategy.select(
+            for: config,
+            hasExactFloat32LMHead: hasExactFloat32LMHead
+        )
+    }
+
+    static func forcedExactHeadBackend(environment: [String: String]) -> ClassifierStrategy? {
+        guard let rawValue = environment["ESPRESSO_FORCE_EXACT_HEAD_BACKEND"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased(),
+              !rawValue.isEmpty else {
+            return nil
+        }
+
+        switch rawValue {
+        case "ane", "ane_classifier":
+            return .ane
+        case "cpu_partitioned_fp32", "partitioned", "fp32":
+            return .cpuPartitionedFP32
+        case "cpu_fp16_tiled", "fp16_tiled", "fp16":
+            return .cpuFP16Tiled
+        default:
+            return nil
+        }
     }
 
     static func usesHybridLayerInputRebinding(
@@ -234,6 +270,8 @@ public struct RealModelInferenceEngine: ~Copyable {
         let tokenEmbedding: [Float]
         let finalNormGamma: [Float]
         let lmHead: [Float]
+        let lmHeadFP16: [UInt16]?
+        let lmHeadHasExactFloat32Sidecar: Bool
         let finalNormGammaPath: String
         let finalNormGammaCompilePath: String
         let finalNormGammaData: Data
@@ -343,6 +381,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         let tokenEmbedding: [Float]
         let finalNormGamma: [Float]
         let lmHead: [Float]
+        let lmHeadFP16: [UInt16]?
         let layers: [ExactCPULlamaLayerWeights]
     }
 
@@ -801,12 +840,18 @@ public struct RealModelInferenceEngine: ~Copyable {
         config: MultiModelConfig,
         weightDirURL: URL,
         tokenizer: LoadedTokenizer,
-        assets: TopLevelAssets
+        assets: TopLevelAssets,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) {
         let lmHead: [Float]
+        let hasExactFloat32LMHead: Bool
         switch assets {
-        case let .gpt2(a): lmHead = a.lmHead
-        case let .llama(a): lmHead = a.lmHead
+        case let .gpt2(a):
+            lmHead = a.lmHead
+            hasExactFloat32LMHead = true
+        case let .llama(a):
+            lmHead = a.lmHead
+            hasExactFloat32LMHead = a.lmHeadHasExactFloat32Sidecar
         }
         let classifierBlockMaxNorms = lmHead.withUnsafeBufferPointer { weightBuffer in
             Self.precomputeClassifierBlockMaxNorms(
@@ -841,7 +886,11 @@ public struct RealModelInferenceEngine: ~Copyable {
             repeating: 0,
             count: min(Self.classifierArgmaxBlockSize, config.vocab)
         )
-        self.classifierStrategy = ClassifierStrategy.select(for: config)
+        self.classifierStrategy = Self.resolveClassifierStrategy(
+            config: config,
+            hasExactFloat32LMHead: hasExactFloat32LMHead,
+            environment: environment
+        )
         self.cachedExactCPULlamaWeights = nil
     }
 
@@ -1124,7 +1173,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             promptTokens: promptTokens,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
+            cachedBindingsEnabled: false
         )
     }
 
@@ -1181,25 +1232,10 @@ public struct RealModelInferenceEngine: ~Copyable {
             ))
         case .llama:
             let topLevelPaths = try resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDir)
-            let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
-            )
-            let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
-            topLevelAssets = .llama(LlamaTopLevelAssets(
-                tokenEmbedding: tokenEmbedding,
-                finalNormGamma: finalNormGamma,
-                lmHead: lmHead,
-                finalNormGammaPath: topLevelPaths.finalNormGamma,
-                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
+            topLevelAssets = .llama(try loadLlamaTopLevelAssets(
+                config: config,
+                topLevelPaths: topLevelPaths,
+                weightDirURL: weightDirURL
             ))
         }
 
@@ -1383,27 +1419,45 @@ public struct RealModelInferenceEngine: ~Copyable {
             ))
         case .llama:
             let topLevelPaths = try resolveLlamaTopLevelWeightPaths(config: config, weightDir: weightDir)
-            let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.tokenEmbedding,
-                expectedCount: config.vocab * config.dModel
-            )
-            let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.finalNormGamma,
-                expectedCount: config.dModel
-            )
-            let lmHead = try loadWeightTablePreferringFloat32Sidecar(
-                at: topLevelPaths.lmHead,
-                expectedCount: config.vocab * config.dModel
-            )
-            return .llama(LlamaTopLevelAssets(
-                tokenEmbedding: tokenEmbedding,
-                finalNormGamma: finalNormGamma,
-                lmHead: lmHead,
-                finalNormGammaPath: topLevelPaths.finalNormGamma,
-                finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
-                finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
+            return .llama(try loadLlamaTopLevelAssets(
+                config: config,
+                topLevelPaths: topLevelPaths,
+                weightDirURL: weightDirURL
             ))
         }
+    }
+
+    private static func loadLlamaTopLevelAssets(
+        config: MultiModelConfig,
+        topLevelPaths: LlamaTopLevelWeightPaths,
+        weightDirURL: URL
+    ) throws -> LlamaTopLevelAssets {
+        let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
+            at: topLevelPaths.tokenEmbedding,
+            expectedCount: config.vocab * config.dModel
+        )
+        let finalNormGamma = try loadWeightTablePreferringFloat32Sidecar(
+            at: topLevelPaths.finalNormGamma,
+            expectedCount: config.dModel
+        )
+        let lmHead = try loadWeightTablePreferringFloat32Sidecar(
+            at: topLevelPaths.lmHead,
+            expectedCount: config.vocab * config.dModel
+        )
+        let lmHeadFP16 = try loadRawFP16WeightTableIfNoExactFloat32Sidecar(
+            at: topLevelPaths.lmHead,
+            expectedCount: config.vocab * config.dModel
+        )
+        return LlamaTopLevelAssets(
+            tokenEmbedding: tokenEmbedding,
+            finalNormGamma: finalNormGamma,
+            lmHead: lmHead,
+            lmHeadFP16: lmHeadFP16,
+            lmHeadHasExactFloat32Sidecar: lmHeadFP16 == nil,
+            finalNormGammaPath: topLevelPaths.finalNormGamma,
+            finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
+            finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
+        )
     }
 
     static func spatialBucket(for tokenCount: Int, maxSeq: Int) -> Int {
@@ -3747,7 +3801,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             didCompile = true
         }
 
-        if classifierStrategy == .ane {
+        if classifierStrategy.usesANEClassifier {
             if compiledHybridGreedyNorm.count != 1 ||
                 compiledHybridGreedyClassifier.count != 1 ||
                 compiledHybridGreedySpatial != hybridHeadSpatial {
@@ -3881,21 +3935,26 @@ public struct RealModelInferenceEngine: ~Copyable {
             didCompile = true
         }
 
-        // Compile greedy norm + classifier for llama (ANE path only)
-        if classifierStrategy == .ane {
-            if compiledHybridGreedyNorm.count != 1 ||
-                compiledHybridGreedyClassifier.count != 1 ||
-                compiledHybridGreedySpatial != hybridHeadSpatial {
-                compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                    try Self.compileLlamaHead(
-                        config: config,
-                        weightDirURL: weightDirURL,
-                        assets: llamaAssets,
-                        spatial: hybridHeadSpatial,
-                        inputDType: .fp16,
-                        outputDType: .fp16
-                    )
-                })
+        // Compile the greedy fp16 RMSNorm head once for both ANE and CPU-exact
+        // classifier backends. Stories uses this path to keep final normalization
+        // on ANE while preserving exact CPU token selection.
+        if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
+            compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                try Self.compileLlamaHead(
+                    config: config,
+                    weightDirURL: weightDirURL,
+                    assets: llamaAssets,
+                    spatial: hybridHeadSpatial,
+                    inputDType: .fp16,
+                    outputDType: .fp16
+                )
+            })
+            compiledHybridGreedySpatial = hybridHeadSpatial
+            didCompile = true
+        }
+
+        if classifierStrategy.usesANEClassifier {
+            if compiledHybridGreedyClassifier.count != 1 {
                 compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
                     try Self.compileLlamaClassifier(
                         config: config,
@@ -3903,7 +3962,6 @@ public struct RealModelInferenceEngine: ~Copyable {
                         spatial: hybridHeadSpatial
                     )
                 })
-                compiledHybridGreedySpatial = hybridHeadSpatial
                 try compiledHybridGreedyClassifier[0].kernel.rebindInput(
                     at: 0,
                     to: compiledHybridGreedyNorm[0].outputSurface
@@ -3911,15 +3969,17 @@ public struct RealModelInferenceEngine: ~Copyable {
                 didCompile = true
             }
 
-            if compiledHybridGreedyNorm.count == 1,
-               compiledHybridGreedyClassifier.count == 1,
-               let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
-                try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
+            if compiledHybridGreedyClassifier.count == 1 {
                 try compiledHybridGreedyClassifier[0].kernel.rebindInput(
                     at: 0,
                     to: compiledHybridGreedyNorm[0].outputSurface
                 )
             }
+        }
+
+        if compiledHybridGreedyNorm.count == 1,
+           let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+            try compiledHybridGreedyNorm[0].kernel.rebindInput(at: 0, to: finalSurface)
         }
 
         return didCompile
@@ -3958,7 +4018,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         // Pre-create cached Metal bindings for all layers (GPT-2 path)
         let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = Self.supportsHybridCachedBindings(
-            architecture: config.architecture,
+            config: config,
             environment: ProcessInfo.processInfo.environment
         ) ? {
             var bindings: [MetalAttentionKernel.CachedLayerBindings] = []
@@ -4002,7 +4062,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         var timings = HybridDecodeTimingBreakdown()
         let useANEGreedyHead =
             temperature == 0 &&
-            classifierStrategy == .ane &&
+            classifierStrategy.usesANEClassifier &&
             compiledHybridGreedyNorm.count == 1 &&
             compiledHybridGreedyClassifier.count == 1
 
@@ -4207,7 +4267,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             promptTokens: promptTokens,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
+            cachedBindingsEnabled: false
         )
     }
 
@@ -4587,7 +4649,7 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         // Pre-create cached decode-surface metadata for all layers.
         let cachedBindings: [MetalAttentionKernel.CachedLayerBindings]? = Self.supportsHybridCachedBindings(
-            architecture: config.architecture,
+            config: config,
             environment: ProcessInfo.processInfo.environment
         ) ? {
             var bindings: [MetalAttentionKernel.CachedLayerBindings] = []
@@ -4622,13 +4684,13 @@ public struct RealModelInferenceEngine: ~Copyable {
         var timings = HybridDecodeTimingBreakdown()
         let useANEGreedyHead =
             temperature == 0 &&
-            classifierStrategy == .ane &&
+            classifierStrategy.usesANEClassifier &&
             compiledHybridGreedyNorm.count == 1 &&
             compiledHybridGreedyClassifier.count == 1
 
         let useCPUExactGreedyHead =
             temperature == 0 &&
-            classifierStrategy == .cpuExact
+            classifierStrategy.usesCPUExactClassifier
 
         // Build the RoPE hook closure that rotates Q and K between ANE QKV eval and Metal attention
         let nHeads = config.nHead
@@ -4896,7 +4958,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         var firstTokenRecorded = false
         var rng = SystemRandomNumberGenerator()
         var normalized = [Float](repeating: 0, count: config.dModel)
-        var hidden = [Float](repeating: 0, count: config.dModel)
         let headSpatial = compiledHybridHeadSpatial
 
         while generatedTokens.count < effectiveMaxTokens {
@@ -4927,36 +4988,25 @@ public struct RealModelInferenceEngine: ~Copyable {
                     throw RealModelInferenceError.runtimeFailure("Llama hybrid greedy ANE head evaluation failed: \(error)")
                 }
             } else if useCPUExactGreedyHead {
-                guard let lastFFNOut = compiledHybridSurfaceHandles.last?.ffnOut else {
-                    throw RealModelInferenceError.runtimeFailure("Llama CPU exact head: last layer FFN output surface unavailable")
+                guard compiledHybridGreedyNorm.count == 1 else {
+                    throw RealModelInferenceError.runtimeFailure("Llama CPU exact head: greedy RMSNorm kernel unavailable")
                 }
-                let laneSpatial = compiledHybridSurfaceHandles.last!.laneSpatial
 
-                // 1. Read hidden state from last layer's FFN output surface
                 do {
-                    try hidden.withUnsafeMutableBufferPointer { buf in
+                    try compiledHybridGreedyNorm[0].kernel.eval()
+                    try normalized.withUnsafeMutableBufferPointer { buffer in
                         try SurfaceIO.readFP16SpatialSlice(
-                            from: lastFFNOut,
+                            from: compiledHybridGreedyNorm[0].outputSurface,
                             channelOffset: 0,
                             spatialIndex: 0,
-                            spatial: laneSpatial,
-                            into: buf,
+                            spatial: headSpatial,
+                            into: buffer,
                             channels: config.dModel
                         )
                     }
                 } catch {
-                    throw RealModelInferenceError.runtimeFailure("Llama CPU exact head: surface read failed: \(error)")
+                    throw RealModelInferenceError.runtimeFailure("Llama CPU exact head: ANE RMSNorm read failed: \(error)")
                 }
-
-                // 2. Apply final RMSNorm on CPU
-                let gamma = llamaAssets.finalNormGamma
-                var sumSq: Float = 0
-                vDSP_dotpr(hidden, 1, hidden, 1, &sumSq, vDSP_Length(config.dModel))
-                var invRms = 1.0 / sqrtf(sumSq / Float(config.dModel) + config.normEps)
-                vDSP_vsmul(hidden, 1, &invRms, &normalized, 1, vDSP_Length(config.dModel))
-                vDSP_vmul(normalized, 1, gamma, 1, &normalized, 1, vDSP_Length(config.dModel))
-
-                // 3. Exact classifier argmax over the shared LM head.
                 nextToken = TokenID(exactClassifierArgmax(normalized))
             } else {
                 do {
@@ -5064,7 +5114,9 @@ public struct RealModelInferenceEngine: ~Copyable {
             promptTokens: promptTokens,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
+            cachedBindingsEnabled: cachedBindings != nil
         )
     }
 
@@ -5089,6 +5141,10 @@ public struct RealModelInferenceEngine: ~Copyable {
             at: topLevelPaths.lmHead,
             expectedCount: config.vocab * config.dModel
         )
+        let lmHeadFP16 = try Self.loadRawFP16WeightTableIfNoExactFloat32Sidecar(
+            at: topLevelPaths.lmHead,
+            expectedCount: config.vocab * config.dModel
+        )
         let layers = try (0..<config.nLayer).map { layerIndex in
             let paths = LayerWeightPaths.forLayer(
                 layerIndex,
@@ -5101,6 +5157,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             tokenEmbedding: tokenEmbedding,
             finalNormGamma: finalNormGamma,
             lmHead: lmHead,
+            lmHeadFP16: lmHeadFP16,
             layers: layers
         )
         cachedExactCPULlamaWeights = loadedWeights
@@ -5125,7 +5182,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         let exactWeights = try loadCachedExactCPULlamaWeights()
         let tokenEmbedding = exactWeights.tokenEmbedding
         let finalNormGamma = exactWeights.finalNormGamma
-        let lmHead = exactWeights.lmHead
         let layers = exactWeights.layers
 
         var kCaches = Array(
@@ -5283,16 +5339,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             let normalized = Self.rmsNorm(lastHidden, weight: finalNormGamma, eps: Float(config.normEps))
             let nextToken: TokenID
             if temperature == 0 {
-                let logits = Self.multiplyRowMajorMatrix(
-                    matrix: lmHead,
-                    rows: config.vocab,
-                    cols: config.dModel,
-                    vector: normalized
-                )
-                guard let token = logits.enumerated().max(by: { $0.element < $1.element }).map({ TokenID($0.offset) }) else {
-                    throw RealModelInferenceError.runtimeFailure("Exact CPU llama decode produced empty logits")
-                }
-                nextToken = token
+                nextToken = TokenID(exactClassifierArgmax(normalized))
             } else {
                 nextToken = selectTokenFromNormalizedHidden(
                     normalized,
@@ -5349,7 +5396,8 @@ public struct RealModelInferenceEngine: ~Copyable {
             promptTokens: promptTokens,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
-            firstTokenLatencyMs: firstTokenLatencyMs
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: classifierStrategy.exactHeadBackendLabel
         )
     }
 
@@ -6068,7 +6116,11 @@ public struct RealModelInferenceEngine: ~Copyable {
         spatial: Int
     ) throws -> CompiledClassifier {
         let generator = GenerationClassifierWithMaxGenerator(vocabSize: config.vocab, laneSpatial: spatial)
-        let classifierBlob = WeightBlob.build(from: assets.lmHead, rows: config.vocab, cols: config.dModel)
+        let classifierBlob = if let lmHeadFP16 = assets.lmHeadFP16 {
+            WeightBlob.buildFP16(from: lmHeadFP16)
+        } else {
+            WeightBlob.build(from: assets.lmHead, rows: config.vocab, cols: config.dModel)
+        }
         let kernel: ANEKernel
         do {
             kernel = try ANEKernel(
@@ -6483,6 +6535,70 @@ public struct RealModelInferenceEngine: ~Copyable {
         return values
     }
 
+    static func loadRawFP16WeightTableIfNoExactFloat32Sidecar(
+        at path: String,
+        expectedCount: Int
+    ) throws -> [UInt16]? {
+        let sidecarPath = exactFloat32SidecarPath(forBlobPath: path)
+        guard !FileManager.default.fileExists(atPath: sidecarPath) else {
+            return nil
+        }
+
+        let header: BlobWeightLoader.Header
+        do {
+            header = try BlobWeightLoader.readHeader(from: path)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to read weight blob header \(path): \(error)")
+        }
+
+        let expectedBytes = expectedCount * MemoryLayout<UInt16>.stride
+        guard Int(header.dataSize) == expectedBytes else {
+            throw RealModelInferenceError.invalidWeightCount(
+                path: path,
+                expected: expectedCount,
+                actual: Int(header.dataSize) / MemoryLayout<UInt16>.stride
+            )
+        }
+
+        let handle: FileHandle
+        do {
+            handle = try FileHandle(forReadingFrom: URL(fileURLWithPath: path))
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to open weight blob \(path): \(error)")
+        }
+        defer { try? handle.close() }
+
+        do {
+            try handle.seek(toOffset: UInt64(header.dataOffset))
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to seek weight blob \(path): \(error)")
+        }
+
+        let payload: Data
+        do {
+            payload = try handle.read(upToCount: expectedBytes) ?? Data()
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to read weight blob payload \(path): \(error)")
+        }
+        guard payload.count == expectedBytes else {
+            throw RealModelInferenceError.invalidWeightCount(
+                path: path,
+                expected: expectedCount,
+                actual: payload.count / MemoryLayout<UInt16>.stride
+            )
+        }
+
+        return payload.withUnsafeBytes { raw in
+            (0..<expectedCount).map { index in
+                let bits = raw.loadUnaligned(
+                    fromByteOffset: index * MemoryLayout<UInt16>.stride,
+                    as: UInt16.self
+                )
+                return UInt16(littleEndian: bits)
+            }
+        }
+    }
+
     static func exactFloat32SidecarPath(forBlobPath path: String) -> String {
         if path.hasSuffix(".bin") {
             return String(path.dropLast(4)) + ".float32.bin"
@@ -6689,27 +6805,70 @@ public struct RealModelInferenceEngine: ~Copyable {
 
     private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
         precondition(hidden.count == config.dModel)
-        let blockSize = Self.classifierArgmaxBlockSize
-        return hidden.withUnsafeBufferPointer { hiddenBuffer in
-            lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
-                classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
-                    classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
-                        guard let hiddenBase = hiddenBuffer.baseAddress,
-                              let weightBase = weightBuffer.baseAddress,
-                              let normsBase = normsBuffer.baseAddress,
-                              let scratchBase = scratchBuffer.baseAddress else {
-                            return 0
+        switch classifierStrategy {
+        case .ane, .cpuPartitionedFP32:
+            let blockSize = Self.classifierArgmaxBlockSize
+            return hidden.withUnsafeBufferPointer { hiddenBuffer in
+                lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
+                    classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                        classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                            guard let hiddenBase = hiddenBuffer.baseAddress,
+                                  let weightBase = weightBuffer.baseAddress,
+                                  let normsBase = normsBuffer.baseAddress,
+                                  let scratchBase = scratchBuffer.baseAddress else {
+                                return 0
+                            }
+                            return Self.partitionedArgmax(
+                                classifier: weightBase,
+                                input: hiddenBase,
+                                logitsScratch: scratchBase,
+                                blockMaxNorms: normsBase,
+                                vocabSize: config.vocab,
+                                dim: config.dModel,
+                                blockSize: blockSize
+                            )
                         }
-                        return Self.partitionedArgmax(
-                            classifier: weightBase,
-                            input: hiddenBase,
-                            logitsScratch: scratchBase,
-                            blockMaxNorms: normsBase,
-                            vocabSize: config.vocab,
-                            dim: config.dModel,
-                            blockSize: blockSize
-                        )
                     }
+                }
+            }
+        case .cpuFP16Tiled:
+            guard case let .llama(assets) = assets, let lmHeadFP16 = assets.lmHeadFP16 else {
+                return hidden.withUnsafeBufferPointer { hiddenBuffer in
+                    lmHeadWeights.withUnsafeBufferPointer { weightBuffer in
+                        classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                            classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                                guard let hiddenBase = hiddenBuffer.baseAddress,
+                                      let weightBase = weightBuffer.baseAddress,
+                                      let normsBase = normsBuffer.baseAddress,
+                                      let scratchBase = scratchBuffer.baseAddress else {
+                                    return 0
+                                }
+                                return Self.partitionedArgmax(
+                                    classifier: weightBase,
+                                    input: hiddenBase,
+                                    logitsScratch: scratchBase,
+                                    blockMaxNorms: normsBase,
+                                    vocabSize: config.vocab,
+                                    dim: config.dModel,
+                                    blockSize: Self.classifierArgmaxBlockSize
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+            return hidden.withUnsafeBufferPointer { hiddenBuffer in
+                lmHeadFP16.withUnsafeBufferPointer { weightBuffer in
+                    guard let hiddenBase = hiddenBuffer.baseAddress,
+                          let weightBase = weightBuffer.baseAddress else {
+                        return 0
+                    }
+                    return FP16TiledClassifier.tiledMatvecArgmax(
+                        weights: weightBase,
+                        input: hiddenBase,
+                        vocabSize: config.vocab,
+                        dim: config.dModel
+                    )
                 }
             }
         }

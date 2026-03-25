@@ -958,3 +958,42 @@ Both 0.6B and 1.7B pass all correctness checks with the narrowed `.automatic` po
 - Confirmed protected models currently exist in `/tmp/edgerunner-models` for `0.6B`, `1.7B`, and `4B`.
 - Confirmed the main executable surfaces the prompt should pin down include Espresso `swift build`, `swift test`, `./espresso`, `./.build/debug/EspressoGGUFRunner verify-qwen`, and Edgerunner `swift build` plus `swift test --filter "QwenBenchmark/decodeBenchmark"`.
 - Confirmed the prompt should explicitly forbid destructive git cleanup and deletion of protected models, while allowing cleanup only for disposable `/var/folders/.../T/espresso_gguf_*` temp directories.
+
+# Stories Benchmark 2026-03-25
+
+- [x] Run the repo's published stories-family benchmark command (`swift run espresso-bench --ane-only --inference --layers 6 --warmup 20 --iterations 100`)
+- [x] Capture the saved summary artifact at [summary.json](/Users/chriskarani/CodingProjects/Espresso/benchmarks/results/2026-03-25-223111/summary.json)
+- [x] Identify the dominant bottlenecks from the measured breakdown
+
+## Review
+
+- No literal `stories.llm` file exists in the repo; the benchmark family is wired through `stories` -> `stories110m`.
+- `ANE Direct`: `11.650 ms` mean, `85.83 tok/s`, compile time `7094.21 ms`
+- `ANE Inference`: `10.230 ms` mean, `97.75 tok/s`, compile time `1546.64 ms`
+- Direct runtime bottlenecks: `ANE compute 87.59%`, `IO 10.47%`, `CPU 1.94%`
+- Inference runtime bottlenecks: `ANE compute 96.64%`, `IO 3.36%`, `CPU 0.00%`
+- The current checkout is slower than the checked-in dashboard numbers in [latest.json](/Users/chriskarani/CodingProjects/Espresso/benchmarks/results/latest.json); the dominant runtime bottleneck is still ANE compute, and first-run compile cost is also material at this size.
+
+# Stories Throughput Experiment Loop 2026-03-25
+
+- [x] Add benchmark-visible ANE compile retry and failure counters to the generation path.
+- [x] Add exact-head backend reporting and the `cpu_fp16_tiled` Stories classifier path.
+- [x] Route LLaMA greedy exact decode through ANE final RMSNorm before CPU classification.
+- [x] Add non-destructive experiment scripts for Stories inner-loop benchmarking and disposable worktree keep-or-revert evaluation.
+- [x] Re-measure cached bindings and revert the default-on choice when it failed the keep gate on the sampled Stories prompt.
+- [x] Rebuild and rerun the focused RealModelInference and EspressoGenerate verification slice.
+
+## Review
+
+- Added `ANECompileStats` and surfaced `compile_retry_count`, `compile_failure_count`, `exact_head_backend`, and `cached_bindings_enabled` through benchmark JSON, CSV, and prompt-suite TSV output.
+- Stories exact decode now supports `cpu_fp16_tiled` directly from `lm_head.bin` when no exact float32 sidecar exists, while keeping `cpu_partitioned_fp32` as the exact fallback.
+- LLaMA greedy exact paths now use the compiled final RMSNorm head before CPU argmax, removing the old CPU-side final norm from that lane.
+- Added `scripts/run_stories_generate_benchmark.sh` for the fast Stories warm loop and `scripts/run_autoresearch_experiment.sh` for disposable-worktree keep-or-revert execution.
+- Measured on March 25, 2026 with prompt `Hello`, `max_tokens=16`, `warmup=1`, `iterations=2`:
+- default Stories exact path: `83.27 tok/s`, `exact_head_backend=cpu_fp16_tiled`, `cached_bindings_enabled=false`
+- cached bindings opt-in: `80.96 tok/s`, same generated tokens/text, so cached bindings remain opt-in
+- forced `cpu_partitioned_fp32`: `75.91 tok/s`, same generated tokens/text, so `cpu_fp16_tiled` stays the better Stories exact default on this sample
+- compile instability is now explicit in the benchmark contract on this hardware shape: `compile_retry_count=60`, `compile_failure_count=75`
+- Verification passed:
+- `swift build`
+- `swift test --filter 'ClassifierStrategyTests|HybridLlamaDecodeStepTests|RealModelInferenceTests/test_loadRawFP16WeightTableIfNoExactFloat32SidecarReadsBlobPayload|RealModelInferenceTests/test_loadRawFP16WeightTableIfNoExactFloat32SidecarDefersToExactSidecar|EspressoGenerateTests/test_makePromptSuiteSummaryAggregatesPerPromptVerdicts|EspressoGenerateTests/test_aggregateBenchmarkRunsUsesWarmupAndAggregatesMeasuredLatencySamples|EspressoGenerateTests/test_optionsParseGenerateBenchmarkFlags'`

@@ -120,6 +120,7 @@ public struct ANEKernel: ~Copyable {
 
         while true {
             let handle: OpaquePointer?
+            ANECompileStats.recordAttempt()
             if checkBudget {
                 CompileGate.lock.lock()
                 if CompileBudget.isExhausted {
@@ -133,14 +134,17 @@ public struct ANEKernel: ~Copyable {
             }
 
             if let handle {
+                ANECompileStats.recordSuccess()
                 return handle
             }
 
             let error = lastCompileError()
-            guard ANECompileRetryPolicy.shouldRetry(
+            let shouldRetry = ANECompileRetryPolicy.shouldRetry(
                 lastCompileError: error,
                 attemptIndex: attemptIndex
-            ) else {
+            )
+            ANECompileStats.recordFailure(willRetry: shouldRetry)
+            guard shouldRetry else {
                 return nil
             }
 

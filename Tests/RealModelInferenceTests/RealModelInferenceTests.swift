@@ -185,6 +185,41 @@ private func shouldRunLegacyQwenExperimentTests(
     #expect(loaded.elementsEqual(blobValues, by: { abs($0 - $1) < 1e-3 }))
 }
 
+@Test func test_loadRawFP16WeightTableIfNoExactFloat32SidecarReadsBlobPayload() throws {
+    let root = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let values: [Float] = [1.0, -2.5, 3.25]
+    let blobPath = root.appendingPathComponent("lm_head.bin")
+    try writeBlob(values: values, to: blobPath)
+
+    let raw = try #require(
+        try RealModelInferenceEngine.loadRawFP16WeightTableIfNoExactFloat32Sidecar(
+            at: blobPath.path,
+            expectedCount: values.count
+        )
+    )
+    #expect(raw.map { Float(Float16(bitPattern: $0)) }.elementsEqual(values, by: { abs($0 - $1) < 1e-3 }))
+}
+
+@Test func test_loadRawFP16WeightTableIfNoExactFloat32SidecarDefersToExactSidecar() throws {
+    let root = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: root) }
+
+    let blobPath = root.appendingPathComponent("lm_head.bin")
+    try writeBlob(values: [1.0, 2.0, 3.0], to: blobPath)
+    let sidecarPath = root.appendingPathComponent("lm_head.float32.bin")
+    let bits: [UInt32] = [1.0, 2.0, 3.0].map { Float32($0).bitPattern }
+    let data = bits.withUnsafeBytes { Data($0) }
+    try data.write(to: sidecarPath)
+
+    let raw = try RealModelInferenceEngine.loadRawFP16WeightTableIfNoExactFloat32Sidecar(
+        at: blobPath.path,
+        expectedCount: 3
+    )
+    #expect(raw == nil)
+}
+
 @Test func test_evalHybridSingleLayerRawQKVOutputsForTestingRejectsUnsupportedArchitecture() throws {
     let config = makeTinyGPT2Config()
     try expectRealModelInferenceError(containing: "llama-family artifacts only") {

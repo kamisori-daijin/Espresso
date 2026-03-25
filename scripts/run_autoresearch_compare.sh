@@ -194,12 +194,16 @@ if command -v jq >/dev/null 2>&1; then
     "espresso_p95_token_ms=\(.espresso.p95_token_ms)",
     "coreml_p95_token_ms=\(.coreml.p95_token_ms)",
     "espresso_compile_ms=\(.espresso.compile_time_ms)",
-    "coreml_compile_ms=\(.coreml.compile_time_ms)"
+    "coreml_compile_ms=\(.coreml.compile_time_ms)",
+    "espresso_compile_retry_count=\(.espresso.compile_retry_count)",
+    "espresso_compile_failure_count=\(.espresso.compile_failure_count)",
+    "espresso_exact_head_backend=\(.espresso.exact_head_backend)",
+    "espresso_cached_bindings_enabled=\(.espresso.cached_bindings_enabled)"
   ' "$COMPARE_JSON"
 
   if [[ -n "$RESULTS_TSV" ]]; then
     if [[ ! -f "$RESULTS_TSV" ]]; then
-      printf 'timestamp\tcommit\tstatus\tprimary_metric\tespresso_tokens_per_second\tcoreml_tokens_per_second\tspeedup_vs_coreml\ttoken_match\ttext_match\tespresso_first_token_ms\tcoreml_first_token_ms\tespresso_median_token_ms\tcoreml_median_token_ms\tespresso_p95_token_ms\tcoreml_p95_token_ms\tespresso_compile_ms\tcoreml_compile_ms\toutput_dir\tprompt_id\tchange_summary\n' >"$RESULTS_TSV"
+      printf 'timestamp\tcommit\tstatus\tprimary_metric\tespresso_tokens_per_second\tcoreml_tokens_per_second\tspeedup_vs_coreml\ttoken_match\ttext_match\tespresso_first_token_ms\tcoreml_first_token_ms\tespresso_median_token_ms\tcoreml_median_token_ms\tespresso_p95_token_ms\tcoreml_p95_token_ms\tespresso_compile_ms\tcoreml_compile_ms\tespresso_compile_retry_count\tespresso_compile_failure_count\tespresso_exact_head_backend\tespresso_cached_bindings_enabled\toutput_dir\tprompt_id\tchange_summary\n' >"$RESULTS_TSV"
     fi
     jq -r --arg timestamp "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
           --arg commit "$(git rev-parse --short HEAD)" \
@@ -223,6 +227,10 @@ if command -v jq >/dev/null 2>&1; then
         .coreml.p95_token_ms,
         .espresso.compile_time_ms,
         .coreml.compile_time_ms,
+        .espresso.compile_retry_count,
+        .espresso.compile_failure_count,
+        .espresso.exact_head_backend,
+        .espresso.cached_bindings_enabled,
         $output_dir,
         $prompt_id,
         ""

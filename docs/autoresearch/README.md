@@ -71,6 +71,53 @@ Parallel ANE benchmarks collide on the same hardware and make tokens/sec numbers
 2. the benchmark referee validates those changes serially on hardware
 3. only referee-validated wins get merged
 
+## Experiment Then Revert
+
+Use the disposable-worktree loop when you want Auto-Inference-Optimiser-style
+keep-or-revert behavior without destructive git cleanup:
+
+```bash
+# Baseline once
+./scripts/run_autoresearch_suite.sh --output-dir /tmp/espresso-baseline
+
+# Candidate in a disposable detached worktree
+./scripts/run_autoresearch_experiment.sh \
+  --ref feat/my-candidate \
+  --baseline /tmp/espresso-baseline/suite-summary.json \
+  --env-file ./.autoresearch/env.sh
+```
+
+The candidate worktree is deleted automatically when it fails the keep gates.
+Passing candidates are kept in place for manual promotion or merge.
+
+## Stories Inner Loop
+
+For the exact Stories110M path, use the fast warm Espresso-only referee before
+running a full Core ML compare:
+
+```bash
+./scripts/run_stories_generate_benchmark.sh --prompt "Hello"
+```
+
+This targets the local Stories artifacts at
+`~/Library/Application Support/Espresso/demo/stories110m` by default and keeps
+the GPT-2 autoresearch defaults untouched.
+
+LLaMA-family cached bindings remain opt-in until they clear the same keep gate:
+
+```bash
+ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS=1 \
+  ./scripts/run_stories_generate_benchmark.sh --prompt "Hello"
+```
+
+For exact-head experiments, force the backend explicitly so you only change one
+variable per run:
+
+```bash
+ESPRESSO_FORCE_EXACT_HEAD_BACKEND=cpu_fp16_tiled \
+  ./scripts/run_stories_generate_benchmark.sh --prompt "Hello"
+```
+
 ## Scaffold A Lane
 
 From the repo root or any Espresso worktree:

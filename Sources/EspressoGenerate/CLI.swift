@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import ANERuntime
 import ANETypes
 import ModelSupport
 import RealModelInference
@@ -411,6 +412,44 @@ struct BackendRunMetrics: Sendable {
     let p95TokenMs: Double
     let totalTimeMs: Double
     let tokenLatenciesMs: [Double]
+    let compileRetryCount: Int
+    let compileFailureCount: Int
+    let exactHeadBackend: String?
+    let cachedBindingsEnabled: Bool?
+
+    init(
+        backend: String,
+        text: String,
+        generatedTokens: [TokenID],
+        promptTokens: [TokenID],
+        compileTimeMs: Double,
+        firstTokenLatencyMs: Double,
+        tokensPerSecond: Double,
+        medianTokenMs: Double,
+        p95TokenMs: Double,
+        totalTimeMs: Double,
+        tokenLatenciesMs: [Double],
+        compileRetryCount: Int = 0,
+        compileFailureCount: Int = 0,
+        exactHeadBackend: String? = nil,
+        cachedBindingsEnabled: Bool? = nil
+    ) {
+        self.backend = backend
+        self.text = text
+        self.generatedTokens = generatedTokens
+        self.promptTokens = promptTokens
+        self.compileTimeMs = compileTimeMs
+        self.firstTokenLatencyMs = firstTokenLatencyMs
+        self.tokensPerSecond = tokensPerSecond
+        self.medianTokenMs = medianTokenMs
+        self.p95TokenMs = p95TokenMs
+        self.totalTimeMs = totalTimeMs
+        self.tokenLatenciesMs = tokenLatenciesMs
+        self.compileRetryCount = compileRetryCount
+        self.compileFailureCount = compileFailureCount
+        self.exactHeadBackend = exactHeadBackend
+        self.cachedBindingsEnabled = cachedBindingsEnabled
+    }
 }
 
 struct CompareReport: Sendable {
@@ -996,6 +1035,7 @@ private func runEspressoGeneration(
 ) throws -> BackendRunMetrics {
     var tokenLatenciesMs: [Double] = []
     var totalTimeMs = 0.0
+    let compileStatsBefore = ANECompileStats.snapshot()
     let result = try engine.generate(
         prompt: invocation.prompt,
         maxTokens: invocation.maxTokens,
@@ -1006,6 +1046,7 @@ private func runEspressoGeneration(
             onStep?(step)
         }
     )
+    let compileStatsAfter = ANECompileStats.snapshot()
     return BackendRunMetrics(
         backend: "espresso",
         text: result.text,
@@ -1017,7 +1058,11 @@ private func runEspressoGeneration(
         medianTokenMs: percentile(tokenLatenciesMs, percentile: 0.5),
         p95TokenMs: percentile(tokenLatenciesMs, percentile: 0.95),
         totalTimeMs: totalTimeMs,
-        tokenLatenciesMs: tokenLatenciesMs
+        tokenLatenciesMs: tokenLatenciesMs,
+        compileRetryCount: compileStatsAfter.retryCount - compileStatsBefore.retryCount,
+        compileFailureCount: compileStatsAfter.failureCount - compileStatsBefore.failureCount,
+        exactHeadBackend: result.exactHeadBackend,
+        cachedBindingsEnabled: result.cachedBindingsEnabled
     )
 }
 
@@ -1037,12 +1082,20 @@ func aggregateBenchmarkRuns(
     var lastMeasured: BackendRunMetrics?
     var compileTimeMs = 0.0
     var aggregatedLatencySamples: [Double] = []
+    var compileRetryCount = 0
+    var compileFailureCount = 0
+    var exactHeadBackend: String?
+    var cachedBindingsEnabled: Bool?
 
     for iteration in 0..<totalIterations {
         let metrics = try run()
         if compileTimeMs == 0, metrics.compileTimeMs > 0 {
             compileTimeMs = metrics.compileTimeMs
+            compileRetryCount = metrics.compileRetryCount
+            compileFailureCount = metrics.compileFailureCount
         }
+        exactHeadBackend = exactHeadBackend ?? metrics.exactHeadBackend
+        cachedBindingsEnabled = cachedBindingsEnabled ?? metrics.cachedBindingsEnabled
         if iteration >= warmup {
             lastMeasured = metrics
             aggregatedLatencySamples.append(contentsOf: metrics.tokenLatenciesMs)
@@ -1064,7 +1117,11 @@ func aggregateBenchmarkRuns(
         medianTokenMs: percentile(aggregatedLatencySamples, percentile: 0.5),
         p95TokenMs: percentile(aggregatedLatencySamples, percentile: 0.95),
         totalTimeMs: lastMeasured.totalTimeMs,
-        tokenLatenciesMs: lastMeasured.tokenLatenciesMs
+        tokenLatenciesMs: lastMeasured.tokenLatenciesMs,
+        compileRetryCount: compileRetryCount != 0 ? compileRetryCount : lastMeasured.compileRetryCount,
+        compileFailureCount: compileFailureCount != 0 ? compileFailureCount : lastMeasured.compileFailureCount,
+        exactHeadBackend: exactHeadBackend ?? lastMeasured.exactHeadBackend,
+        cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled
     )
 }
 
@@ -1211,18 +1268,26 @@ private func compareReport(
 private func printGenerateStats(_ invocation: ResolvedInvocation, result: BackendRunMetrics) {
     stderrLine(
         String(
-            format: "model=%@ prompt_tokens=%d generated_tokens=%d compile_ms=%.2f first_token_ms=%.2f tok_per_s=%.2f median_token_ms=%.2f p95_token_ms=%.2f",
+            format: "model=%@ prompt_tokens=%d generated_tokens=%d compile_ms=%.2f compile_retries=%d compile_failures=%d first_token_ms=%.2f tok_per_s=%.2f median_token_ms=%.2f p95_token_ms=%.2f",
             locale: posixLocale,
             invocation.config.name,
             result.promptTokens.count,
             result.generatedTokens.count,
             result.compileTimeMs,
+            result.compileRetryCount,
+            result.compileFailureCount,
             result.firstTokenLatencyMs,
             result.tokensPerSecond,
             result.medianTokenMs,
             result.p95TokenMs
         )
     )
+    if let exactHeadBackend = result.exactHeadBackend {
+        stderrLine("exact_head_backend=\(exactHeadBackend)")
+    }
+    if let cachedBindingsEnabled = result.cachedBindingsEnabled {
+        stderrLine("cached_bindings_enabled=\(cachedBindingsEnabled)")
+    }
     stderrLine("weights=\(invocation.weightsDir)")
     stderrLine("tokenizer=\(invocation.tokenizerDir)")
 }
@@ -1230,9 +1295,11 @@ private func printGenerateStats(_ invocation: ResolvedInvocation, result: Backen
 private func printCompareSummary(_ report: CompareReport) {
     stderrLine(
         String(
-            format: "espresso compile_ms=%.2f first_token_ms=%.2f tok_per_s=%.2f median_token_ms=%.2f p95_token_ms=%.2f",
+            format: "espresso compile_ms=%.2f compile_retries=%d compile_failures=%d first_token_ms=%.2f tok_per_s=%.2f median_token_ms=%.2f p95_token_ms=%.2f",
             locale: posixLocale,
             report.espresso.compileTimeMs,
+            report.espresso.compileRetryCount,
+            report.espresso.compileFailureCount,
             report.espresso.firstTokenLatencyMs,
             report.espresso.tokensPerSecond,
             report.espresso.medianTokenMs,
@@ -1262,6 +1329,12 @@ private func printCompareSummary(_ report: CompareReport) {
         )
     }
     stderrLine("compare_match=tokens:\(report.tokenMatch) text:\(report.textMatch)")
+    if let exactHeadBackend = report.espresso.exactHeadBackend {
+        stderrLine("espresso_exact_head_backend=\(exactHeadBackend)")
+    }
+    if let cachedBindingsEnabled = report.espresso.cachedBindingsEnabled {
+        stderrLine("espresso_cached_bindings_enabled=\(cachedBindingsEnabled)")
+    }
     if let espressoPower = report.espressoPower, espressoPower.sampleCount > 0 {
         stderrLine(
             String(
@@ -1330,9 +1403,9 @@ private func writeCompareArtifacts(report: CompareReport, defaults: DemoDefaults
     try jsonData.write(to: jsonURL)
 
     let csv = """
-    backend,compile_ms,first_token_ms,tokens_per_second,median_token_ms,p95_token_ms,total_time_ms,package_w,cpu_w,gpu_w,ane_w
-    espresso,\(report.espresso.compileTimeMs),\(report.espresso.firstTokenLatencyMs),\(report.espresso.tokensPerSecond),\(report.espresso.medianTokenMs),\(report.espresso.p95TokenMs),\(report.espresso.totalTimeMs),\(report.espressoPower?.packageW ?? 0),\(report.espressoPower?.cpuW ?? 0),\(report.espressoPower?.gpuW ?? 0),\(report.espressoPower?.aneW ?? 0)
-    coreml,\(report.coreML.compileTimeMs),\(report.coreML.firstTokenLatencyMs),\(report.coreML.tokensPerSecond),\(report.coreML.medianTokenMs),\(report.coreML.p95TokenMs),\(report.coreML.totalTimeMs),\(report.coreMLPower?.packageW ?? 0),\(report.coreMLPower?.cpuW ?? 0),\(report.coreMLPower?.gpuW ?? 0),\(report.coreMLPower?.aneW ?? 0)
+    backend,compile_ms,compile_retry_count,compile_failure_count,first_token_ms,tokens_per_second,median_token_ms,p95_token_ms,total_time_ms,exact_head_backend,cached_bindings_enabled,package_w,cpu_w,gpu_w,ane_w
+    espresso,\(report.espresso.compileTimeMs),\(report.espresso.compileRetryCount),\(report.espresso.compileFailureCount),\(report.espresso.firstTokenLatencyMs),\(report.espresso.tokensPerSecond),\(report.espresso.medianTokenMs),\(report.espresso.p95TokenMs),\(report.espresso.totalTimeMs),\(report.espresso.exactHeadBackend ?? ""),\(report.espresso.cachedBindingsEnabled.map(String.init(describing:)) ?? ""),\(report.espressoPower?.packageW ?? 0),\(report.espressoPower?.cpuW ?? 0),\(report.espressoPower?.gpuW ?? 0),\(report.espressoPower?.aneW ?? 0)
+    coreml,\(report.coreML.compileTimeMs),\(report.coreML.compileRetryCount),\(report.coreML.compileFailureCount),\(report.coreML.firstTokenLatencyMs),\(report.coreML.tokensPerSecond),\(report.coreML.medianTokenMs),\(report.coreML.p95TokenMs),\(report.coreML.totalTimeMs),\(report.coreML.exactHeadBackend ?? ""),\(report.coreML.cachedBindingsEnabled.map(String.init(describing:)) ?? ""),\(report.coreMLPower?.packageW ?? 0),\(report.coreMLPower?.cpuW ?? 0),\(report.coreMLPower?.gpuW ?? 0),\(report.coreMLPower?.aneW ?? 0)
     """
     try (csv + "\n").write(to: csvURL, atomically: true, encoding: .utf8)
 
@@ -1361,6 +1434,8 @@ private func writeCompareArtifacts(report: CompareReport, defaults: DemoDefaults
 private func backendPayload(_ backend: BackendRunMetrics) -> [String: Any] {
     [
         "compile_time_ms": backend.compileTimeMs,
+        "compile_retry_count": backend.compileRetryCount,
+        "compile_failure_count": backend.compileFailureCount,
         "first_token_latency_ms": backend.firstTokenLatencyMs,
         "tokens_per_second": backend.tokensPerSecond,
         "median_token_ms": backend.medianTokenMs,
@@ -1369,6 +1444,8 @@ private func backendPayload(_ backend: BackendRunMetrics) -> [String: Any] {
         "generated_tokens": backend.generatedTokens.map(Int.init),
         "token_latencies_ms": backend.tokenLatenciesMs,
         "text": backend.text,
+        "exact_head_backend": backend.exactHeadBackend ?? NSNull(),
+        "cached_bindings_enabled": backend.cachedBindingsEnabled ?? NSNull(),
     ]
 }
 

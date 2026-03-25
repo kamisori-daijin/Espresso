@@ -38,3 +38,6 @@
 
 ## 2026-03-20
 - When broader verification depends on a missing protected model, start the download in the background immediately and continue local analysis or smaller checks instead of serially blocking on the asset fetch.
+
+## 2026-03-25
+- When a throughput idea does not clear the measured keep gate, revert it to an explicit experiment flag and preserve the measurement harness instead of shipping the faster-on-paper default.

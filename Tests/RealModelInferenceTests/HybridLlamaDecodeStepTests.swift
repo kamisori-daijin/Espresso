@@ -162,38 +162,64 @@ import ModelSupport
 }
 
 @Test func test_hybridCachedBindingsCanBeDisabledByEnvironment() {
+    let gpt2Config = ModelRegistry.gpt2_124m
+    let storiesConfig = ModelRegistry.stories110m
+    let otherLlamaConfig = ModelRegistry.tinyLlama_1_1b
     #expect(
         RealModelInferenceEngine.supportsHybridCachedBindings(
-            architecture: .gpt2,
+            config: gpt2Config,
             environment: [:]
         ) == true
     )
     #expect(
         RealModelInferenceEngine.supportsHybridCachedBindings(
-            architecture: .llama,
+            config: storiesConfig,
             environment: [:]
         ) == false
     )
     #expect(
         RealModelInferenceEngine.supportsHybridCachedBindings(
-            architecture: .llama,
+            config: otherLlamaConfig,
             environment: ["ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS": "1"]
         ) == true
     )
     #expect(
         RealModelInferenceEngine.supportsHybridCachedBindings(
-            architecture: .gpt2,
+            config: gpt2Config,
             environment: ["ESPRESSO_DISABLE_HYBRID_CACHED_BINDINGS": "1"]
         ) == false
     )
     #expect(
         RealModelInferenceEngine.supportsHybridCachedBindings(
-            architecture: .llama,
+            config: storiesConfig,
             environment: [
                 "ESPRESSO_ENABLE_LLAMA_HYBRID_CACHED_BINDINGS": "1",
                 "ESPRESSO_DISABLE_HYBRID_CACHED_BINDINGS": "1",
             ]
         ) == false
+    )
+}
+
+@Test func test_forceExactHeadBackendOverrideParsesKnownValues() {
+    #expect(
+        RealModelInferenceEngine.forcedExactHeadBackend(
+            environment: ["ESPRESSO_FORCE_EXACT_HEAD_BACKEND": "cpu_fp16_tiled"]
+        ) == .cpuFP16Tiled
+    )
+    #expect(
+        RealModelInferenceEngine.forcedExactHeadBackend(
+            environment: ["ESPRESSO_FORCE_EXACT_HEAD_BACKEND": "partitioned"]
+        ) == .cpuPartitionedFP32
+    )
+    #expect(
+        RealModelInferenceEngine.forcedExactHeadBackend(
+            environment: ["ESPRESSO_FORCE_EXACT_HEAD_BACKEND": "ane"]
+        ) == .ane
+    )
+    #expect(
+        RealModelInferenceEngine.forcedExactHeadBackend(
+            environment: ["ESPRESSO_FORCE_EXACT_HEAD_BACKEND": "bogus"]
+        ) == nil
     )
 }
 

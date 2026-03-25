@@ -35,10 +35,27 @@ import Espresso
         architecture: .llama
     )
     // 32000 * 2048 = 65_536_000 elements > 16_000_000
-    #expect(ClassifierStrategy.select(for: config) == .cpuExact)
+    #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
 }
 
-@Test func qwen3VocabSelectsCPU() {
+@Test func llamaLargeVocabWithExactSidecarSelectsPartitionedCPU() {
+    let config = MultiModelConfig(
+        name: "tinyllama-test",
+        nLayer: 22,
+        nHead: 32,
+        nKVHead: 4,
+        dModel: 2048,
+        headDim: 64,
+        hiddenDim: 5632,
+        vocab: 32_000,
+        maxSeq: 2048,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+    #expect(ClassifierStrategy.select(for: config, hasExactFloat32LMHead: true) == .cpuPartitionedFP32)
+}
+
+@Test func qwen3VocabWithoutSidecarSelectsFP16TiledCPU() {
     let config = MultiModelConfig(
         name: "qwen3-0.6b-test",
         nLayer: 28,
@@ -53,7 +70,24 @@ import Espresso
         architecture: .llama
     )
     // 151936 * 1024 = 155_582_464 elements >> 16_000_000
-    #expect(ClassifierStrategy.select(for: config) == .cpuExact)
+    #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
+}
+
+@Test func gpt2LargeVocabKeepsPartitionedCPUPath() {
+    let config = MultiModelConfig(
+        name: "gpt2-large-vocab",
+        nLayer: 12,
+        nHead: 12,
+        nKVHead: 12,
+        dModel: 768,
+        headDim: 64,
+        hiddenDim: 3072,
+        vocab: 50_257,
+        maxSeq: 1024,
+        normEps: 1e-5,
+        architecture: .gpt2
+    )
+    #expect(ClassifierStrategy.select(for: config) == .cpuPartitionedFP32)
 }
 
 @Test func exactThresholdSelectsANE() {
@@ -89,7 +123,7 @@ import Espresso
         normEps: 1e-5,
         architecture: .llama
     )
-    #expect(ClassifierStrategy.select(for: config) == .cpuExact)
+    #expect(ClassifierStrategy.select(for: config) == .cpuFP16Tiled)
 }
 
 @Test func cpuTiledArgmaxCorrectness() {
