@@ -244,6 +244,21 @@ import ModelSupport
     }
 }
 
+@Test func test_sentencePieceTokenizerURLPrefersTokenizerModel() throws {
+    let fileManager = FileManager.default
+    let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    let modelURL = root.appendingPathComponent("tokenizer.model")
+    let binURL = root.appendingPathComponent("tokenizer.bin")
+    fileManager.createFile(atPath: modelURL.path, contents: Data([0x01]))
+    fileManager.createFile(atPath: binURL.path, contents: Data([0x02]))
+
+    let resolved = sentencePieceTokenizerURL(in: root)
+    #expect(resolved == modelURL)
+
+    try? fileManager.removeItem(at: root)
+}
+
 @Test func test_resolveCoreMLModelPathRejectsLlamaWithoutExplicitModel() throws {
     let fileManager = FileManager.default
     let root = fileManager.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)

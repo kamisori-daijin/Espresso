@@ -716,9 +716,19 @@ func hasGPT2TokenizerAssets(in directory: URL) -> Bool {
         fileManager.fileExists(atPath: directory.appendingPathComponent("merges.txt").path)
 }
 
-private func hasSentencePieceAssets(in directory: URL) -> Bool {
+func sentencePieceTokenizerURL(in directory: URL) -> URL? {
     let fileManager = FileManager()
-    return fileManager.fileExists(atPath: directory.appendingPathComponent("tokenizer.bin").path)
+    for filename in ["tokenizer.model", "tokenizer.bin"] {
+        let candidate = directory.appendingPathComponent(filename)
+        if fileManager.fileExists(atPath: candidate.path) {
+            return candidate
+        }
+    }
+    return nil
+}
+
+private func hasSentencePieceAssets(in directory: URL) -> Bool {
+    sentencePieceTokenizerURL(in: directory) != nil
 }
 
 private func hasTokenizerJSONAssets(in directory: URL) -> Bool {
@@ -790,7 +800,7 @@ private func normalizeTokenizerLocation(_ rawPath: String, config: MultiModelCon
                 return parent.path
             }
         case .llama:
-            if url.lastPathComponent == "tokenizer.bin", hasSentencePieceAssets(in: parent) {
+            if ["tokenizer.model", "tokenizer.bin"].contains(url.lastPathComponent), hasSentencePieceAssets(in: parent) {
                 return parent.path
             }
             if url.lastPathComponent == "tokenizer.json", hasTokenizerJSONAssets(in: parent) {
@@ -828,7 +838,7 @@ private func resolveTokenizerDirectory(
         )
     case .llama:
         throw CLIError.usage(
-            "Unable to locate llama tokenizer assets. Pass --tokenizer or place tokenizer.bin, tokenizer.json, or vocab.json + merges.txt near the weights."
+            "Unable to locate llama tokenizer assets. Pass --tokenizer or place tokenizer.model, tokenizer.bin, tokenizer.json, or vocab.json + merges.txt near the weights."
         )
     }
 }
@@ -888,8 +898,7 @@ private func loadTokenizer(config: MultiModelConfig, tokenizerDir: String) throw
         let tokenizer = try GPT2BPETokenizer(vocabURL: vocabURL, mergesURL: mergesURL)
         return CLITokenizer(encodeImpl: tokenizer.encode, decodeImpl: tokenizer.decode)
     case .llama:
-        let sentencePieceURL = tokenizerDirURL.appendingPathComponent("tokenizer.bin")
-        if FileManager.default.fileExists(atPath: sentencePieceURL.path) {
+        if let sentencePieceURL = sentencePieceTokenizerURL(in: tokenizerDirURL) {
             let tokenizer = try SentencePieceTokenizer(modelURL: sentencePieceURL)
             return CLITokenizer(encodeImpl: tokenizer.encode, decodeImpl: tokenizer.decode)
         }
