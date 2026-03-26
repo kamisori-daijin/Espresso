@@ -31,6 +31,69 @@ public enum ESPBehaviorClass: String, Sendable, Codable, CaseIterable {
     case approximate
 }
 
+public enum ESPOutputHeadKind: String, Sendable, Codable, CaseIterable {
+    case dense
+    case factored
+}
+
+public struct ESPOutputHeadMetadata: Sendable, Codable, Equatable {
+    public let kind: ESPOutputHeadKind
+    public let behaviorClass: ESPBehaviorClass
+    public let bottleneck: Int?
+    public let groups: Int?
+    public let projectionRef: String?
+    public let expansionRef: String?
+
+    public init(
+        kind: ESPOutputHeadKind,
+        behaviorClass: ESPBehaviorClass,
+        bottleneck: Int? = nil,
+        groups: Int? = nil,
+        projectionRef: String? = nil,
+        expansionRef: String? = nil
+    ) {
+        self.kind = kind
+        self.behaviorClass = behaviorClass
+        self.bottleneck = bottleneck
+        self.groups = groups
+        self.projectionRef = projectionRef
+        self.expansionRef = expansionRef
+    }
+}
+
+public enum ESPDraftKind: String, Sendable, Codable, CaseIterable {
+    case exactTwoToken = "exact_two_token"
+    case multiToken = "multi_token"
+}
+
+public struct ESPDraftMetadata: Sendable, Codable, Equatable {
+    public let kind: ESPDraftKind
+    public let behaviorClass: ESPBehaviorClass
+    public let horizon: Int
+    public let verifier: String
+    public let rollback: String
+    public let artifactRef: String
+    public let acceptanceMetric: String
+
+    public init(
+        kind: ESPDraftKind,
+        behaviorClass: ESPBehaviorClass,
+        horizon: Int,
+        verifier: String,
+        rollback: String,
+        artifactRef: String,
+        acceptanceMetric: String
+    ) {
+        self.kind = kind
+        self.behaviorClass = behaviorClass
+        self.horizon = horizon
+        self.verifier = verifier
+        self.rollback = rollback
+        self.artifactRef = artifactRef
+        self.acceptanceMetric = acceptanceMetric
+    }
+}
+
 public struct ESPCompressionPolicy: Sendable, Codable, Equatable {
     public let name: String
     public let weightBits: Int
@@ -84,6 +147,10 @@ public enum ESPBundleValidationError: Error, Equatable {
     case malformedLine(String)
     case malformedSection(String)
     case unsupportedValue(String)
+    case invalidOutputHead(String)
+    case invalidDraft(String)
+    case invalidReferencedPath(String)
+    case missingReferencedFile(String)
     case signatureMismatch(path: String)
 }
 
@@ -102,6 +169,8 @@ public struct ESPManifest: Sendable, Codable, Equatable {
     public let behaviorClass: ESPBehaviorClass
     public let adapterSlots: Int
     public let optimization: ESPOptimizationMetadata
+    public let outputHead: ESPOutputHeadMetadata?
+    public let draft: ESPDraftMetadata?
     public let accuracyBaselineRef: String
     public let performanceBaselineRef: String
     public let signatureRef: String
@@ -121,6 +190,8 @@ public struct ESPManifest: Sendable, Codable, Equatable {
         behaviorClass: ESPBehaviorClass = .exact,
         adapterSlots: Int,
         optimization: ESPOptimizationMetadata = .legacyDefaults,
+        outputHead: ESPOutputHeadMetadata? = nil,
+        draft: ESPDraftMetadata? = nil,
         accuracyBaselineRef: String,
         performanceBaselineRef: String,
         signatureRef: String
@@ -139,6 +210,8 @@ public struct ESPManifest: Sendable, Codable, Equatable {
         self.behaviorClass = behaviorClass
         self.adapterSlots = adapterSlots
         self.optimization = optimization
+        self.outputHead = outputHead
+        self.draft = draft
         self.accuracyBaselineRef = accuracyBaselineRef
         self.performanceBaselineRef = performanceBaselineRef
         self.signatureRef = signatureRef
@@ -183,6 +256,8 @@ public struct ESPManifest: Sendable, Codable, Equatable {
 
         try validateNonEmpty(optimization.recipe, field: "optimization.recipe")
         try validateNonEmpty(optimization.qualityGate, field: "optimization.quality_gate")
+        try validate(outputHead: outputHead)
+        try validate(draft: draft)
     }
 
     public func renderTOML() -> String {
@@ -214,6 +289,21 @@ public struct ESPManifest: Sendable, Codable, Equatable {
             optimization.teacherModel.map { "teacher_model = \(quoted($0))" },
             optimization.draftModel.map { "draft_model = \(quoted($0))" },
             optimization.performanceTarget.map { "performance_target = \(quoted($0))" },
+            outputHead.map { _ in "[output_head]" },
+            outputHead.map { "kind = \(quoted($0.kind.rawValue))" },
+            outputHead.map { "behavior_class = \(quoted($0.behaviorClass.rawValue))" },
+            outputHead?.bottleneck.map { "bottleneck = \($0)" },
+            outputHead?.groups.map { "groups = \($0)" },
+            outputHead?.projectionRef.map { "projection_ref = \(quoted($0))" },
+            outputHead?.expansionRef.map { "expansion_ref = \(quoted($0))" },
+            draft.map { _ in "[draft]" },
+            draft.map { "kind = \(quoted($0.kind.rawValue))" },
+            draft.map { "behavior_class = \(quoted($0.behaviorClass.rawValue))" },
+            draft.map { "horizon = \($0.horizon)" },
+            draft.map { "verifier = \(quoted($0.verifier))" },
+            draft.map { "rollback = \(quoted($0.rollback))" },
+            draft.map { "artifact_ref = \(quoted($0.artifactRef))" },
+            draft.map { "acceptance_metric = \(quoted($0.acceptanceMetric))" },
         ]
         let lines = rawLines.compactMap { $0 }
 
@@ -224,6 +314,8 @@ public struct ESPManifest: Sendable, Codable, Equatable {
         var topLevel: [String: String] = [:]
         var compressionSection: [String: String] = [:]
         var optimizationSection: [String: String] = [:]
+        var outputHeadSection: [String: String] = [:]
+        var draftSection: [String: String] = [:]
         var currentSection: String?
 
         for rawLine in text.split(whereSeparator: \.isNewline) {
@@ -237,6 +329,10 @@ public struct ESPManifest: Sendable, Codable, Equatable {
                     currentSection = "compression_policy"
                 case "[optimization]":
                     currentSection = "optimization"
+                case "[output_head]":
+                    currentSection = "output_head"
+                case "[draft]":
+                    currentSection = "draft"
                 default:
                     throw ESPBundleValidationError.malformedSection(line)
                 }
@@ -253,6 +349,10 @@ public struct ESPManifest: Sendable, Codable, Equatable {
                 compressionSection[key] = value
             } else if currentSection == "optimization" {
                 optimizationSection[key] = value
+            } else if currentSection == "output_head" {
+                outputHeadSection[key] = value
+            } else if currentSection == "draft" {
+                draftSection[key] = value
             } else {
                 topLevel[key] = value
             }
@@ -283,6 +383,8 @@ public struct ESPManifest: Sendable, Codable, Equatable {
                 draftModel: optimizationSection["draft_model"].flatMap { try? unquote($0) },
                 performanceTarget: optimizationSection["performance_target"].flatMap { try? unquote($0) }
             ),
+            outputHead: try parseOutputHeadSection(outputHeadSection),
+            draft: try parseDraftSection(draftSection),
             accuracyBaselineRef: try parseString(topLevel, key: "accuracy_baseline_ref"),
             performanceBaselineRef: try parseString(topLevel, key: "performance_baseline_ref"),
             signatureRef: try parseString(topLevel, key: "signature_ref")
@@ -295,6 +397,61 @@ public struct ESPManifest: Sendable, Codable, Equatable {
         guard !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ESPBundleValidationError.emptyField(field)
         }
+    }
+
+    private func validate(outputHead: ESPOutputHeadMetadata?) throws {
+        guard let outputHead else {
+            return
+        }
+
+        switch outputHead.kind {
+        case .dense:
+            if outputHead.bottleneck != nil || outputHead.groups != nil ||
+                outputHead.projectionRef != nil || outputHead.expansionRef != nil {
+                throw ESPBundleValidationError.invalidOutputHead(
+                    "dense output head cannot declare factored weights or dimensions"
+                )
+            }
+        case .factored:
+            guard let bottleneck = outputHead.bottleneck, bottleneck > 0 else {
+                throw ESPBundleValidationError.invalidOutputHead(
+                    "factored output head requires bottleneck > 0"
+                )
+            }
+            guard let groups = outputHead.groups, groups > 0 else {
+                throw ESPBundleValidationError.invalidOutputHead(
+                    "factored output head requires groups > 0"
+                )
+            }
+            try validateReference(outputHead.projectionRef, field: "output_head.projection_ref")
+            try validateReference(outputHead.expansionRef, field: "output_head.expansion_ref")
+        }
+    }
+
+    private func validate(draft: ESPDraftMetadata?) throws {
+        guard let draft else {
+            return
+        }
+
+        guard draft.horizon > 1 else {
+            throw ESPBundleValidationError.invalidDraft("draft horizon must be > 1")
+        }
+        if draft.kind == .exactTwoToken, draft.horizon != 2 {
+            throw ESPBundleValidationError.invalidDraft(
+                "exact_two_token draft requires horizon == 2"
+            )
+        }
+        try validateNonEmpty(draft.verifier, field: "draft.verifier")
+        try validateNonEmpty(draft.rollback, field: "draft.rollback")
+        try validateNonEmpty(draft.acceptanceMetric, field: "draft.acceptance_metric")
+        try validateReference(draft.artifactRef, field: "draft.artifact_ref")
+    }
+
+    private func validateReference(_ value: String?, field: String) throws {
+        guard let value else {
+            throw ESPBundleValidationError.emptyField(field)
+        }
+        try validateNonEmpty(value, field: field)
     }
 }
 
@@ -414,6 +571,7 @@ public struct ESPBundleArchive: Sendable, Equatable {
         if verifySignatures {
             try archive.verifySignatures(fileManager: fileManager)
         }
+        try archive.validateReferencedArtifacts(fileManager: fileManager)
         return archive
     }
 
@@ -470,6 +628,52 @@ public struct ESPBundleArchive: Sendable, Equatable {
         }
         return urls.sorted { $0.path < $1.path }
     }
+
+    private func validateReferencedArtifacts(fileManager: FileManager) throws {
+        if let outputHead = manifest.outputHead, outputHead.kind == .factored {
+            if let projectionRef = outputHead.projectionRef {
+                try validateReferencedArtifact(
+                    reference: projectionRef,
+                    fileManager: fileManager
+                )
+            }
+            if let expansionRef = outputHead.expansionRef {
+                try validateReferencedArtifact(
+                    reference: expansionRef,
+                    fileManager: fileManager
+                )
+            }
+        }
+        if let draft = manifest.draft {
+            try validateReferencedArtifact(reference: draft.artifactRef, fileManager: fileManager)
+        }
+    }
+
+    private func validateReferencedArtifact(
+        reference: String,
+        fileManager: FileManager
+    ) throws {
+        let candidateURL = try resolveBundleRelativeFile(reference: reference)
+        var isDirectory = ObjCBool(false)
+        guard fileManager.fileExists(atPath: candidateURL.path, isDirectory: &isDirectory),
+              !isDirectory.boolValue else {
+            throw ESPBundleValidationError.missingReferencedFile(reference)
+        }
+    }
+
+    private func resolveBundleRelativeFile(reference: String) throws -> URL {
+        guard !reference.isEmpty,
+              !reference.hasPrefix("/") else {
+            throw ESPBundleValidationError.invalidReferencedPath(reference)
+        }
+        let resolvedURL = bundleURL.appendingPathComponent(reference).standardizedFileURL
+        let rootPath = bundleURL.standardizedFileURL.path
+        let resolvedPath = resolvedURL.path
+        guard resolvedPath == rootPath || resolvedPath.hasPrefix(rootPath + "/") else {
+            throw ESPBundleValidationError.invalidReferencedPath(reference)
+        }
+        return resolvedURL
+    }
 }
 
 private func quoted(_ value: String) -> String {
@@ -515,6 +719,41 @@ private func parseEnum<T: RawRepresentable>(
         throw ESPBundleValidationError.unsupportedValue(raw)
     }
     return value
+}
+
+private func parseOutputHeadSection(
+    _ dictionary: [String: String]
+) throws -> ESPOutputHeadMetadata? {
+    guard !dictionary.isEmpty else {
+        return nil
+    }
+
+    return ESPOutputHeadMetadata(
+        kind: try parseEnum(dictionary, key: "kind", as: ESPOutputHeadKind.self),
+        behaviorClass: try parseEnum(dictionary, key: "behavior_class", as: ESPBehaviorClass.self),
+        bottleneck: dictionary["bottleneck"].flatMap(Int.init),
+        groups: dictionary["groups"].flatMap(Int.init),
+        projectionRef: dictionary["projection_ref"].flatMap { try? unquote($0) },
+        expansionRef: dictionary["expansion_ref"].flatMap { try? unquote($0) }
+    )
+}
+
+private func parseDraftSection(
+    _ dictionary: [String: String]
+) throws -> ESPDraftMetadata? {
+    guard !dictionary.isEmpty else {
+        return nil
+    }
+
+    return ESPDraftMetadata(
+        kind: try parseEnum(dictionary, key: "kind", as: ESPDraftKind.self),
+        behaviorClass: try parseEnum(dictionary, key: "behavior_class", as: ESPBehaviorClass.self),
+        horizon: try parseInt(dictionary, key: "horizon"),
+        verifier: try parseString(dictionary, key: "verifier"),
+        rollback: try parseString(dictionary, key: "rollback"),
+        artifactRef: try parseString(dictionary, key: "artifact_ref"),
+        acceptanceMetric: try parseString(dictionary, key: "acceptance_metric")
+    )
 }
 
 private func parseEnum<T: RawRepresentable>(

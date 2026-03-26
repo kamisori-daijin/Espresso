@@ -24,6 +24,23 @@ import Foundation
             draftModel: nil,
             performanceTarget: "110 tok/s"
         ),
+        outputHead: .init(
+            kind: .factored,
+            behaviorClass: .nearExact,
+            bottleneck: 128,
+            groups: 1,
+            projectionRef: "weights/cls_proj.bin",
+            expansionRef: "weights/cls_expand.bin"
+        ),
+        draft: .init(
+            kind: .exactTwoToken,
+            behaviorClass: .exact,
+            horizon: 2,
+            verifier: "exact",
+            rollback: "exact_replay",
+            artifactRef: "weights/future-sidecar.bin",
+            acceptanceMetric: "accepted_future_tokens"
+        ),
         accuracyBaselineRef: "benchmarks/qwen-0.6b/accuracy.json",
         performanceBaselineRef: "benchmarks/qwen-0.6b/perf.json",
         signatureRef: "signatures/manifest.sig"
@@ -37,6 +54,10 @@ import Foundation
     #expect(renderedA.contains("behavior_class = \"near_exact\""))
     #expect(renderedA.contains("context_target_tokens = 1024"))
     #expect(renderedA.contains("supported_backends = [\"ane-private\", \"cpu-safe\"]"))
+    #expect(renderedA.contains("[output_head]"))
+    #expect(renderedA.contains("projection_ref = \"weights/cls_proj.bin\""))
+    #expect(renderedA.contains("[draft]"))
+    #expect(renderedA.contains("artifact_ref = \"weights/future-sidecar.bin\""))
 }
 
 @Test func manifestValidationRejectsEmptyModelID() {
@@ -104,6 +125,23 @@ import Foundation
             draftModel: nil,
             performanceTarget: nil
         ),
+        outputHead: .init(
+            kind: .factored,
+            behaviorClass: .nearExact,
+            bottleneck: 96,
+            groups: 3,
+            projectionRef: "weights/cls_proj.bin",
+            expansionRef: "weights/cls_expand.bin"
+        ),
+        draft: .init(
+            kind: .exactTwoToken,
+            behaviorClass: .exact,
+            horizon: 2,
+            verifier: "exact",
+            rollback: "exact_replay",
+            artifactRef: "weights/future-sidecar.bin",
+            acceptanceMetric: "accepted_future_tokens"
+        ),
         accuracyBaselineRef: "benchmarks/accuracy.json",
         performanceBaselineRef: "benchmarks/perf.json",
         signatureRef: "signatures/content-hashes.json"
@@ -139,6 +177,155 @@ import Foundation
     #expect(manifest.contextTargetTokens == 256)
     #expect(manifest.optimization.recipe == "legacy")
     #expect(manifest.optimization.qualityGate == "legacy-compatible")
+    #expect(manifest.outputHead == nil)
+    #expect(manifest.draft == nil)
+}
+
+@Test func manifestValidationRejectsIncompleteFactoredHead() {
+    let manifest = ESPManifest(
+        formatVersion: "1.1.0",
+        modelID: "espresso.llama.factored",
+        modelFamily: .llama,
+        architectureVersion: "decoder-v1",
+        tokenizerContract: "sentencepiece-v1",
+        supportedBackends: [.anePrivate],
+        supportedProfiles: [.prefill256, .decode1],
+        maxContext: 256,
+        contextTargetTokens: 256,
+        compressionPolicy: .init(name: "fp16", weightBits: 16, activationBits: nil),
+        modelTier: .optimized,
+        behaviorClass: .nearExact,
+        adapterSlots: 0,
+        optimization: .init(recipe: "factored", qualityGate: "gated"),
+        outputHead: .init(
+            kind: .factored,
+            behaviorClass: .nearExact,
+            bottleneck: 128,
+            groups: 1,
+            projectionRef: nil,
+            expansionRef: "weights/cls_expand.bin"
+        ),
+        accuracyBaselineRef: "benchmarks/accuracy.json",
+        performanceBaselineRef: "benchmarks/perf.json",
+        signatureRef: "signatures/content-hashes.json"
+    )
+
+    do {
+        try manifest.validate()
+        #expect(Bool(false), "Expected invalid factored head")
+    } catch let error as ESPBundleValidationError {
+        #expect(error == .emptyField("output_head.projection_ref"))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
+}
+
+@Test func manifestValidationRejectsInvalidExactTwoTokenDraft() {
+    let manifest = ESPManifest(
+        formatVersion: "1.1.0",
+        modelID: "espresso.llama.draft",
+        modelFamily: .llama,
+        architectureVersion: "decoder-v1",
+        tokenizerContract: "sentencepiece-v1",
+        supportedBackends: [.anePrivate],
+        supportedProfiles: [.prefill256, .decode1],
+        maxContext: 256,
+        contextTargetTokens: 256,
+        compressionPolicy: .init(name: "fp16", weightBits: 16, activationBits: nil),
+        modelTier: .optimized,
+        behaviorClass: .exact,
+        adapterSlots: 0,
+        optimization: .init(recipe: "draft", qualityGate: "gated"),
+        draft: .init(
+            kind: .exactTwoToken,
+            behaviorClass: .exact,
+            horizon: 3,
+            verifier: "exact",
+            rollback: "exact_replay",
+            artifactRef: "weights/future-sidecar.bin",
+            acceptanceMetric: "accepted_future_tokens"
+        ),
+        accuracyBaselineRef: "benchmarks/accuracy.json",
+        performanceBaselineRef: "benchmarks/perf.json",
+        signatureRef: "signatures/content-hashes.json"
+    )
+
+    do {
+        try manifest.validate()
+        #expect(Bool(false), "Expected invalid draft horizon")
+    } catch let error as ESPBundleValidationError {
+        #expect(error == .invalidDraft("exact_two_token draft requires horizon == 2"))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
+}
+
+@Test func bundleOpenRejectsMissingReferencedDraftArtifact() throws {
+    let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+    let weights = root.appendingPathComponent("weights-src", isDirectory: true)
+    let tokenizer = root.appendingPathComponent("tokenizer-src", isDirectory: true)
+    let bundle = root.appendingPathComponent("model.esp", isDirectory: true)
+
+    try FileManager.default.createDirectory(at: weights, withIntermediateDirectories: true)
+    try FileManager.default.createDirectory(at: tokenizer, withIntermediateDirectories: true)
+    try Data("{}".utf8).write(to: weights.appendingPathComponent("metadata.json"))
+    try Data("weights".utf8).write(to: weights.appendingPathComponent("lm_head.bin"))
+    try Data("proj".utf8).write(to: weights.appendingPathComponent("cls_proj.bin"))
+    try Data("expand".utf8).write(to: weights.appendingPathComponent("cls_expand.bin"))
+    try Data("tokenizer".utf8).write(to: tokenizer.appendingPathComponent("tokenizer.model"))
+
+    let manifest = ESPManifest(
+        formatVersion: "1.1.0",
+        modelID: "espresso.llama.test",
+        modelFamily: .llama,
+        architectureVersion: "decoder-v1",
+        tokenizerContract: "sentencepiece-v1",
+        supportedBackends: [.anePrivate, .cpuSafe],
+        supportedProfiles: [.prefill256, .decode1],
+        maxContext: 256,
+        contextTargetTokens: 256,
+        compressionPolicy: .init(name: "fp16", weightBits: 16, activationBits: nil),
+        modelTier: .optimized,
+        behaviorClass: .exact,
+        adapterSlots: 0,
+        optimization: .init(recipe: "stories-ctx256", qualityGate: "exact"),
+        outputHead: .init(
+            kind: .factored,
+            behaviorClass: .nearExact,
+            bottleneck: 64,
+            groups: 1,
+            projectionRef: "weights/cls_proj.bin",
+            expansionRef: "weights/cls_expand.bin"
+        ),
+        draft: .init(
+            kind: .exactTwoToken,
+            behaviorClass: .exact,
+            horizon: 2,
+            verifier: "exact",
+            rollback: "exact_replay",
+            artifactRef: "weights/future-sidecar.bin",
+            acceptanceMetric: "accepted_future_tokens"
+        ),
+        accuracyBaselineRef: "benchmarks/accuracy.json",
+        performanceBaselineRef: "benchmarks/perf.json",
+        signatureRef: "signatures/content-hashes.json"
+    )
+
+    _ = try ESPBundleArchive.create(
+        at: bundle,
+        manifest: manifest,
+        weightsDirectory: weights,
+        tokenizerDirectory: tokenizer
+    )
+
+    do {
+        _ = try ESPBundleArchive.open(at: bundle)
+        #expect(Bool(false), "Expected missing referenced artifact rejection")
+    } catch let error as ESPBundleValidationError {
+        #expect(error == .missingReferencedFile("weights/future-sidecar.bin"))
+    } catch {
+        #expect(Bool(false), "Unexpected error: \(error)")
+    }
 }
 
 @Test func bundleCreateAndOpenRoundTrip() throws {

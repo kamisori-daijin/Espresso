@@ -25,6 +25,23 @@ import Foundation
             draftModel: nil,
             performanceTarget: nil
         ),
+        outputHead: .init(
+            kind: .factored,
+            behaviorClass: .nearExact,
+            bottleneck: 128,
+            groups: 1,
+            projectionRef: "weights/cls_proj.bin",
+            expansionRef: "weights/cls_expand.bin"
+        ),
+        draft: .init(
+            kind: .exactTwoToken,
+            behaviorClass: .exact,
+            horizon: 2,
+            verifier: "exact",
+            rollback: "exact_replay",
+            artifactRef: "weights/future-sidecar.bin",
+            acceptanceMetric: "accepted_future_tokens"
+        ),
         accuracyBaselineRef: "benchmarks/accuracy.json",
         performanceBaselineRef: "benchmarks/perf.json",
         signatureRef: "signatures/manifest.sig"
@@ -38,6 +55,8 @@ import Foundation
     #expect(selection.backend == .anePrivate)
     #expect(selection.profile == .prefill2048)
     #expect(selection.contextTargetTokens == 1024)
+    #expect(selection.outputHead?.kind == .factored)
+    #expect(selection.draft?.kind == .exactTwoToken)
 }
 
 @Test func runtimeFallsBackToCPUWhenANEUnavailable() throws {
@@ -182,6 +201,9 @@ import Foundation
     }
     """.write(to: weights.appendingPathComponent("metadata.json"), atomically: true, encoding: .utf8)
     try Data("weights".utf8).write(to: weights.appendingPathComponent("lm_head.bin"))
+    try Data("proj".utf8).write(to: weights.appendingPathComponent("cls_proj.bin"))
+    try Data("expand".utf8).write(to: weights.appendingPathComponent("cls_expand.bin"))
+    try Data("draft".utf8).write(to: weights.appendingPathComponent("future-sidecar.bin"))
     try Data("tokenizer".utf8).write(to: tokenizer.appendingPathComponent("tokenizer.model"))
 
     let manifest = ESPManifest(
@@ -205,6 +227,23 @@ import Foundation
             draftModel: nil,
             performanceTarget: nil
         ),
+        outputHead: .init(
+            kind: .factored,
+            behaviorClass: .nearExact,
+            bottleneck: 128,
+            groups: 1,
+            projectionRef: "weights/cls_proj.bin",
+            expansionRef: "weights/cls_expand.bin"
+        ),
+        draft: .init(
+            kind: .exactTwoToken,
+            behaviorClass: .exact,
+            horizon: 2,
+            verifier: "exact",
+            rollback: "exact_replay",
+            artifactRef: "weights/future-sidecar.bin",
+            acceptanceMetric: "accepted_future_tokens"
+        ),
         accuracyBaselineRef: "benchmarks/accuracy.json",
         performanceBaselineRef: "benchmarks/perf.json",
         signatureRef: "signatures/content-hashes.json"
@@ -221,4 +260,6 @@ import Foundation
     #expect(bundle.config.name == "qwen3")
     #expect(selection.backend == .anePrivate)
     #expect(selection.contextTargetTokens == 1024)
+    #expect(selection.outputHead?.projectionRef == "weights/cls_proj.bin")
+    #expect(selection.draft?.artifactRef == "weights/future-sidecar.bin")
 }

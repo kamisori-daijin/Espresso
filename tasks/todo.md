@@ -10,9 +10,13 @@
 - [x] Package and verify a first-class `stories110m-ctx256` `.esp` artifact.
 - [x] Add GQA/MQA Stories variant schema/runtime compatibility coverage.
 - [x] Add a reproducible distilled Stories-native pipeline with export/eval metadata.
-- [ ] Add manifest/runtime support for a factored output head.
-- [ ] Add manifest/runtime support for a draft or multi-token head with verifier accounting.
-- [ ] Run verification builds/tests/benchmarks and record retained outcomes.
+- [x] Add `.esp` manifest sections for output-head and draft metadata with exact/near-exact/approximate labeling.
+- [x] Validate factored-head and draft sidecar file references during bundle/runtime open.
+- [x] Expose selected output-head and draft features through runtime resolution.
+- [x] Add CLI/exporter support for output-head and draft manifest metadata.
+- [x] Run verification builds/tests for the output-head/draft contract slice and a real bundle smoke run.
+- [ ] Add real model/export/runtime execution for a cheaper factored Stories head and benchmark it on the Stories release path.
+- [ ] Add real bundle/runtime execution for draft or multi-token Stories decoding with acceptance accounting and benchmark it on the Stories release path.
 
 ## Baseline
 
@@ -34,10 +38,11 @@
 | `stories110m-ctx256` long prompt | `espresso-generate generate --bundle /tmp/stories110m-ctx256-v1.esp --max-tokens 32 --prompt 'In a distant future ...'` | baseline text matched, `106.02 tok/s` single run | text matched, `65.43 tok/s` single run | exact text match; single-run latency noisy, not used as retain gate | informational |
 | Distill proof artifact | `python3 scripts/distill_stories_native.py --config configs/stories/distill-proof.json --dry-run` then `espresso-generate generate --bundle /tmp/stories110m-distill-proof.esp --max-tokens 8 Hello` | no pipeline | `.esp` proof artifact exported and ran, but `compile_ms=26778.79`, retries/failures high, text approximate/garbled | approximate proof-only, not a retained serving path | keep pipeline, reject artifact as product path |
 | GQA proof artifact | `python3 scripts/distill_stories_native.py --config configs/stories/gqa4-proof.json --dry-run` then `espresso-generate generate --bundle /tmp/stories110m-gqa4-proof.esp --max-tokens 4 Hello` | no runnable Stories/GQA artifact | `.esp` GQA proof artifact exported and ran, but `compile_ms=26621.03`, retries/failures high, text approximate/garbled | approximate proof-only, validates contract/runtime compatibility, not a retained serving path | keep support, reject artifact as product path |
+| Output-head/draft contract slice | `swift test --filter 'ESPBundleTests|ESPRuntimeTests|ESPConvertTests'` + release `espc`/`esprun` rebuild + `esprun`/`espresso-generate` smoke on `/tmp/stories110m-contract-proof.esp` | no bundle contract for factored-head or draft metadata | manifest/runtime/CLI support added; proof bundle packaged and generated successfully | contract-only verification; no throughput claim, retained path unchanged | keep |
 
 ## Review
 
 - Retained:
-  bundle contract v`1.1.0`, context-target packing, measured bundle token latencies, and the executed distillation/export proof pipelines for baseline and GQA student artifacts.
+  bundle contract v`1.1.0`, context-target packing, measured bundle token latencies, output-head/draft manifest-runtime contract support, and the executed distillation/export proof pipelines for baseline and GQA student artifacts.
 - Remaining:
-  factored-head manifest/runtime wiring, draft or multi-token manifest/runtime wiring, and a retained optimized Stories artifact beyond the ctx256 packaging lane.
+  a retained factored-head Stories artifact with real release-benchmark evidence, a retained draft or multi-token Stories artifact with acceptance accounting and real release-benchmark evidence, and a retained optimized Stories artifact beyond the ctx256 packaging lane.

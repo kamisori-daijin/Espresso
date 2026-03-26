@@ -83,6 +83,23 @@ import Testing
                 teacherModel: nil,
                 draftModel: nil,
                 performanceTarget: "105 tok/s"
+            ),
+            outputHead: .init(
+                kind: .factored,
+                behaviorClass: .nearExact,
+                bottleneck: 128,
+                groups: 1,
+                projectionRef: "weights/cls_proj.bin",
+                expansionRef: "weights/cls_expand.bin"
+            ),
+            draft: .init(
+                kind: .exactTwoToken,
+                behaviorClass: .exact,
+                horizon: 2,
+                verifier: "exact",
+                rollback: "exact_replay",
+                artifactRef: "weights/future-sidecar.bin",
+                acceptanceMetric: "accepted_future_tokens"
             )
         )
     )
@@ -93,6 +110,8 @@ import Testing
     #expect(manifest.modelTier == .optimized)
     #expect(manifest.optimization.recipe == "stories-ctx256")
     #expect(manifest.optimization.performanceTarget == "105 tok/s")
+    #expect(manifest.outputHead?.kind == .factored)
+    #expect(manifest.draft?.kind == .exactTwoToken)
 }
 
 @Test func nativeExporterRejectsContextTargetAboveModelContext() throws {

@@ -13,17 +13,23 @@ public struct ESPNativeModelBundleExportOptions: Sendable, Equatable {
     public let modelTier: ESPModelTier
     public let behaviorClass: ESPBehaviorClass
     public let optimization: ESPOptimizationMetadata
+    public let outputHead: ESPOutputHeadMetadata?
+    public let draft: ESPDraftMetadata?
 
     public init(
         contextTargetTokens: Int? = nil,
         modelTier: ESPModelTier = .compat,
         behaviorClass: ESPBehaviorClass = .exact,
-        optimization: ESPOptimizationMetadata = .init(recipe: "native-baseline", qualityGate: "exact")
+        optimization: ESPOptimizationMetadata = .init(recipe: "native-baseline", qualityGate: "exact"),
+        outputHead: ESPOutputHeadMetadata? = nil,
+        draft: ESPDraftMetadata? = nil
     ) {
         self.contextTargetTokens = contextTargetTokens
         self.modelTier = modelTier
         self.behaviorClass = behaviorClass
         self.optimization = optimization
+        self.outputHead = outputHead
+        self.draft = draft
     }
 }
 
@@ -108,6 +114,8 @@ public enum ESPNativeModelBundleExporter {
             behaviorClass: options.behaviorClass,
             adapterSlots: 0,
             optimization: options.optimization,
+            outputHead: options.outputHead,
+            draft: options.draft,
             accuracyBaselineRef: "benchmarks/accuracy.json",
             performanceBaselineRef: "benchmarks/perf.json",
             signatureRef: "signatures/\(ESPBundleLayout.signatureCatalogFileName)"

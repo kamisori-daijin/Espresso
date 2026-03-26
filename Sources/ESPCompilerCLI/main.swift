@@ -71,6 +71,19 @@ struct ESPCompilerCLI {
         var teacherModel: String?
         var draftModel: String?
         var performanceTarget: String?
+        var outputHeadKind: ESPOutputHeadKind?
+        var outputHeadBehaviorClass: ESPBehaviorClass?
+        var outputHeadBottleneck: Int?
+        var outputHeadGroups: Int?
+        var outputHeadProjectionRef: String?
+        var outputHeadExpansionRef: String?
+        var draftKind: ESPDraftKind?
+        var draftBehaviorClass: ESPBehaviorClass?
+        var draftHorizon: Int?
+        var draftVerifier: String?
+        var draftRollback: String?
+        var draftArtifactRef: String?
+        var draftAcceptanceMetric: String?
         var index = 3
 
         while index < arguments.count {
@@ -129,6 +142,94 @@ struct ESPCompilerCLI {
                     throw usageError("Missing value for --performance-target")
                 }
                 performanceTarget = arguments[index]
+            case "--output-head-kind":
+                index += 1
+                guard index < arguments.count,
+                      let value = ESPOutputHeadKind(rawValue: arguments[index]) else {
+                    throw usageError("Expected --output-head-kind dense|factored")
+                }
+                outputHeadKind = value
+            case "--output-head-behavior-class":
+                index += 1
+                guard index < arguments.count,
+                      let value = ESPBehaviorClass(rawValue: arguments[index]) else {
+                    throw usageError("Expected --output-head-behavior-class exact|near_exact|approximate")
+                }
+                outputHeadBehaviorClass = value
+            case "--output-head-bottleneck":
+                index += 1
+                guard index < arguments.count,
+                      let value = Int(arguments[index]),
+                      value > 0 else {
+                    throw usageError("Expected a positive integer for --output-head-bottleneck")
+                }
+                outputHeadBottleneck = value
+            case "--output-head-groups":
+                index += 1
+                guard index < arguments.count,
+                      let value = Int(arguments[index]),
+                      value > 0 else {
+                    throw usageError("Expected a positive integer for --output-head-groups")
+                }
+                outputHeadGroups = value
+            case "--output-head-projection":
+                index += 1
+                guard index < arguments.count else {
+                    throw usageError("Missing value for --output-head-projection")
+                }
+                outputHeadProjectionRef = arguments[index]
+            case "--output-head-expansion":
+                index += 1
+                guard index < arguments.count else {
+                    throw usageError("Missing value for --output-head-expansion")
+                }
+                outputHeadExpansionRef = arguments[index]
+            case "--draft-kind":
+                index += 1
+                guard index < arguments.count,
+                      let value = ESPDraftKind(rawValue: arguments[index]) else {
+                    throw usageError("Expected --draft-kind exact_two_token|multi_token")
+                }
+                draftKind = value
+            case "--draft-behavior-class":
+                index += 1
+                guard index < arguments.count,
+                      let value = ESPBehaviorClass(rawValue: arguments[index]) else {
+                    throw usageError("Expected --draft-behavior-class exact|near_exact|approximate")
+                }
+                draftBehaviorClass = value
+            case "--draft-horizon":
+                index += 1
+                guard index < arguments.count,
+                      let value = Int(arguments[index]),
+                      value > 1 else {
+                    throw usageError("Expected an integer > 1 for --draft-horizon")
+                }
+                draftHorizon = value
+            case "--draft-verifier":
+                index += 1
+                guard index < arguments.count else {
+                    throw usageError("Missing value for --draft-verifier")
+                }
+                draftVerifier = arguments[index]
+            case "--draft-rollback":
+                index += 1
+                guard index < arguments.count else {
+                    throw usageError("Missing value for --draft-rollback")
+                }
+                draftRollback = arguments[index]
+            case "--draft-artifact":
+                index += 1
+                guard index < arguments.count else {
+                    throw usageError("Missing value for --draft-artifact")
+                }
+                draftArtifactRef = arguments[index]
+            case "--draft-acceptance-metric":
+                index += 1
+                guard index < arguments.count else {
+                    throw usageError("Missing value for --draft-acceptance-metric")
+                }
+                draftAcceptanceMetric = arguments[index]
             case "--overwrite":
                 overwriteExisting = true
             default:
@@ -151,7 +252,28 @@ struct ESPCompilerCLI {
                     teacherModel: teacherModel,
                     draftModel: draftModel,
                     performanceTarget: performanceTarget
-                )
+                ),
+                outputHead: outputHeadKind.map {
+                    ESPOutputHeadMetadata(
+                        kind: $0,
+                        behaviorClass: outputHeadBehaviorClass ?? behaviorClass,
+                        bottleneck: outputHeadBottleneck,
+                        groups: outputHeadGroups,
+                        projectionRef: outputHeadProjectionRef,
+                        expansionRef: outputHeadExpansionRef
+                    )
+                },
+                draft: draftKind.map {
+                    ESPDraftMetadata(
+                        kind: $0,
+                        behaviorClass: draftBehaviorClass ?? behaviorClass,
+                        horizon: draftHorizon ?? ($0 == .exactTwoToken ? 2 : 4),
+                        verifier: draftVerifier ?? "exact",
+                        rollback: draftRollback ?? "exact_replay",
+                        artifactRef: draftArtifactRef ?? "weights/future-sidecar.bin",
+                        acceptanceMetric: draftAcceptanceMetric ?? "accepted_future_tokens"
+                    )
+                }
             ),
             overwriteExisting: overwriteExisting
         )
@@ -165,7 +287,7 @@ struct ESPCompilerCLI {
         fputs(
             """
             Usage:
-              espc pack-native <model-dir> <bundle-path> [--tokenizer-dir DIR] [--context-target TOKENS] [--model-tier compat|optimized|native_fast] [--behavior-class exact|near_exact|approximate] [--optimization-recipe NAME] [--quality-gate NAME] [--teacher-model MODEL] [--draft-model MODEL] [--performance-target VALUE] [--overwrite]
+              espc pack-native <model-dir> <bundle-path> [--tokenizer-dir DIR] [--context-target TOKENS] [--model-tier compat|optimized|native_fast] [--behavior-class exact|near_exact|approximate] [--optimization-recipe NAME] [--quality-gate NAME] [--teacher-model MODEL] [--draft-model MODEL] [--performance-target VALUE] [--output-head-kind dense|factored] [--output-head-behavior-class exact|near_exact|approximate] [--output-head-bottleneck TOKENS] [--output-head-groups COUNT] [--output-head-projection PATH] [--output-head-expansion PATH] [--draft-kind exact_two_token|multi_token] [--draft-behavior-class exact|near_exact|approximate] [--draft-horizon TOKENS] [--draft-verifier MODE] [--draft-rollback MODE] [--draft-artifact PATH] [--draft-acceptance-metric NAME] [--overwrite]
               espc inspect <bundle-path>
 
             """,

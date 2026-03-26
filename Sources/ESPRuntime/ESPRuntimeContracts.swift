@@ -44,17 +44,23 @@ public struct ESPRuntimeSelection: Sendable, Equatable {
     public let backend: ESPBackendKind
     public let profile: ESPProfile
     public let contextTargetTokens: Int
+    public let outputHead: ESPOutputHeadMetadata?
+    public let draft: ESPDraftMetadata?
     public let reason: String
 
     public init(
         backend: ESPBackendKind,
         profile: ESPProfile,
         contextTargetTokens: Int,
+        outputHead: ESPOutputHeadMetadata? = nil,
+        draft: ESPDraftMetadata? = nil,
         reason: String
     ) {
         self.backend = backend
         self.profile = profile
         self.contextTargetTokens = contextTargetTokens
+        self.outputHead = outputHead
+        self.draft = draft
         self.reason = reason
     }
 }
@@ -92,6 +98,8 @@ public enum ESPRuntimeResolver {
                     backend: .anePrivate,
                     profile: selectedProfile,
                     contextTargetTokens: manifest.contextTargetTokens,
+                    outputHead: manifest.outputHead,
+                    draft: manifest.draft,
                     reason: "Private ANE backend is available on this host"
                 )
             case .cpuSafe:
@@ -99,6 +107,8 @@ public enum ESPRuntimeResolver {
                     backend: .cpuSafe,
                     profile: selectedProfile,
                     contextTargetTokens: manifest.contextTargetTokens,
+                    outputHead: manifest.outputHead,
+                    draft: manifest.draft,
                     reason: "Fell back to CPU-safe backend"
                 )
             default:
