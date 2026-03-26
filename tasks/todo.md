@@ -17,7 +17,10 @@
 - [x] Run verification builds/tests for the output-head/draft contract slice and a real bundle smoke run.
 - [x] Add real model/export/runtime execution for a cheaper factored Stories head and benchmark it on the Stories release path.
 - [ ] Retain a factored Stories head only if real Stories throughput wins and prompt quality is acceptable.
-- [ ] Add real bundle/runtime execution for draft or multi-token Stories decoding with acceptance accounting and benchmark it on the Stories release path.
+- [x] Produce the first stable Stories student artifact with the distillation pipeline and verify short/long prompt quality against the retained exact bundle.
+- [x] Export an exact two-token Stories draft artifact from the stable student and package it through `.esp` draft metadata.
+- [x] Add real bundle/runtime execution for exact two-token Stories decoding with acceptance accounting and benchmark it on the Stories release path.
+- [ ] Retain an exact two-token Stories draft path only if the real Stories release benchmark improves over the retained exact bundle.
 
 ## Baseline
 
@@ -42,10 +45,12 @@
 | Output-head/draft contract slice | `swift test --filter 'ESPBundleTests|ESPRuntimeTests|ESPConvertTests'` + release `espc`/`esprun` rebuild + `esprun`/`espresso-generate` smoke on `/tmp/stories110m-contract-proof.esp` | no bundle contract for factored-head or draft metadata | manifest/runtime/CLI support added; proof bundle packaged and generated successfully | contract-only verification; no throughput claim, retained path unchanged | keep |
 | Factored Stories head `r256` | `python3 scripts/factorize_stories_output_head.py ... --rank 256` then `espresso-generate ... /tmp/stories110m-factored-r256.esp ... Hello` | `/tmp/stories110m-ctx256-v1.esp`: `99.48 tok/s`, `compile_ms=802.03`, exact baseline text | `107.81 tok/s`, `compile_ms=695.04`, `exact_head_backend=ane_factored_classifier` | near-exact label was too optimistic; short and long prompts diverged badly | reject artifact, keep support/tooling |
 | Factored Stories head `r512` | `python3 scripts/factorize_stories_output_head.py ... --rank 512` then `espresso-generate ... /tmp/stories110m-factored-r512.esp ... Hello` | `/tmp/stories110m-ctx256-v1.esp`: `99.48 tok/s`, `compile_ms=802.03`, exact baseline text | `111.11 tok/s`, `compile_ms=819.02`, `exact_head_backend=ane_factored_classifier` | faster, but short and long prompts still diverged materially from the retained exact path | reject artifact, keep support/tooling |
+| Stable student exact-copy artifact | `python3 scripts/distill_stories_native.py --config configs/stories/distill-stable-copy.json` then short/long `espresso-generate --bundle /tmp/stories110m-stable-copy.esp ...` | no stable Stories-native student artifact | `/tmp/stories110m-stable-copy.esp` exported with `initialization_mode=teacher_copy`; short and long prompt continuations matched `/tmp/stories110m-ctx256-v1.esp` exactly | exact stable student proof; not a throughput claim by itself | keep |
+| Exact two-token Stories draft proof | `python3 scripts/package_stories_exact_two_token_draft.py ...` then `espresso-generate ... /tmp/stories110m-exact-two-token-draft.esp ... Hello` | `/tmp/stories110m-ctx256-v1.esp`: `115.86 tok/s`, `compile_ms=1004.71`, `first_token_ms=1.45`, `median_token_ms=8.75`, `p95_token_ms=10.39`, `exact_head_backend=ane_classifier`, `cached_bindings_enabled=true` | `76.16 tok/s`, `compile_ms=0.00`, `first_token_ms=1.15`, `median_token_ms=14.23`, `p95_token_ms=19.66`, `exact_head_backend=cpu_exact_two_token_draft`, `cached_bindings_enabled=false`, `committed_exact_tokens_per_pass=1.9688`, `accepted_future_tokens_per_pass=1.9688` | exact; short and long prompt continuations matched the retained exact bundle, but wall-clock throughput regressed materially | reject artifact, keep support/tooling |
 
 ## Review
 
 - Retained:
-  bundle contract v`1.1.0`, context-target packing, measured bundle token latencies, output-head/draft manifest-runtime contract support, factorized-head runtime/tooling support, and the executed distillation/export proof pipelines for baseline and GQA student artifacts.
+  bundle contract v`1.1.0`, context-target packing, measured bundle token latencies, output-head/draft manifest-runtime contract support, factorized-head runtime/tooling support, the stable teacher-copied Stories student pipeline/artifact, and the executed exact two-token draft bundle/runtime proof path.
 - Remaining:
-  a retained factored-head Stories artifact with real release-benchmark evidence and acceptable prompt quality, a retained draft or multi-token Stories artifact with acceptance accounting and real release-benchmark evidence, and a retained optimized Stories artifact beyond the ctx256 packaging lane.
+  a retained factored-head Stories artifact with real release-benchmark evidence and acceptable prompt quality, a retained exact two-token or multi-token Stories artifact that beats the current release benchmark, and a retained optimized Stories artifact beyond the ctx256 packaging lane.

@@ -105,6 +105,16 @@ class StudentSpec:
 
 
 @dataclass(frozen=True)
+class InitializationSpec:
+    mode: str
+
+    @staticmethod
+    def from_dict(payload: dict[str, Any] | None) -> "InitializationSpec":
+        payload = payload or {}
+        return InitializationSpec(mode=str(payload.get("mode", "random")))
+
+
+@dataclass(frozen=True)
 class TrainSpec:
     texts: list[str]
     sequence_length: int
@@ -168,6 +178,7 @@ class ExportSpec:
 class DistillationConfig:
     teacher: TeacherSpec
     student: StudentSpec
+    initialization: InitializationSpec
     train: TrainSpec
     export: ExportSpec
 
@@ -177,6 +188,7 @@ class DistillationConfig:
         return DistillationConfig(
             teacher=TeacherSpec.from_dict(payload["teacher"]),
             student=StudentSpec.from_dict(payload["student"]),
+            initialization=InitializationSpec.from_dict(payload.get("initialization")),
             train=TrainSpec.from_dict(payload["train"]),
             export=ExportSpec.from_dict(payload["export"]),
         )
@@ -241,6 +253,33 @@ def build_training_examples(texts: list[str], tokenizer, sequence_length: int, m
     if not examples:
         raise ValueError("No usable training examples were produced from the configured texts")
     return examples
+
+
+def initialize_student_from_teacher(
+    student_model: LlamaForCausalLM,
+    teacher_model,
+    initialization: InitializationSpec,
+) -> str:
+    if initialization.mode == "random":
+        return "random"
+    if initialization.mode != "teacher_copy":
+        raise ValueError(f"Unsupported initialization mode: {initialization.mode}")
+
+    teacher_state = teacher_model.state_dict()
+    student_state = student_model.state_dict()
+    copied = 0
+    for name, tensor in student_state.items():
+        teacher_tensor = teacher_state.get(name)
+        if teacher_tensor is None or teacher_tensor.shape != tensor.shape:
+            raise ValueError(
+                f"teacher_copy requires matching tensor for {name}; "
+                f"student shape={tuple(tensor.shape)} teacher shape={None if teacher_tensor is None else tuple(teacher_tensor.shape)}"
+            )
+        tensor.copy_(teacher_tensor.to(device=tensor.device, dtype=tensor.dtype))
+        copied += 1
+    if copied != len(student_state):
+        raise ValueError(f"teacher_copy copied {copied} tensors but student has {len(student_state)} tensors")
+    return "teacher_copy"
 
 
 def export_student_to_espresso(model: LlamaForCausalLM, student: StudentSpec, output_dir: Path) -> Path:
@@ -326,6 +365,11 @@ def run_distillation(config: DistillationConfig, dry_run: bool = False) -> dict[
     teacher_model, tokenizer, teacher_ref = load_teacher(config.teacher)
     teacher_model.eval().to(device)
     student_model = LlamaForCausalLM(config.student.to_llama_config()).to(device)
+    initialization_mode = initialize_student_from_teacher(
+        student_model=student_model,
+        teacher_model=teacher_model,
+        initialization=config.initialization,
+    )
     student_model.train()
 
     examples = build_training_examples(
@@ -384,6 +428,7 @@ def run_distillation(config: DistillationConfig, dry_run: bool = False) -> dict[
         "steps_requested": config.train.steps,
         "steps_completed": total_steps,
         "device": device,
+        "initialization_mode": initialization_mode,
         "behavior_class": config.export.behavior_class,
         "optimization_recipe": config.export.optimization_recipe,
         "bundle_path": config.export.bundle_path,

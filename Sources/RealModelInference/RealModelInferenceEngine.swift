@@ -24,6 +24,8 @@ public struct GenerationResult: Sendable {
     public let firstTokenLatencyMs: Double
     public let exactHeadBackend: String
     public let cachedBindingsEnabled: Bool
+    public let committedExactTokensPerPass: Double?
+    public let acceptedFutureTokensPerPass: Double?
 
     public init(
         text: String,
@@ -34,7 +36,9 @@ public struct GenerationResult: Sendable {
         compileTimeMs: Double,
         firstTokenLatencyMs: Double,
         exactHeadBackend: String = "unknown",
-        cachedBindingsEnabled: Bool = false
+        cachedBindingsEnabled: Bool = false,
+        committedExactTokensPerPass: Double? = nil,
+        acceptedFutureTokensPerPass: Double? = nil
     ) {
         self.text = text
         self.tokens = tokens
@@ -45,6 +49,8 @@ public struct GenerationResult: Sendable {
         self.firstTokenLatencyMs = firstTokenLatencyMs
         self.exactHeadBackend = exactHeadBackend
         self.cachedBindingsEnabled = cachedBindingsEnabled
+        self.committedExactTokensPerPass = committedExactTokensPerPass
+        self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
     }
 }
 
@@ -420,6 +426,336 @@ public struct RealModelInferenceEngine: ~Copyable {
         let lmHead: [Float]
         let lmHeadFP16: [UInt16]?
         let layers: [ExactCPULlamaLayerWeights]
+    }
+
+    private struct ExactTwoTokenDraftDescriptor: Sendable, Decodable {
+        let modelDir: String
+        let tokenizerDir: String?
+        let modelID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case modelDir = "model_dir"
+            case tokenizerDir = "tokenizer_dir"
+            case modelID = "model_id"
+        }
+    }
+
+    private struct ResolvedExactTwoTokenDraft: Sendable {
+        let descriptor: ExactTwoTokenDraftDescriptor
+        let descriptorURL: URL
+        let weightDirURL: URL
+        let config: MultiModelConfig
+    }
+
+    private struct CPUExactLlamaCheckpoint: Sendable {
+        let visibleTokenCount: Int
+        let lastHidden: [Float]
+        let kCaches: [[Float]]
+        let vCaches: [[Float]]
+    }
+
+    private struct CPUExactLlamaRuntime: Sendable {
+        let config: MultiModelConfig
+        let roundIntermediatesToFP16: Bool
+        let tokenEmbedding: [Float]
+        let finalNormGamma: [Float]
+        let lmHead: [Float]
+        let layers: [ExactCPULlamaLayerWeights]
+        let classifierBlockMaxNorms: [Float]
+        var classifierLogitsScratch: [Float]
+        var kCaches: [[Float]]
+        var vCaches: [[Float]]
+        var lastHidden: [Float]
+        var visibleTokenCount: Int
+
+        init(config: MultiModelConfig, weightDirURL: URL) throws {
+            let topLevelPaths = try RealModelInferenceEngine.resolveLlamaTopLevelWeightPaths(
+                config: config,
+                weightDir: weightDirURL.path
+            )
+            self.config = config
+            self.roundIntermediatesToFP16 = RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16()
+            self.tokenEmbedding = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
+                at: topLevelPaths.tokenEmbedding,
+                expectedCount: config.vocab * config.dModel
+            )
+            self.finalNormGamma = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
+                at: topLevelPaths.finalNormGamma,
+                expectedCount: config.dModel
+            )
+            self.lmHead = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
+                at: topLevelPaths.lmHead,
+                expectedCount: config.vocab * config.dModel
+            )
+            self.layers = try (0..<config.nLayer).map { layerIndex in
+                let paths = LayerWeightPaths.forLayer(
+                    layerIndex,
+                    config: config,
+                    blobDir: weightDirURL.path
+                )
+                return try RealModelInferenceEngine.loadExactCPULlamaLayerWeights(
+                    config: config,
+                    paths: paths
+                )
+            }
+            self.classifierBlockMaxNorms = lmHead.withUnsafeBufferPointer { weightBuffer in
+                RealModelInferenceEngine.precomputeClassifierBlockMaxNorms(
+                    classifier: weightBuffer.baseAddress!,
+                    vocabSize: config.vocab,
+                    dim: config.dModel,
+                    blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                )
+            }
+            self.classifierLogitsScratch = [Float](
+                repeating: 0,
+                count: min(RealModelInferenceEngine.classifierArgmaxBlockSize, config.vocab)
+            )
+            self.kCaches = Array(
+                repeating: [Float](repeating: 0, count: config.kvDim * config.maxSeq),
+                count: config.nLayer
+            )
+            self.vCaches = Array(
+                repeating: [Float](repeating: 0, count: config.kvDim * config.maxSeq),
+                count: config.nLayer
+            )
+            self.lastHidden = [Float](repeating: 0, count: config.dModel)
+            self.visibleTokenCount = 0
+        }
+
+        mutating func reset() {
+            for layerIndex in 0..<config.nLayer {
+                kCaches[layerIndex].withUnsafeMutableBufferPointer { pointer in
+                    for index in pointer.indices {
+                        pointer[index] = 0
+                    }
+                }
+                vCaches[layerIndex].withUnsafeMutableBufferPointer { pointer in
+                    for index in pointer.indices {
+                        pointer[index] = 0
+                    }
+                }
+            }
+            lastHidden.withUnsafeMutableBufferPointer { pointer in
+                for index in pointer.indices {
+                    pointer[index] = 0
+                }
+            }
+            visibleTokenCount = 0
+        }
+
+        mutating func prefill(promptTokens: [TokenID]) throws {
+            guard !promptTokens.isEmpty else {
+                throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
+            }
+            reset()
+            for token in promptTokens {
+                try advance(token: token)
+            }
+        }
+
+        mutating func captureCheckpoint() -> CPUExactLlamaCheckpoint {
+            CPUExactLlamaCheckpoint(
+                visibleTokenCount: visibleTokenCount,
+                lastHidden: lastHidden,
+                kCaches: kCaches,
+                vCaches: vCaches
+            )
+        }
+
+        mutating func rollback(to checkpoint: CPUExactLlamaCheckpoint) {
+            visibleTokenCount = checkpoint.visibleTokenCount
+            lastHidden = checkpoint.lastHidden
+            kCaches = checkpoint.kCaches
+            vCaches = checkpoint.vCaches
+        }
+
+        mutating func selectGreedyToken() -> TokenID {
+            let normalized = RealModelInferenceEngine.rmsNorm(
+                lastHidden,
+                weight: finalNormGamma,
+                eps: Float(config.normEps)
+            )
+            return TokenID(exactClassifierArgmax(normalized))
+        }
+
+        mutating func advance(token: TokenID) throws {
+            guard visibleTokenCount < config.maxSeq else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Draft runtime position \(visibleTokenCount) exceeds context \(config.maxSeq)"
+                )
+            }
+            lastHidden = maybeRound(try forwardToken(token, position: visibleTokenCount))
+            visibleTokenCount += 1
+        }
+
+        private func maybeRound(_ values: [Float]) -> [Float] {
+            roundIntermediatesToFP16 ? RealModelInferenceEngine.roundFloat16Vector(values) : values
+        }
+
+        private mutating func forwardToken(_ token: TokenID, position: Int) throws -> [Float] {
+            guard Int(token) >= 0, Int(token) < config.vocab else {
+                throw RealModelInferenceError.runtimeFailure("Draft runtime token \(token) is outside vocab \(config.vocab)")
+            }
+            var hidden = Array(tokenEmbedding[Int(token) * config.dModel..<(Int(token) + 1) * config.dModel])
+            for layerIndex in 0..<config.nLayer {
+                let layer = layers[layerIndex]
+                let attnNormed = RealModelInferenceEngine.rmsNorm(
+                    hidden,
+                    weight: layer.rmsAtt,
+                    eps: Float(config.normEps)
+                )
+                var q = maybeRound(
+                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                        matrix: layer.wq,
+                        rows: config.attentionDim,
+                        cols: config.dModel,
+                        vector: attnNormed
+                    )
+                )
+                var k = maybeRound(
+                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                        matrix: layer.wk,
+                        rows: config.kvDim,
+                        cols: config.dModel,
+                        vector: attnNormed
+                    )
+                )
+                let vRounded = maybeRound(
+                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                        matrix: layer.wv,
+                        rows: config.kvDim,
+                        cols: config.dModel,
+                        vector: attnNormed
+                    )
+                )
+
+                if let qNorm = layer.qNorm {
+                    q.withUnsafeMutableBufferPointer { values in
+                        qNorm.withUnsafeBufferPointer { weights in
+                            RealModelInferenceEngine.applyPerHeadRMSNormInPlace(
+                                values: values,
+                                weights: weights,
+                                headCount: config.nHead,
+                                headDim: config.headDim,
+                                epsilon: Float(config.normEps)
+                            )
+                        }
+                    }
+                }
+                if let kNorm = layer.kNorm {
+                    k.withUnsafeMutableBufferPointer { values in
+                        kNorm.withUnsafeBufferPointer { weights in
+                            RealModelInferenceEngine.applyPerHeadRMSNormInPlace(
+                                values: values,
+                                weights: weights,
+                                headCount: config.nKVHead,
+                                headDim: config.headDim,
+                                epsilon: Float(config.normEps)
+                            )
+                        }
+                    }
+                }
+
+                q = maybeRound(
+                    RealModelInferenceEngine.applyHalfSplitRoPEPerHead(
+                        q,
+                        heads: config.nHead,
+                        headDim: config.headDim,
+                        position: position,
+                        theta: config.ropeTheta
+                    )
+                )
+                k = maybeRound(
+                    RealModelInferenceEngine.applyHalfSplitRoPEPerHead(
+                        k,
+                        heads: config.nKVHead,
+                        headDim: config.headDim,
+                        position: position,
+                        theta: config.ropeTheta
+                    )
+                )
+
+                for channel in 0..<config.kvDim {
+                    kCaches[layerIndex][channel * config.maxSeq + position] = k[channel]
+                    vCaches[layerIndex][channel * config.maxSeq + position] = vRounded[channel]
+                }
+
+                let context = RealModelInferenceEngine.decodeContextFromCaches(
+                    qOut: q,
+                    kCache: kCaches[layerIndex],
+                    vCache: vCaches[layerIndex],
+                    heads: config.nHead,
+                    kvHeads: config.nKVHead,
+                    headDim: config.headDim,
+                    visibleTokenCount: position + 1,
+                    cacheStride: config.maxSeq
+                )
+
+                let projected = maybeRound(
+                    zip(
+                        hidden,
+                        RealModelInferenceEngine.multiplyRowMajorMatrix(
+                            matrix: layer.wo,
+                            rows: config.dModel,
+                            cols: config.attentionDim,
+                            vector: context
+                        )
+                    ).map(+)
+                )
+                let ffnNormed = RealModelInferenceEngine.rmsNorm(
+                    projected,
+                    weight: layer.rmsFfn,
+                    eps: Float(config.normEps)
+                )
+                let gate = RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: layer.w1,
+                    rows: config.hiddenDim,
+                    cols: config.dModel,
+                    vector: ffnNormed
+                )
+                let up = RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: layer.w3,
+                    rows: config.hiddenDim,
+                    cols: config.dModel,
+                    vector: ffnNormed
+                )
+                let activated = zip(gate, up).map { RealModelInferenceEngine.silu($0) * $1 }
+                let down = RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: layer.w2,
+                    rows: config.dModel,
+                    cols: config.hiddenDim,
+                    vector: activated
+                )
+                hidden = maybeRound(zip(projected, down).map(+))
+            }
+            return hidden
+        }
+
+        private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
+            hidden.withUnsafeBufferPointer { hiddenBuffer in
+                lmHead.withUnsafeBufferPointer { weightBuffer in
+                    classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                        classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                            guard let hiddenBase = hiddenBuffer.baseAddress,
+                                  let weightBase = weightBuffer.baseAddress,
+                                  let normsBase = normsBuffer.baseAddress,
+                                  let scratchBase = scratchBuffer.baseAddress else {
+                                return 0
+                            }
+                            return RealModelInferenceEngine.partitionedArgmax(
+                                classifier: weightBase,
+                                input: hiddenBase,
+                                logitsScratch: scratchBase,
+                                blockMaxNorms: normsBase,
+                                vocabSize: config.vocab,
+                                dim: config.dModel,
+                                blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                            )
+                        }
+                    }
+                }
+            }
+        }
     }
 
     private enum LoadedTokenizer {
@@ -999,11 +1335,26 @@ public struct RealModelInferenceEngine: ~Copyable {
             channels: config.dModel,
             maxSeq: config.maxSeq
         )
+        let environment = ProcessInfo.processInfo.environment
 
         if config.architecture == .llama {
+            if temperature == 0,
+               let draft = try Self.resolveExactTwoTokenDraft(
+                   config: config,
+                   weightDirURL: weightDirURL,
+                   environment: environment
+               ) {
+                return try generateIncrementalExactTwoTokenDraftLlama(
+                    promptTokens: promptTokens,
+                    effectiveMaxTokens: effectiveMaxTokens,
+                    compileTimeMs: 0,
+                    draft: draft,
+                    onStep: onStep
+                )
+            }
             switch Self.llamaGenerationPath(
                 config: config,
-                environment: ProcessInfo.processInfo.environment
+                environment: environment
             ) {
             case .exactCPU:
                 return try generateIncrementalExactCPULlama(
@@ -4680,6 +5031,149 @@ public struct RealModelInferenceEngine: ~Copyable {
         return (order, evictedKey)
     }
 
+    private static func loadConfigFromMetadataFile(at metadataURL: URL) throws -> MultiModelConfig {
+        let data: Data
+        do {
+            data = try Data(contentsOf: metadataURL)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to read metadata.json: \(error)")
+        }
+
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("metadata.json is not valid JSON: \(error)")
+        }
+
+        guard let metadata = object as? [String: Any] else {
+            throw RealModelInferenceError.runtimeFailure("metadata.json must be a JSON object")
+        }
+
+        func requiredInt(_ key: String) throws -> Int {
+            guard let number = metadata[key] as? NSNumber else {
+                throw RealModelInferenceError.runtimeFailure("metadata.json missing numeric field \(key)")
+            }
+            return number.intValue
+        }
+
+        func requiredDouble(_ key: String) throws -> Double {
+            guard let number = metadata[key] as? NSNumber else {
+                throw RealModelInferenceError.runtimeFailure("metadata.json missing numeric field \(key)")
+            }
+            return number.doubleValue
+        }
+
+        guard let name = metadata["name"] as? String, !name.isEmpty else {
+            throw RealModelInferenceError.runtimeFailure("metadata.json missing string field name")
+        }
+        let architecture: MultiModelConfig.Architecture
+        switch (metadata["architecture"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "gpt2":
+            architecture = .gpt2
+        case "llama":
+            architecture = .llama
+        default:
+            throw RealModelInferenceError.runtimeFailure("metadata.json missing supported architecture")
+        }
+
+        return MultiModelConfig(
+            name: name,
+            nLayer: try requiredInt("nLayer"),
+            nHead: try requiredInt("nHead"),
+            nKVHead: try requiredInt("nKVHead"),
+            dModel: try requiredInt("dModel"),
+            headDim: try requiredInt("headDim"),
+            hiddenDim: try requiredInt("hiddenDim"),
+            vocab: try requiredInt("vocab"),
+            maxSeq: try requiredInt("maxSeq"),
+            normEps: Float(try requiredDouble("normEps")),
+            ropeTheta: Float((metadata["ropeTheta"] as? NSNumber)?.doubleValue ?? 10_000),
+            eosToken: (metadata["eosToken"] as? NSNumber)?.uint32Value,
+            architecture: architecture
+        )
+    }
+
+    private static func resolveExactTwoTokenDraft(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        environment: [String: String]
+    ) throws -> ResolvedExactTwoTokenDraft? {
+        guard environment["ESPRESSO_BUNDLE_DRAFT_KIND"] == "exact_two_token" else {
+            return nil
+        }
+        if let rawHorizon = environment["ESPRESSO_BUNDLE_DRAFT_HORIZON"],
+           Int(rawHorizon) != 2 {
+            throw RealModelInferenceError.runtimeFailure(
+                "exact two-token draft requires horizon == 2, got \(rawHorizon)"
+            )
+        }
+        guard let artifactRef = environment["ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF"],
+              !artifactRef.isEmpty else {
+            throw RealModelInferenceError.runtimeFailure("exact two-token draft requires ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF")
+        }
+
+        let bundleRootURL = weightDirURL.deletingLastPathComponent()
+        let descriptorURL = bundleRootURL.appendingPathComponent(artifactRef).standardizedFileURL
+        let bundleRootPath = bundleRootURL.path
+        guard descriptorURL.path == bundleRootPath || descriptorURL.path.hasPrefix(bundleRootPath + "/") else {
+            throw RealModelInferenceError.runtimeFailure("Draft artifact ref escapes bundle root: \(artifactRef)")
+        }
+        guard FileManager.default.fileExists(atPath: descriptorURL.path) else {
+            throw RealModelInferenceError.runtimeFailure("Draft artifact file is missing: \(descriptorURL.path)")
+        }
+
+        let descriptorData = try Data(contentsOf: descriptorURL)
+        let descriptor: ExactTwoTokenDraftDescriptor
+        do {
+            descriptor = try JSONDecoder().decode(ExactTwoTokenDraftDescriptor.self, from: descriptorData)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to decode draft descriptor \(descriptorURL.path): \(error)")
+        }
+        guard !descriptor.modelDir.isEmpty else {
+            throw RealModelInferenceError.runtimeFailure("Draft descriptor is missing model_dir")
+        }
+
+        let draftWeightDirURL = weightDirURL.appendingPathComponent(
+            descriptor.modelDir,
+            isDirectory: true
+        ).standardizedFileURL
+        let weightRootPath = weightDirURL.path
+        guard draftWeightDirURL.path == weightRootPath || draftWeightDirURL.path.hasPrefix(weightRootPath + "/") else {
+            throw RealModelInferenceError.runtimeFailure("Draft model_dir escapes weights root: \(descriptor.modelDir)")
+        }
+        try validateDirectory(draftWeightDirURL)
+        let draftConfig = try loadConfigFromMetadataFile(
+            at: draftWeightDirURL.appendingPathComponent("metadata.json")
+        )
+        guard draftConfig.architecture == .llama else {
+            throw RealModelInferenceError.runtimeFailure("exact two-token draft currently supports llama draft models only")
+        }
+        guard draftConfig.vocab == config.vocab else {
+            throw RealModelInferenceError.runtimeFailure(
+                "draft/full vocab mismatch: draft=\(draftConfig.vocab) full=\(config.vocab)"
+            )
+        }
+        return ResolvedExactTwoTokenDraft(
+            descriptor: descriptor,
+            descriptorURL: descriptorURL,
+            weightDirURL: draftWeightDirURL,
+            config: draftConfig
+        )
+    }
+
+    static func resolveExactTwoTokenDraftWeightDirForTesting(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        environment: [String: String]
+    ) throws -> String? {
+        try resolveExactTwoTokenDraft(
+            config: config,
+            weightDirURL: weightDirURL,
+            environment: environment
+        )?.weightDirURL.path
+    }
+
     private func encodePrompt(_ prompt: String) throws -> [TokenID] {
         let rawTokens = tokenizer.encode(prompt)
         guard !rawTokens.isEmpty else {
@@ -5289,6 +5783,184 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
         cachedExactCPULlamaWeights = loadedWeights
         return loadedWeights
+    }
+
+    private mutating func generateIncrementalExactTwoTokenDraftLlama(
+        promptTokens: [TokenID],
+        effectiveMaxTokens: Int,
+        compileTimeMs: Double,
+        draft: ResolvedExactTwoTokenDraft,
+        onStep: ((GenerationStep) -> Void)?
+    ) throws -> GenerationResult {
+        guard !promptTokens.isEmpty else {
+            throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
+        }
+        var fullRuntime = try CPUExactLlamaRuntime(config: config, weightDirURL: weightDirURL)
+        var draftRuntime = try CPUExactLlamaRuntime(config: draft.config, weightDirURL: draft.weightDirURL)
+
+        try fullRuntime.prefill(promptTokens: promptTokens)
+        try draftRuntime.prefill(promptTokens: promptTokens)
+
+        var allTokens = promptTokens
+        var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
+        generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
+
+        let generationStart = DispatchTime.now().uptimeNanoseconds
+        var emissionStart = generationStart
+        var firstTokenLatencyMs = 0.0
+        var firstTokenRecorded = false
+        var committedExactTokensTotal = 0
+        var acceptedFutureTokensTotal = 0
+        var speculativePassCount = 0
+
+        func emit(_ token: TokenID, at emissionNow: UInt64) {
+            generatedTokens.append(token)
+            allTokens.append(token)
+            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
+            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+            tokenLatenciesMs.append(tokenLatencyMs)
+            if !firstTokenRecorded {
+                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
+                firstTokenRecorded = true
+            }
+            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
+            onStep?(
+                GenerationStep(
+                    token: token,
+                    generatedTokens: generatedTokens,
+                    text: tokenizer.decode(allTokens.map(Int.init)),
+                    tokenLatencyMs: tokenLatencyMs,
+                    elapsedMs: elapsedMs,
+                    firstTokenLatencyMs: firstTokenLatencyMs,
+                    tokensPerSecond: tokensPerSecond
+                )
+            )
+            emissionStart = emissionNow
+        }
+
+        let firstToken = fullRuntime.selectGreedyToken()
+        if let eosToken = config.eosToken, firstToken == eosToken {
+            generatedTokens.append(firstToken)
+            return GenerationResult(
+                text: tokenizer.decode((promptTokens + generatedTokens).map(Int.init)),
+                tokens: generatedTokens,
+                promptTokens: promptTokens,
+                tokenLatenciesMs: tokenLatenciesMs,
+                tokensPerSecond: 0,
+                compileTimeMs: compileTimeMs,
+                firstTokenLatencyMs: 0,
+                exactHeadBackend: "cpu_exact_two_token_draft",
+                cachedBindingsEnabled: false,
+                committedExactTokensPerPass: nil,
+                acceptedFutureTokensPerPass: nil
+            )
+        }
+        let firstEmission = DispatchTime.now().uptimeNanoseconds
+        emit(firstToken, at: firstEmission)
+        if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            let totalMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
+            let tps = generatedTokens.isEmpty ? 0 : Double(generatedTokens.count) / max(totalMs / 1_000, 1e-9)
+            return GenerationResult(
+                text: tokenizer.decode(allTokens.map(Int.init)),
+                tokens: generatedTokens,
+                promptTokens: promptTokens,
+                tokenLatenciesMs: tokenLatenciesMs,
+                tokensPerSecond: tps,
+                compileTimeMs: compileTimeMs,
+                firstTokenLatencyMs: firstTokenLatencyMs,
+                exactHeadBackend: "cpu_exact_two_token_draft",
+                cachedBindingsEnabled: false,
+                committedExactTokensPerPass: nil,
+                acceptedFutureTokensPerPass: nil
+            )
+        }
+
+        try fullRuntime.advance(token: firstToken)
+        try draftRuntime.advance(token: firstToken)
+
+        while generatedTokens.count < effectiveMaxTokens, allTokens.count < config.maxSeq {
+            speculativePassCount += 1
+            let remainingTokenBudget = min(effectiveMaxTokens - generatedTokens.count, config.maxSeq - allTokens.count)
+            let draftCheckpoint = draftRuntime.captureCheckpoint()
+            let proposedToken0 = draftRuntime.selectGreedyToken()
+            try draftRuntime.advance(token: proposedToken0)
+
+            let exactToken0 = fullRuntime.selectGreedyToken()
+            var acceptedInPass = 0
+            var committedInPass = 0
+
+            if exactToken0 == proposedToken0 {
+                acceptedInPass += 1
+            } else {
+                draftRuntime.rollback(to: draftCheckpoint)
+            }
+
+            let firstRoundEmission = DispatchTime.now().uptimeNanoseconds
+            emit(exactToken0, at: firstRoundEmission)
+            committedInPass += 1
+            if let eosToken = config.eosToken, exactToken0 == eosToken {
+                committedExactTokensTotal += committedInPass
+                acceptedFutureTokensTotal += acceptedInPass
+                break
+            }
+            try fullRuntime.advance(token: exactToken0)
+            if exactToken0 != proposedToken0 {
+                try draftRuntime.advance(token: exactToken0)
+            }
+
+            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq || remainingTokenBudget <= 1 {
+                committedExactTokensTotal += committedInPass
+                acceptedFutureTokensTotal += acceptedInPass
+                continue
+            }
+
+            let proposedToken1 = draftRuntime.selectGreedyToken()
+            let exactToken1 = fullRuntime.selectGreedyToken()
+            if exactToken1 == proposedToken1 {
+                acceptedInPass += 1
+            }
+            let secondRoundEmission = DispatchTime.now().uptimeNanoseconds
+            emit(exactToken1, at: secondRoundEmission)
+            committedInPass += 1
+            if let eosToken = config.eosToken, exactToken1 == eosToken {
+                committedExactTokensTotal += committedInPass
+                acceptedFutureTokensTotal += acceptedInPass
+                break
+            }
+            try fullRuntime.advance(token: exactToken1)
+            try draftRuntime.advance(token: exactToken1)
+
+            committedExactTokensTotal += committedInPass
+            acceptedFutureTokensTotal += acceptedInPass
+        }
+
+        let generationEnd = DispatchTime.now().uptimeNanoseconds
+        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
+        let tokensPerSecond = generatedTokens.isEmpty
+            ? 0
+            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
+        let committedExactTokensPerPass = speculativePassCount == 0
+            ? nil
+            : Double(committedExactTokensTotal) / Double(speculativePassCount)
+        let acceptedFutureTokensPerPass = speculativePassCount == 0
+            ? nil
+            : Double(acceptedFutureTokensTotal) / Double(speculativePassCount)
+
+        return GenerationResult(
+            text: tokenizer.decode(allTokens.map(Int.init)),
+            tokens: generatedTokens,
+            promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
+            tokensPerSecond: tokensPerSecond,
+            compileTimeMs: compileTimeMs,
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: "cpu_exact_two_token_draft",
+            cachedBindingsEnabled: false,
+            committedExactTokensPerPass: committedExactTokensPerPass,
+            acceptedFutureTokensPerPass: acceptedFutureTokensPerPass
+        )
     }
 
     private mutating func generateIncrementalExactCPULlama(

@@ -141,6 +141,66 @@ import Testing
     #expect(debugPromptTokens(env: [:], defaultTokens: [9707, 21806]) == [9707, 21806])
 }
 
+@Test func test_resolveExactTwoTokenDraftWeightDirForTestingLoadsBundleRelativeDraftDescriptor() throws {
+    let bundleRoot = try makeTempDirectory()
+    defer { try? FileManager.default.removeItem(at: bundleRoot) }
+
+    let weightDir = bundleRoot.appendingPathComponent("weights", isDirectory: true)
+    let draftDir = weightDir.appendingPathComponent("draft/student", isDirectory: true)
+    try FileManager.default.createDirectory(at: draftDir, withIntermediateDirectories: true)
+
+    let config = MultiModelConfig(
+        name: "stories110m",
+        nLayer: 12,
+        nHead: 12,
+        nKVHead: 12,
+        dModel: 768,
+        headDim: 64,
+        hiddenDim: 2048,
+        vocab: 32_000,
+        maxSeq: 256,
+        normEps: 1e-5,
+        architecture: .llama
+    )
+    let draftMetadata: [String: Any] = [
+        "name": "stories110m-stable-copy",
+        "nLayer": 12,
+        "nHead": 12,
+        "nKVHead": 12,
+        "dModel": 768,
+        "headDim": 64,
+        "hiddenDim": 2048,
+        "vocab": 32_000,
+        "maxSeq": 256,
+        "normEps": 1e-5,
+        "ropeTheta": 10_000.0,
+        "architecture": "llama",
+    ]
+    let draftMetadataData = try JSONSerialization.data(withJSONObject: draftMetadata, options: [.sortedKeys])
+    try draftMetadataData.write(to: draftDir.appendingPathComponent("metadata.json"))
+
+    let descriptor: [String: Any] = [
+        "model_dir": "draft/student",
+        "tokenizer_dir": "tokenizer",
+        "model_id": "stories110m-stable-copy",
+    ]
+    let descriptorData = try JSONSerialization.data(withJSONObject: descriptor, options: [.sortedKeys])
+    let descriptorURL = weightDir.appendingPathComponent("draft/exact-two-token.json")
+    try FileManager.default.createDirectory(at: descriptorURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+    try descriptorData.write(to: descriptorURL)
+
+    let resolved = try RealModelInferenceEngine.resolveExactTwoTokenDraftWeightDirForTesting(
+        config: config,
+        weightDirURL: weightDir,
+        environment: [
+            "ESPRESSO_BUNDLE_DRAFT_KIND": "exact_two_token",
+            "ESPRESSO_BUNDLE_DRAFT_HORIZON": "2",
+            "ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF": "weights/draft/exact-two-token.json",
+        ]
+    )
+    #expect(resolved == draftDir.path)
+}
+
 private func shouldRunLegacyQwenExperimentTests(
     env: [String: String] = ProcessInfo.processInfo.environment
 ) -> Bool {

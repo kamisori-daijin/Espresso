@@ -51,6 +51,9 @@ class DistillStoriesNativeTests(unittest.TestCase):
                             "optimization_recipe": "stories-gqa4-proof",
                             "quality_gate": "proof-only",
                         },
+                        "initialization": {
+                            "mode": "teacher_copy",
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -62,6 +65,7 @@ class DistillStoriesNativeTests(unittest.TestCase):
         self.assertEqual(config.student.to_llama_config().num_key_value_heads, 2)
         self.assertEqual(config.export.context_target_tokens, 256)
         self.assertEqual(config.export.optimization_recipe, "stories-gqa4-proof")
+        self.assertEqual(config.initialization.mode, "teacher_copy")
 
     def test_build_training_examples_uses_text_inputs(self) -> None:
         class Tokenizer:

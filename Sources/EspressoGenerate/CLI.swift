@@ -426,6 +426,8 @@ struct BackendRunMetrics: Sendable {
     let compileBreakdown: [String: ANECompileLabelStatsSnapshot]?
     let exactHeadBackend: String?
     let cachedBindingsEnabled: Bool?
+    let committedExactTokensPerPass: Double?
+    let acceptedFutureTokensPerPass: Double?
 
     init(
         backend: String,
@@ -443,7 +445,9 @@ struct BackendRunMetrics: Sendable {
         compileFailureCount: Int = 0,
         compileBreakdown: [String: ANECompileLabelStatsSnapshot]? = nil,
         exactHeadBackend: String? = nil,
-        cachedBindingsEnabled: Bool? = nil
+        cachedBindingsEnabled: Bool? = nil,
+        committedExactTokensPerPass: Double? = nil,
+        acceptedFutureTokensPerPass: Double? = nil
     ) {
         self.backend = backend
         self.text = text
@@ -461,6 +465,8 @@ struct BackendRunMetrics: Sendable {
         self.compileBreakdown = compileBreakdown
         self.exactHeadBackend = exactHeadBackend
         self.cachedBindingsEnabled = cachedBindingsEnabled
+        self.committedExactTokensPerPass = committedExactTokensPerPass
+        self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
     }
 }
 
@@ -1085,7 +1091,9 @@ private func makeBundleRuntimeMetrics(bundle: ESPRuntimeBundle, invocation: Reso
         compileFailureCount: compileStatsDelta.failureCount,
         compileBreakdown: compileStatsDelta.labelStats.isEmpty ? nil : compileStatsDelta.labelStats,
         exactHeadBackend: result.exactHeadBackend,
-        cachedBindingsEnabled: result.cachedBindingsEnabled
+        cachedBindingsEnabled: result.cachedBindingsEnabled,
+        committedExactTokensPerPass: result.committedExactTokensPerPass,
+        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass
     )
 }
 
@@ -1160,7 +1168,9 @@ private func runEspressoGeneration(
         compileFailureCount: compileStatsDelta.failureCount,
         compileBreakdown: compileStatsDelta.labelStats.isEmpty ? nil : compileStatsDelta.labelStats,
         exactHeadBackend: result.exactHeadBackend,
-        cachedBindingsEnabled: result.cachedBindingsEnabled
+        cachedBindingsEnabled: result.cachedBindingsEnabled,
+        committedExactTokensPerPass: result.committedExactTokensPerPass,
+        acceptedFutureTokensPerPass: result.acceptedFutureTokensPerPass
     )
 }
 
@@ -1185,6 +1195,8 @@ func aggregateBenchmarkRuns(
     var compileBreakdown: [String: ANECompileLabelStatsSnapshot]?
     var exactHeadBackend: String?
     var cachedBindingsEnabled: Bool?
+    var committedExactTokensPerPass: Double?
+    var acceptedFutureTokensPerPass: Double?
 
     for iteration in 0..<totalIterations {
         let metrics = try run()
@@ -1196,6 +1208,8 @@ func aggregateBenchmarkRuns(
         }
         exactHeadBackend = exactHeadBackend ?? metrics.exactHeadBackend
         cachedBindingsEnabled = cachedBindingsEnabled ?? metrics.cachedBindingsEnabled
+        committedExactTokensPerPass = committedExactTokensPerPass ?? metrics.committedExactTokensPerPass
+        acceptedFutureTokensPerPass = acceptedFutureTokensPerPass ?? metrics.acceptedFutureTokensPerPass
         if iteration >= warmup {
             lastMeasured = metrics
             aggregatedLatencySamples.append(contentsOf: metrics.tokenLatenciesMs)
@@ -1222,7 +1236,9 @@ func aggregateBenchmarkRuns(
         compileFailureCount: compileFailureCount != 0 ? compileFailureCount : lastMeasured.compileFailureCount,
         compileBreakdown: compileBreakdown ?? lastMeasured.compileBreakdown,
         exactHeadBackend: exactHeadBackend ?? lastMeasured.exactHeadBackend,
-        cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled
+        cachedBindingsEnabled: cachedBindingsEnabled ?? lastMeasured.cachedBindingsEnabled,
+        committedExactTokensPerPass: committedExactTokensPerPass ?? lastMeasured.committedExactTokensPerPass,
+        acceptedFutureTokensPerPass: acceptedFutureTokensPerPass ?? lastMeasured.acceptedFutureTokensPerPass
     )
 }
 
@@ -1394,6 +1410,24 @@ private func printGenerateStats(_ invocation: ResolvedInvocation, result: Backen
     }
     if let cachedBindingsEnabled = result.cachedBindingsEnabled {
         stderrLine("cached_bindings_enabled=\(cachedBindingsEnabled)")
+    }
+    if let committedExactTokensPerPass = result.committedExactTokensPerPass {
+        stderrLine(
+            String(
+                format: "committed_exact_tokens_per_pass=%.4f",
+                locale: posixLocale,
+                committedExactTokensPerPass
+            )
+        )
+    }
+    if let acceptedFutureTokensPerPass = result.acceptedFutureTokensPerPass {
+        stderrLine(
+            String(
+                format: "accepted_future_tokens_per_pass=%.4f",
+                locale: posixLocale,
+                acceptedFutureTokensPerPass
+            )
+        )
     }
     if let compileBreakdown = result.compileBreakdown, !compileBreakdown.isEmpty {
         stderrLine("compile_breakdown=\(formatCompileBreakdown(compileBreakdown))")
