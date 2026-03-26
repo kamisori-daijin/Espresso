@@ -160,5 +160,7 @@ def load_espresso_llama_for_causal_lm(weights_dir: Path, torch_dtype=None):
         raise ValueError(f"Missing Llama tensors for Espresso weights: {missing}")
     if unexpected:
         raise ValueError(f"Unexpected Espresso tensors for Llama model: {unexpected}")
+    if torch_dtype is not None:
+        model = model.to(dtype=torch_dtype)
     model.eval()
     return metadata, model

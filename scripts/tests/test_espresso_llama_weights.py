@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import numpy as np
+import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -121,6 +122,19 @@ class EspressoLlamaWeightsTests(unittest.TestCase):
         self.assertEqual(kwargs["rope_theta"], 500_000.0)
         self.assertEqual(kwargs["eos_token_id"], 7)
         self.assertFalse(kwargs["tie_word_embeddings"])
+
+    def test_load_espresso_llama_for_causal_lm_applies_requested_torch_dtype(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            weights_dir = Path(directory)
+            write_fixture(weights_dir)
+
+            _, model = script.load_espresso_llama_for_causal_lm(
+                weights_dir,
+                torch_dtype=torch.float16,
+            )
+
+        self.assertEqual(model.model.embed_tokens.weight.dtype, torch.float16)
+        self.assertEqual(model.lm_head.weight.dtype, torch.float16)
 
 
 if __name__ == "__main__":
