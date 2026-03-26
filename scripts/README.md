@@ -14,18 +14,10 @@ Tracked scripts are intentionally limited to:
 - `run_anemll_coreml_benchmark.py`
 - `stories_model_identity.py`
 - `benchmark-prompts.txt`
-- `setup_autoresearch_lane.sh`
 
 For one-off or personal helper scripts, use `scripts/internal/` locally. That area is ignored by git and does not appear on GitHub.
 
-## Autoresearch
-
-Use `setup_autoresearch_lane.sh` to initialize a worktree-local `.autoresearch/` sandbox and ignored `autoresearch-results.tsv` for a lane such as:
-
-- `benchmark-referee`
-- `incremental-decode`
-- `head-path`
-- `bucket-io`
+## Benchmark Automation
 
 Use `run_autoresearch_compare.sh` as the source-of-truth real-model throughput benchmark wrapper for autoresearch lanes. It drives `./espresso bench`, exports the compare report, and appends a results row when `--results-tsv` is passed or when `autoresearch-results.tsv` is present in the current directory. Supports `--prompt-id` to tag runs by prompt.
 
@@ -36,8 +28,3 @@ Use `judge_suite_results.sh` to evaluate a single suite summary or compare basel
 Use `run_anemll_coreml_benchmark.py` to measure fixed-token generation against the public exact-base `anemll` Core ML Llama 3.2 1B packages. It is intended for publishable Espresso-vs-Core ML comparisons when the Core ML baseline is split across embeddings, FFN/prefill, and lm-head compiled models instead of a single `.mlpackage`.
 
 `benchmark-prompts.txt` defines the fixed prompt suite (short/medium/long) used by the suite runner.
-
-The lane scaffold also creates:
-
-- `.autoresearch/env.sh` to pin the compare contract for that worktree
-- `.autoresearch/bench.sh` to run the official throughput wrapper with the lane-local contract

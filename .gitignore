@@ -60,8 +60,6 @@ QWEN_ANE_SERVING_AGENT_EXECUTION_SPEC.md
 docs/
 !docs/
 docs/*
-!docs/autoresearch/
-!docs/autoresearch/**
 !docs/benchmarks.md
 !docs/index.html
 !docs/blog.html
@@ -69,8 +67,6 @@ docs/*
 !docs/gpt2-926-tokens-per-second.html
 !docs/reverse-engineering-apple-neural-engine.html
 prompts/
-!docs/autoresearch/prompts/
-!docs/autoresearch/prompts/**
 scripts/
 !scripts/
 scripts/*
@@ -84,7 +80,6 @@ scripts/internal/**
 !scripts/run_autoresearch_suite.sh
 !scripts/judge_suite_results.sh
 !scripts/benchmark-prompts.txt
-!scripts/setup_autoresearch_lane.sh
 !scripts/generate-benchmark-dashboard.sh
 !scripts/stories_model_identity.py
 !scripts/espresso_llama_weights.py
@@ -101,6 +96,11 @@ CLAUDE.md
 # Internal development directories
 archive/
 autoresearch-master/
+agents/
+marketing/
+phase3b-corrected
+CLAUDE_QWEN_ANE_RUNTIME_EXECUTION_PROMPT.md
+QWEN_ANE_SERVING_AGENT_EXECUTION_SPEC.md
 results/
 training/
 
