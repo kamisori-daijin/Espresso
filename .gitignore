@@ -48,6 +48,14 @@ Sources/EspressoBenchApp/
 Tests/EspressoBenchAppTests/
 scripts/package_espresso_bench_app.sh
 
+# Internal planning / go-to-market artifacts stay local
+agents/
+marketing/
+tasks/
+phase3*-corrected
+CLAUDE_QWEN_ANE_RUNTIME_EXECUTION_PROMPT.md
+QWEN_ANE_SERVING_AGENT_EXECUTION_SPEC.md
+
 # Development / internal documentation
 docs/
 !docs/
