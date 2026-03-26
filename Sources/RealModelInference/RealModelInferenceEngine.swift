@@ -18,30 +18,39 @@ public struct GenerationResult: Sendable {
     public let text: String
     public let tokens: [TokenID]
     public let promptTokens: [TokenID]
+    public let tokenLatenciesMs: [Double]
     public let tokensPerSecond: Double
     public let compileTimeMs: Double
     public let firstTokenLatencyMs: Double
     public let exactHeadBackend: String
     public let cachedBindingsEnabled: Bool
+    public let committedExactTokensPerPass: Double?
+    public let acceptedFutureTokensPerPass: Double?
 
     public init(
         text: String,
         tokens: [TokenID],
         promptTokens: [TokenID],
+        tokenLatenciesMs: [Double] = [],
         tokensPerSecond: Double,
         compileTimeMs: Double,
         firstTokenLatencyMs: Double,
         exactHeadBackend: String = "unknown",
-        cachedBindingsEnabled: Bool = false
+        cachedBindingsEnabled: Bool = false,
+        committedExactTokensPerPass: Double? = nil,
+        acceptedFutureTokensPerPass: Double? = nil
     ) {
         self.text = text
         self.tokens = tokens
         self.promptTokens = promptTokens
+        self.tokenLatenciesMs = tokenLatenciesMs
         self.tokensPerSecond = tokensPerSecond
         self.compileTimeMs = compileTimeMs
         self.firstTokenLatencyMs = firstTokenLatencyMs
         self.exactHeadBackend = exactHeadBackend
         self.cachedBindingsEnabled = cachedBindingsEnabled
+        self.committedExactTokensPerPass = committedExactTokensPerPass
+        self.acceptedFutureTokensPerPass = acceptedFutureTokensPerPass
     }
 }
 
@@ -141,9 +150,6 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         if environment["ESPRESSO_ENABLE_HYBRID_DONOR_DELTA"] == "1" {
             return true
-        }
-        if config.architecture == .llama, config.name == "stories110m" {
-            return false
         }
         return true
     }
@@ -293,11 +299,19 @@ public struct RealModelInferenceEngine: ~Copyable {
     }
 
     private struct LlamaTopLevelAssets {
+        struct FactoredOutputHead: Sendable, Equatable {
+            let projection: [Float]
+            let expansion: [Float]
+            let bottleneck: Int
+            let groups: Int
+        }
+
         let tokenEmbedding: [Float]
         let finalNormGamma: [Float]
         let lmHead: [Float]
         let lmHeadFP16: [UInt16]?
         let lmHeadHasExactFloat32Sidecar: Bool
+        let factoredOutputHead: FactoredOutputHead?
         let finalNormGammaPath: String
         let finalNormGammaCompilePath: String
         let finalNormGammaData: Data
@@ -411,6 +425,336 @@ public struct RealModelInferenceEngine: ~Copyable {
         let layers: [ExactCPULlamaLayerWeights]
     }
 
+    private struct ExactTwoTokenDraftDescriptor: Sendable, Decodable {
+        let modelDir: String
+        let tokenizerDir: String?
+        let modelID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case modelDir = "model_dir"
+            case tokenizerDir = "tokenizer_dir"
+            case modelID = "model_id"
+        }
+    }
+
+    private struct ResolvedExactTwoTokenDraft: Sendable {
+        let descriptor: ExactTwoTokenDraftDescriptor
+        let descriptorURL: URL
+        let weightDirURL: URL
+        let config: MultiModelConfig
+    }
+
+    private struct CPUExactLlamaCheckpoint: Sendable {
+        let visibleTokenCount: Int
+        let lastHidden: [Float]
+        let kCaches: [[Float]]
+        let vCaches: [[Float]]
+    }
+
+    private struct CPUExactLlamaRuntime: Sendable {
+        let config: MultiModelConfig
+        let roundIntermediatesToFP16: Bool
+        let tokenEmbedding: [Float]
+        let finalNormGamma: [Float]
+        let lmHead: [Float]
+        let layers: [ExactCPULlamaLayerWeights]
+        let classifierBlockMaxNorms: [Float]
+        var classifierLogitsScratch: [Float]
+        var kCaches: [[Float]]
+        var vCaches: [[Float]]
+        var lastHidden: [Float]
+        var visibleTokenCount: Int
+
+        init(config: MultiModelConfig, weightDirURL: URL) throws {
+            let topLevelPaths = try RealModelInferenceEngine.resolveLlamaTopLevelWeightPaths(
+                config: config,
+                weightDir: weightDirURL.path
+            )
+            self.config = config
+            self.roundIntermediatesToFP16 = RealModelInferenceEngine.shouldRoundCPUExactDecodeIntermediatesToFP16()
+            self.tokenEmbedding = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
+                at: topLevelPaths.tokenEmbedding,
+                expectedCount: config.vocab * config.dModel
+            )
+            self.finalNormGamma = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
+                at: topLevelPaths.finalNormGamma,
+                expectedCount: config.dModel
+            )
+            self.lmHead = try RealModelInferenceEngine.loadWeightTablePreferringFloat32Sidecar(
+                at: topLevelPaths.lmHead,
+                expectedCount: config.vocab * config.dModel
+            )
+            self.layers = try (0..<config.nLayer).map { layerIndex in
+                let paths = LayerWeightPaths.forLayer(
+                    layerIndex,
+                    config: config,
+                    blobDir: weightDirURL.path
+                )
+                return try RealModelInferenceEngine.loadExactCPULlamaLayerWeights(
+                    config: config,
+                    paths: paths
+                )
+            }
+            self.classifierBlockMaxNorms = lmHead.withUnsafeBufferPointer { weightBuffer in
+                RealModelInferenceEngine.precomputeClassifierBlockMaxNorms(
+                    classifier: weightBuffer.baseAddress!,
+                    vocabSize: config.vocab,
+                    dim: config.dModel,
+                    blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                )
+            }
+            self.classifierLogitsScratch = [Float](
+                repeating: 0,
+                count: min(RealModelInferenceEngine.classifierArgmaxBlockSize, config.vocab)
+            )
+            self.kCaches = Array(
+                repeating: [Float](repeating: 0, count: config.kvDim * config.maxSeq),
+                count: config.nLayer
+            )
+            self.vCaches = Array(
+                repeating: [Float](repeating: 0, count: config.kvDim * config.maxSeq),
+                count: config.nLayer
+            )
+            self.lastHidden = [Float](repeating: 0, count: config.dModel)
+            self.visibleTokenCount = 0
+        }
+
+        mutating func reset() {
+            for layerIndex in 0..<config.nLayer {
+                kCaches[layerIndex].withUnsafeMutableBufferPointer { pointer in
+                    for index in pointer.indices {
+                        pointer[index] = 0
+                    }
+                }
+                vCaches[layerIndex].withUnsafeMutableBufferPointer { pointer in
+                    for index in pointer.indices {
+                        pointer[index] = 0
+                    }
+                }
+            }
+            lastHidden.withUnsafeMutableBufferPointer { pointer in
+                for index in pointer.indices {
+                    pointer[index] = 0
+                }
+            }
+            visibleTokenCount = 0
+        }
+
+        mutating func prefill(promptTokens: [TokenID]) throws {
+            guard !promptTokens.isEmpty else {
+                throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
+            }
+            reset()
+            for token in promptTokens {
+                try advance(token: token)
+            }
+        }
+
+        mutating func captureCheckpoint() -> CPUExactLlamaCheckpoint {
+            CPUExactLlamaCheckpoint(
+                visibleTokenCount: visibleTokenCount,
+                lastHidden: lastHidden,
+                kCaches: kCaches,
+                vCaches: vCaches
+            )
+        }
+
+        mutating func rollback(to checkpoint: CPUExactLlamaCheckpoint) {
+            visibleTokenCount = checkpoint.visibleTokenCount
+            lastHidden = checkpoint.lastHidden
+            kCaches = checkpoint.kCaches
+            vCaches = checkpoint.vCaches
+        }
+
+        mutating func selectGreedyToken() -> TokenID {
+            let normalized = RealModelInferenceEngine.rmsNorm(
+                lastHidden,
+                weight: finalNormGamma,
+                eps: Float(config.normEps)
+            )
+            return TokenID(exactClassifierArgmax(normalized))
+        }
+
+        mutating func advance(token: TokenID) throws {
+            guard visibleTokenCount < config.maxSeq else {
+                throw RealModelInferenceError.runtimeFailure(
+                    "Draft runtime position \(visibleTokenCount) exceeds context \(config.maxSeq)"
+                )
+            }
+            lastHidden = maybeRound(try forwardToken(token, position: visibleTokenCount))
+            visibleTokenCount += 1
+        }
+
+        private func maybeRound(_ values: [Float]) -> [Float] {
+            roundIntermediatesToFP16 ? RealModelInferenceEngine.roundFloat16Vector(values) : values
+        }
+
+        private mutating func forwardToken(_ token: TokenID, position: Int) throws -> [Float] {
+            guard Int(token) >= 0, Int(token) < config.vocab else {
+                throw RealModelInferenceError.runtimeFailure("Draft runtime token \(token) is outside vocab \(config.vocab)")
+            }
+            var hidden = Array(tokenEmbedding[Int(token) * config.dModel..<(Int(token) + 1) * config.dModel])
+            for layerIndex in 0..<config.nLayer {
+                let layer = layers[layerIndex]
+                let attnNormed = RealModelInferenceEngine.rmsNorm(
+                    hidden,
+                    weight: layer.rmsAtt,
+                    eps: Float(config.normEps)
+                )
+                var q = maybeRound(
+                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                        matrix: layer.wq,
+                        rows: config.attentionDim,
+                        cols: config.dModel,
+                        vector: attnNormed
+                    )
+                )
+                var k = maybeRound(
+                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                        matrix: layer.wk,
+                        rows: config.kvDim,
+                        cols: config.dModel,
+                        vector: attnNormed
+                    )
+                )
+                let vRounded = maybeRound(
+                    RealModelInferenceEngine.multiplyRowMajorMatrix(
+                        matrix: layer.wv,
+                        rows: config.kvDim,
+                        cols: config.dModel,
+                        vector: attnNormed
+                    )
+                )
+
+                if let qNorm = layer.qNorm {
+                    q.withUnsafeMutableBufferPointer { values in
+                        qNorm.withUnsafeBufferPointer { weights in
+                            RealModelInferenceEngine.applyPerHeadRMSNormInPlace(
+                                values: values,
+                                weights: weights,
+                                headCount: config.nHead,
+                                headDim: config.headDim,
+                                epsilon: Float(config.normEps)
+                            )
+                        }
+                    }
+                }
+                if let kNorm = layer.kNorm {
+                    k.withUnsafeMutableBufferPointer { values in
+                        kNorm.withUnsafeBufferPointer { weights in
+                            RealModelInferenceEngine.applyPerHeadRMSNormInPlace(
+                                values: values,
+                                weights: weights,
+                                headCount: config.nKVHead,
+                                headDim: config.headDim,
+                                epsilon: Float(config.normEps)
+                            )
+                        }
+                    }
+                }
+
+                q = maybeRound(
+                    RealModelInferenceEngine.applyHalfSplitRoPEPerHead(
+                        q,
+                        heads: config.nHead,
+                        headDim: config.headDim,
+                        position: position,
+                        theta: config.ropeTheta
+                    )
+                )
+                k = maybeRound(
+                    RealModelInferenceEngine.applyHalfSplitRoPEPerHead(
+                        k,
+                        heads: config.nKVHead,
+                        headDim: config.headDim,
+                        position: position,
+                        theta: config.ropeTheta
+                    )
+                )
+
+                for channel in 0..<config.kvDim {
+                    kCaches[layerIndex][channel * config.maxSeq + position] = k[channel]
+                    vCaches[layerIndex][channel * config.maxSeq + position] = vRounded[channel]
+                }
+
+                let context = RealModelInferenceEngine.decodeContextFromCaches(
+                    qOut: q,
+                    kCache: kCaches[layerIndex],
+                    vCache: vCaches[layerIndex],
+                    heads: config.nHead,
+                    kvHeads: config.nKVHead,
+                    headDim: config.headDim,
+                    visibleTokenCount: position + 1,
+                    cacheStride: config.maxSeq
+                )
+
+                let projected = maybeRound(
+                    zip(
+                        hidden,
+                        RealModelInferenceEngine.multiplyRowMajorMatrix(
+                            matrix: layer.wo,
+                            rows: config.dModel,
+                            cols: config.attentionDim,
+                            vector: context
+                        )
+                    ).map(+)
+                )
+                let ffnNormed = RealModelInferenceEngine.rmsNorm(
+                    projected,
+                    weight: layer.rmsFfn,
+                    eps: Float(config.normEps)
+                )
+                let gate = RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: layer.w1,
+                    rows: config.hiddenDim,
+                    cols: config.dModel,
+                    vector: ffnNormed
+                )
+                let up = RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: layer.w3,
+                    rows: config.hiddenDim,
+                    cols: config.dModel,
+                    vector: ffnNormed
+                )
+                let activated = zip(gate, up).map { RealModelInferenceEngine.silu($0) * $1 }
+                let down = RealModelInferenceEngine.multiplyRowMajorMatrix(
+                    matrix: layer.w2,
+                    rows: config.dModel,
+                    cols: config.hiddenDim,
+                    vector: activated
+                )
+                hidden = maybeRound(zip(projected, down).map(+))
+            }
+            return hidden
+        }
+
+        private mutating func exactClassifierArgmax(_ hidden: [Float]) -> Int {
+            hidden.withUnsafeBufferPointer { hiddenBuffer in
+                lmHead.withUnsafeBufferPointer { weightBuffer in
+                    classifierBlockMaxNorms.withUnsafeBufferPointer { normsBuffer in
+                        classifierLogitsScratch.withUnsafeMutableBufferPointer { scratchBuffer in
+                            guard let hiddenBase = hiddenBuffer.baseAddress,
+                                  let weightBase = weightBuffer.baseAddress,
+                                  let normsBase = normsBuffer.baseAddress,
+                                  let scratchBase = scratchBuffer.baseAddress else {
+                                return 0
+                            }
+                            return RealModelInferenceEngine.partitionedArgmax(
+                                classifier: weightBase,
+                                input: hiddenBase,
+                                logitsScratch: scratchBase,
+                                blockMaxNorms: normsBase,
+                                vocabSize: config.vocab,
+                                dim: config.dModel,
+                                blockSize: RealModelInferenceEngine.classifierArgmaxBlockSize
+                            )
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     private enum LoadedTokenizer {
         case gpt2(GPT2BPETokenizer)
         case sentencePiece(SentencePieceTokenizer)
@@ -476,13 +820,13 @@ public struct RealModelInferenceEngine: ~Copyable {
         let kernel: ANEKernel
         let inputSurface: IOSurfaceRef
         let outputSurface: IOSurfaceRef
-        let maxValueSurface: IOSurfaceRef
+        let maxValueSurface: IOSurfaceRef?
 
         init(
             kernel: consuming ANEKernel,
             inputSurface: IOSurfaceRef,
             outputSurface: IOSurfaceRef,
-            maxValueSurface: IOSurfaceRef
+            maxValueSurface: IOSurfaceRef?
         ) {
             self.kernel = kernel
             self.inputSurface = inputSurface
@@ -988,11 +1332,26 @@ public struct RealModelInferenceEngine: ~Copyable {
             channels: config.dModel,
             maxSeq: config.maxSeq
         )
+        let environment = ProcessInfo.processInfo.environment
 
         if config.architecture == .llama {
+            if temperature == 0,
+               let draft = try Self.resolveExactTwoTokenDraft(
+                   config: config,
+                   weightDirURL: weightDirURL,
+                   environment: environment
+               ) {
+                return try generateIncrementalExactTwoTokenDraftLlama(
+                    promptTokens: promptTokens,
+                    effectiveMaxTokens: effectiveMaxTokens,
+                    compileTimeMs: 0,
+                    draft: draft,
+                    onStep: onStep
+                )
+            }
             switch Self.llamaGenerationPath(
                 config: config,
-                environment: ProcessInfo.processInfo.environment
+                environment: environment
             ) {
             case .exactCPU:
                 return try generateIncrementalExactCPULlama(
@@ -1110,7 +1469,9 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         var allTokens = promptTokens
         var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
         generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
         var firstTokenLatencyMs = 0.0
@@ -1170,6 +1531,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             allTokens.append(nextToken)
             let elapsedMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
             let tokenLatencyMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - stepStart)
+            tokenLatenciesMs.append(tokenLatencyMs)
             let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
             onStep?(
                 GenerationStep(
@@ -1197,6 +1559,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             text: tokenizer.decode(allTokens.map(Int.init)),
             tokens: generatedTokens,
             promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
@@ -1456,7 +1819,8 @@ public struct RealModelInferenceEngine: ~Copyable {
     private static func loadLlamaTopLevelAssets(
         config: MultiModelConfig,
         topLevelPaths: LlamaTopLevelWeightPaths,
-        weightDirURL: URL
+        weightDirURL: URL,
+        environment: [String: String] = ProcessInfo.processInfo.environment
     ) throws -> LlamaTopLevelAssets {
         let tokenEmbedding = try loadWeightTablePreferringFloat32Sidecar(
             at: topLevelPaths.tokenEmbedding,
@@ -1474,15 +1838,76 @@ public struct RealModelInferenceEngine: ~Copyable {
             at: topLevelPaths.lmHead,
             expectedCount: config.vocab * config.dModel
         )
+        let factoredOutputHead = try loadLlamaFactoredOutputHead(
+            config: config,
+            weightDirURL: weightDirURL,
+            environment: environment
+        )
         return LlamaTopLevelAssets(
             tokenEmbedding: tokenEmbedding,
             finalNormGamma: finalNormGamma,
             lmHead: lmHead,
             lmHeadFP16: lmHeadFP16,
             lmHeadHasExactFloat32Sidecar: lmHeadFP16 == nil,
+            factoredOutputHead: factoredOutputHead,
             finalNormGammaPath: topLevelPaths.finalNormGamma,
             finalNormGammaCompilePath: compileBlobPath(actualPath: topLevelPaths.finalNormGamma, rootDir: weightDirURL),
             finalNormGammaData: WeightBlob.build(from: finalNormGamma, rows: 1, cols: finalNormGamma.count)
+        )
+    }
+
+    private static func loadLlamaFactoredOutputHead(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        environment: [String: String]
+    ) throws -> LlamaTopLevelAssets.FactoredOutputHead? {
+        guard config.architecture == .llama,
+              environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_KIND"] == "factored" else {
+            return nil
+        }
+
+        guard let bottleneckRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK"],
+              let bottleneck = Int(bottleneckRaw),
+              bottleneck > 0 else {
+            throw RealModelInferenceError.invalidConfig(
+                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_BOTTLENECK > 0"
+            )
+        }
+        guard let groupsRaw = environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS"],
+              let groups = Int(groupsRaw),
+              groups > 0 else {
+            throw RealModelInferenceError.invalidConfig(
+                "Factored output head requires ESPRESSO_BUNDLE_OUTPUT_HEAD_GROUPS > 0"
+            )
+        }
+
+        let projectionPath = try resolveBundleWeightReference(
+            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_PROJECTION_REF"] ?? "cls_proj.bin",
+            weightDirURL: weightDirURL
+        )
+        let expansionPath = try resolveBundleWeightReference(
+            environment["ESPRESSO_BUNDLE_OUTPUT_HEAD_EXPANSION_REF"] ?? "cls_expand.bin",
+            weightDirURL: weightDirURL
+        )
+
+        let projectionCompactCount = bottleneck * (config.dModel / groups)
+        let projectionDenseCount = bottleneck * config.dModel
+        let expansionCompactCount = config.vocab * (bottleneck / groups)
+        let expansionDenseCount = config.vocab * bottleneck
+        let projection = try loadWeightTable(
+            at: projectionPath,
+            allowedCounts: [projectionCompactCount, projectionDenseCount]
+        )
+        let expansion = try loadWeightTable(
+            at: expansionPath,
+            allowedCounts: [expansionCompactCount, expansionDenseCount]
+        )
+
+        return LlamaTopLevelAssets.FactoredOutputHead(
+            projection: projection,
+            expansion: expansion,
+            bottleneck: bottleneck,
+            groups: groups
         )
     }
 
@@ -3945,6 +4370,7 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         let hybridHeadSpatial = Self.incrementalHeadSpatial(channels: config.dModel)
+        let useFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
 
         // Compile RMSNorm head (no beta) for llama
         if compiledHybridHead.count != 1 || compiledHybridHeadSpatial != hybridHeadSpatial {
@@ -3962,41 +4388,70 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
 
         if classifierStrategy.usesANEClassifier {
-            if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
-                compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
-                    try Self.compileLlamaHead(
-                        config: config,
-                        weightDirURL: weightDirURL,
-                        assets: llamaAssets,
-                        spatial: hybridHeadSpatial,
-                        inputDType: .fp16,
-                        outputDType: .fp16
-                    )
-                })
-                compiledHybridGreedySpatial = hybridHeadSpatial
-                didCompile = true
-            }
+            if useFactoredGreedyHead {
+                if compiledHybridGreedyNorm.count != 0 {
+                    compiledHybridGreedyNorm = Self.emptyStorage(CompiledHead.self)
+                    didCompile = true
+                }
+                if compiledHybridGreedyClassifier.count != 1 {
+                    do {
+                        compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                            try Self.compileLlamaFactoredClassifier(
+                                config: config,
+                                assets: llamaAssets,
+                                spatial: hybridHeadSpatial
+                            )
+                        })
+                    } catch {
+                        fputs(
+                            "[RealModelInference] Llama factored classifier compile failed; falling back to dense ANE classifier: \(error)\n",
+                            stderr
+                        )
+                        compiledHybridGreedyClassifier = Self.emptyStorage(CompiledClassifier.self)
+                    }
+                    didCompile = true
+                }
+                if compiledHybridGreedyClassifier.count == 1,
+                   let finalSurface = compiledHybridSurfaceHandles.last?.ffnOut {
+                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(at: 0, to: finalSurface)
+                }
+            } else {
+                if compiledHybridGreedyNorm.count != 1 || compiledHybridGreedySpatial != hybridHeadSpatial {
+                    compiledHybridGreedyNorm = try LayerStorage<CompiledHead>(count: 1, throwingInitializer: { _ in
+                        try Self.compileLlamaHead(
+                            config: config,
+                            weightDirURL: weightDirURL,
+                            assets: llamaAssets,
+                            spatial: hybridHeadSpatial,
+                            inputDType: .fp16,
+                            outputDType: .fp16
+                        )
+                    })
+                    compiledHybridGreedySpatial = hybridHeadSpatial
+                    didCompile = true
+                }
 
-            if compiledHybridGreedyClassifier.count != 1 {
-                compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
-                    try Self.compileLlamaClassifier(
-                        config: config,
-                        assets: llamaAssets,
-                        spatial: hybridHeadSpatial
+                if compiledHybridGreedyClassifier.count != 1 {
+                    compiledHybridGreedyClassifier = try LayerStorage<CompiledClassifier>(count: 1, throwingInitializer: { _ in
+                        try Self.compileLlamaClassifier(
+                            config: config,
+                            assets: llamaAssets,
+                            spatial: hybridHeadSpatial
+                        )
+                    })
+                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                        at: 0,
+                        to: compiledHybridGreedyNorm[0].outputSurface
                     )
-                })
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
-                didCompile = true
-            }
+                    didCompile = true
+                }
 
-            if compiledHybridGreedyClassifier.count == 1 {
-                try compiledHybridGreedyClassifier[0].kernel.rebindInput(
-                    at: 0,
-                    to: compiledHybridGreedyNorm[0].outputSurface
-                )
+                if compiledHybridGreedyClassifier.count == 1 {
+                    try compiledHybridGreedyClassifier[0].kernel.rebindInput(
+                        at: 0,
+                        to: compiledHybridGreedyNorm[0].outputSurface
+                    )
+                }
             }
         }
 
@@ -4085,11 +4540,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Hybrid decode state initialization failed: \(error)")
         }
         var timings = HybridDecodeTimingBreakdown()
+        let usingFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
         let useANEGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesANEClassifier &&
-            compiledHybridGreedyNorm.count == 1 &&
-            compiledHybridGreedyClassifier.count == 1
+            compiledHybridGreedyClassifier.count == 1 &&
+            (
+                (usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 0) ||
+                (!usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 1)
+            )
 
         for (position, token) in promptTokens.enumerated() {
             try writeIncrementalEmbedding(token: token, position: position, into: xCur)
@@ -4155,7 +4614,9 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         var allTokens = promptTokens
         var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
         generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
         var emissionStart = generationStart
@@ -4171,15 +4632,10 @@ public struct RealModelInferenceEngine: ~Copyable {
                 do {
                     try compiledHybridGreedyNorm[0].kernel.eval()
                     try compiledHybridGreedyClassifier[0].kernel.eval()
-                    let argmax = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
-                        from: compiledHybridGreedyClassifier[0].outputSurface,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: headSpatial,
-                        channels: config.vocab,
-                        hintSurface: compiledHybridGreedyClassifier[0].maxValueSurface,
-                        hintSpatialIndex: 0,
-                        hintSpatial: headSpatial
+                    let argmax = try Self.greedyArgmax(
+                        classifier: compiledHybridGreedyClassifier[0],
+                        headSpatial: headSpatial,
+                        vocab: config.vocab
                     )
                     guard let token = TokenID(exactly: argmax.index) else {
                         throw RealModelInferenceError.runtimeFailure(
@@ -4239,6 +4695,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             allTokens.append(nextToken)
             let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
             let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
+            tokenLatenciesMs.append(tokenLatencyMs)
             onStep?(
                 GenerationStep(
                     token: nextToken,
@@ -4290,6 +4747,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             text: tokenizer.decode(allTokens.map(Int.init)),
             tokens: generatedTokens,
             promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
@@ -4331,7 +4789,9 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         var allTokens = promptTokens
         var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
         generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
         var emissionStart = generationStart
@@ -4343,6 +4803,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             allTokens.append(token)
             let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
             let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+            tokenLatenciesMs.append(tokenLatencyMs)
             if !firstTokenRecorded {
                 firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
                 firstTokenRecorded = true
@@ -4502,6 +4963,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             text: tokenizer.decode(allTokens.map(Int.init)),
             tokens: generatedTokens,
             promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs
@@ -4564,6 +5026,149 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
         order.append(accessedKey)
         return (order, evictedKey)
+    }
+
+    private static func loadConfigFromMetadataFile(at metadataURL: URL) throws -> MultiModelConfig {
+        let data: Data
+        do {
+            data = try Data(contentsOf: metadataURL)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to read metadata.json: \(error)")
+        }
+
+        let object: Any
+        do {
+            object = try JSONSerialization.jsonObject(with: data)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("metadata.json is not valid JSON: \(error)")
+        }
+
+        guard let metadata = object as? [String: Any] else {
+            throw RealModelInferenceError.runtimeFailure("metadata.json must be a JSON object")
+        }
+
+        func requiredInt(_ key: String) throws -> Int {
+            guard let number = metadata[key] as? NSNumber else {
+                throw RealModelInferenceError.runtimeFailure("metadata.json missing numeric field \(key)")
+            }
+            return number.intValue
+        }
+
+        func requiredDouble(_ key: String) throws -> Double {
+            guard let number = metadata[key] as? NSNumber else {
+                throw RealModelInferenceError.runtimeFailure("metadata.json missing numeric field \(key)")
+            }
+            return number.doubleValue
+        }
+
+        guard let name = metadata["name"] as? String, !name.isEmpty else {
+            throw RealModelInferenceError.runtimeFailure("metadata.json missing string field name")
+        }
+        let architecture: MultiModelConfig.Architecture
+        switch (metadata["architecture"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "gpt2":
+            architecture = .gpt2
+        case "llama":
+            architecture = .llama
+        default:
+            throw RealModelInferenceError.runtimeFailure("metadata.json missing supported architecture")
+        }
+
+        return MultiModelConfig(
+            name: name,
+            nLayer: try requiredInt("nLayer"),
+            nHead: try requiredInt("nHead"),
+            nKVHead: try requiredInt("nKVHead"),
+            dModel: try requiredInt("dModel"),
+            headDim: try requiredInt("headDim"),
+            hiddenDim: try requiredInt("hiddenDim"),
+            vocab: try requiredInt("vocab"),
+            maxSeq: try requiredInt("maxSeq"),
+            normEps: Float(try requiredDouble("normEps")),
+            ropeTheta: Float((metadata["ropeTheta"] as? NSNumber)?.doubleValue ?? 10_000),
+            eosToken: (metadata["eosToken"] as? NSNumber)?.uint32Value,
+            architecture: architecture
+        )
+    }
+
+    private static func resolveExactTwoTokenDraft(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        environment: [String: String]
+    ) throws -> ResolvedExactTwoTokenDraft? {
+        guard environment["ESPRESSO_BUNDLE_DRAFT_KIND"] == "exact_two_token" else {
+            return nil
+        }
+        if let rawHorizon = environment["ESPRESSO_BUNDLE_DRAFT_HORIZON"],
+           Int(rawHorizon) != 2 {
+            throw RealModelInferenceError.runtimeFailure(
+                "exact two-token draft requires horizon == 2, got \(rawHorizon)"
+            )
+        }
+        guard let artifactRef = environment["ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF"],
+              !artifactRef.isEmpty else {
+            throw RealModelInferenceError.runtimeFailure("exact two-token draft requires ESPRESSO_BUNDLE_DRAFT_ARTIFACT_REF")
+        }
+
+        let bundleRootURL = weightDirURL.deletingLastPathComponent()
+        let descriptorURL = bundleRootURL.appendingPathComponent(artifactRef).standardizedFileURL
+        let bundleRootPath = bundleRootURL.path
+        guard descriptorURL.path == bundleRootPath || descriptorURL.path.hasPrefix(bundleRootPath + "/") else {
+            throw RealModelInferenceError.runtimeFailure("Draft artifact ref escapes bundle root: \(artifactRef)")
+        }
+        guard FileManager.default.fileExists(atPath: descriptorURL.path) else {
+            throw RealModelInferenceError.runtimeFailure("Draft artifact file is missing: \(descriptorURL.path)")
+        }
+
+        let descriptorData = try Data(contentsOf: descriptorURL)
+        let descriptor: ExactTwoTokenDraftDescriptor
+        do {
+            descriptor = try JSONDecoder().decode(ExactTwoTokenDraftDescriptor.self, from: descriptorData)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to decode draft descriptor \(descriptorURL.path): \(error)")
+        }
+        guard !descriptor.modelDir.isEmpty else {
+            throw RealModelInferenceError.runtimeFailure("Draft descriptor is missing model_dir")
+        }
+
+        let draftWeightDirURL = weightDirURL.appendingPathComponent(
+            descriptor.modelDir,
+            isDirectory: true
+        ).standardizedFileURL
+        let weightRootPath = weightDirURL.path
+        guard draftWeightDirURL.path == weightRootPath || draftWeightDirURL.path.hasPrefix(weightRootPath + "/") else {
+            throw RealModelInferenceError.runtimeFailure("Draft model_dir escapes weights root: \(descriptor.modelDir)")
+        }
+        try validateDirectory(draftWeightDirURL)
+        let draftConfig = try loadConfigFromMetadataFile(
+            at: draftWeightDirURL.appendingPathComponent("metadata.json")
+        )
+        guard draftConfig.architecture == .llama else {
+            throw RealModelInferenceError.runtimeFailure("exact two-token draft currently supports llama draft models only")
+        }
+        guard draftConfig.vocab == config.vocab else {
+            throw RealModelInferenceError.runtimeFailure(
+                "draft/full vocab mismatch: draft=\(draftConfig.vocab) full=\(config.vocab)"
+            )
+        }
+        return ResolvedExactTwoTokenDraft(
+            descriptor: descriptor,
+            descriptorURL: descriptorURL,
+            weightDirURL: draftWeightDirURL,
+            config: draftConfig
+        )
+    }
+
+    static func resolveExactTwoTokenDraftWeightDirForTesting(
+        config: MultiModelConfig,
+        weightDirURL: URL,
+        environment: [String: String]
+    ) throws -> String? {
+        try resolveExactTwoTokenDraft(
+            config: config,
+            weightDirURL: weightDirURL,
+            environment: environment
+        )?.weightDirURL.path
     }
 
     private func encodePrompt(_ prompt: String) throws -> [TokenID] {
@@ -4709,11 +5314,15 @@ public struct RealModelInferenceEngine: ~Copyable {
             throw RealModelInferenceError.runtimeFailure("Llama hybrid decode state initialization failed: \(error)")
         }
         var timings = HybridDecodeTimingBreakdown()
+        let usingFactoredGreedyHead = llamaAssets.factoredOutputHead != nil
         let useANEGreedyHead =
             temperature == 0 &&
             classifierStrategy.usesANEClassifier &&
-            compiledHybridGreedyNorm.count == 1 &&
-            compiledHybridGreedyClassifier.count == 1
+            compiledHybridGreedyClassifier.count == 1 &&
+            (
+                (usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 0) ||
+                (!usingFactoredGreedyHead && compiledHybridGreedyNorm.count == 1)
+            )
 
         let useCPUExactGreedyHead =
             temperature == 0 &&
@@ -4972,7 +5581,9 @@ public struct RealModelInferenceEngine: ~Copyable {
 
         var allTokens = promptTokens
         var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
         generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
 
         let generationStart = DispatchTime.now().uptimeNanoseconds
         var emissionStart = generationStart
@@ -4986,17 +5597,16 @@ public struct RealModelInferenceEngine: ~Copyable {
             let nextToken: TokenID
             if useANEGreedyHead {
                 do {
-                    try compiledHybridGreedyNorm[0].kernel.eval()
-                    try compiledHybridGreedyClassifier[0].kernel.eval()
-                    let argmax = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
-                        from: compiledHybridGreedyClassifier[0].outputSurface,
-                        channelOffset: 0,
-                        spatialIndex: 0,
-                        spatial: headSpatial,
-                        channels: config.vocab,
-                        hintSurface: compiledHybridGreedyClassifier[0].maxValueSurface,
-                        hintSpatialIndex: 0,
-                        hintSpatial: headSpatial
+                    if usingFactoredGreedyHead {
+                        try compiledHybridGreedyClassifier[0].kernel.eval()
+                    } else {
+                        try compiledHybridGreedyNorm[0].kernel.eval()
+                        try compiledHybridGreedyClassifier[0].kernel.eval()
+                    }
+                    let argmax = try Self.greedyArgmax(
+                        classifier: compiledHybridGreedyClassifier[0],
+                        headSpatial: headSpatial,
+                        vocab: config.vocab
                     )
                     guard let token = TokenID(exactly: argmax.index) else {
                         throw RealModelInferenceError.runtimeFailure(
@@ -5004,8 +5614,6 @@ public struct RealModelInferenceEngine: ~Copyable {
                         )
                     }
                     nextToken = token
-                } catch let error as RealModelInferenceError {
-                    throw error
                 } catch {
                     throw RealModelInferenceError.runtimeFailure("Llama hybrid greedy ANE head evaluation failed: \(error)")
                 }
@@ -5061,6 +5669,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             allTokens.append(nextToken)
             let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
             let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
+            tokenLatenciesMs.append(tokenLatencyMs)
             onStep?(
                 GenerationStep(
                     token: nextToken,
@@ -5118,10 +5727,13 @@ public struct RealModelInferenceEngine: ~Copyable {
             text: tokenizer.decode(allTokens.map(Int.init)),
             tokens: generatedTokens,
             promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
-            exactHeadBackend: classifierStrategy.exactHeadBackendLabel,
+            exactHeadBackend: usingFactoredGreedyHead && useANEGreedyHead
+                ? "ane_factored_classifier"
+                : classifierStrategy.exactHeadBackendLabel,
             cachedBindingsEnabled: cachedBindings != nil
         )
     }
@@ -5168,6 +5780,184 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
         cachedExactCPULlamaWeights = loadedWeights
         return loadedWeights
+    }
+
+    private mutating func generateIncrementalExactTwoTokenDraftLlama(
+        promptTokens: [TokenID],
+        effectiveMaxTokens: Int,
+        compileTimeMs: Double,
+        draft: ResolvedExactTwoTokenDraft,
+        onStep: ((GenerationStep) -> Void)?
+    ) throws -> GenerationResult {
+        guard !promptTokens.isEmpty else {
+            throw RealModelInferenceError.invalidGenerationParameters("Prompt tokens must not be empty")
+        }
+        var fullRuntime = try CPUExactLlamaRuntime(config: config, weightDirURL: weightDirURL)
+        var draftRuntime = try CPUExactLlamaRuntime(config: draft.config, weightDirURL: draft.weightDirURL)
+
+        try fullRuntime.prefill(promptTokens: promptTokens)
+        try draftRuntime.prefill(promptTokens: promptTokens)
+
+        var allTokens = promptTokens
+        var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
+        generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
+
+        let generationStart = DispatchTime.now().uptimeNanoseconds
+        var emissionStart = generationStart
+        var firstTokenLatencyMs = 0.0
+        var firstTokenRecorded = false
+        var committedExactTokensTotal = 0
+        var acceptedFutureTokensTotal = 0
+        var speculativePassCount = 0
+
+        func emit(_ token: TokenID, at emissionNow: UInt64) {
+            generatedTokens.append(token)
+            allTokens.append(token)
+            let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
+            let tokenLatencyMs = Self.milliseconds(from: emissionNow - emissionStart)
+            tokenLatenciesMs.append(tokenLatencyMs)
+            if !firstTokenRecorded {
+                firstTokenLatencyMs = Self.milliseconds(from: emissionNow - generationStart)
+                firstTokenRecorded = true
+            }
+            let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
+            onStep?(
+                GenerationStep(
+                    token: token,
+                    generatedTokens: generatedTokens,
+                    text: tokenizer.decode(allTokens.map(Int.init)),
+                    tokenLatencyMs: tokenLatencyMs,
+                    elapsedMs: elapsedMs,
+                    firstTokenLatencyMs: firstTokenLatencyMs,
+                    tokensPerSecond: tokensPerSecond
+                )
+            )
+            emissionStart = emissionNow
+        }
+
+        let firstToken = fullRuntime.selectGreedyToken()
+        if let eosToken = config.eosToken, firstToken == eosToken {
+            generatedTokens.append(firstToken)
+            return GenerationResult(
+                text: tokenizer.decode((promptTokens + generatedTokens).map(Int.init)),
+                tokens: generatedTokens,
+                promptTokens: promptTokens,
+                tokenLatenciesMs: tokenLatenciesMs,
+                tokensPerSecond: 0,
+                compileTimeMs: compileTimeMs,
+                firstTokenLatencyMs: 0,
+                exactHeadBackend: "cpu_exact_two_token_draft",
+                cachedBindingsEnabled: false,
+                committedExactTokensPerPass: nil,
+                acceptedFutureTokensPerPass: nil
+            )
+        }
+        let firstEmission = DispatchTime.now().uptimeNanoseconds
+        emit(firstToken, at: firstEmission)
+        if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq {
+            let totalMs = Self.milliseconds(from: DispatchTime.now().uptimeNanoseconds - generationStart)
+            let tps = generatedTokens.isEmpty ? 0 : Double(generatedTokens.count) / max(totalMs / 1_000, 1e-9)
+            return GenerationResult(
+                text: tokenizer.decode(allTokens.map(Int.init)),
+                tokens: generatedTokens,
+                promptTokens: promptTokens,
+                tokenLatenciesMs: tokenLatenciesMs,
+                tokensPerSecond: tps,
+                compileTimeMs: compileTimeMs,
+                firstTokenLatencyMs: firstTokenLatencyMs,
+                exactHeadBackend: "cpu_exact_two_token_draft",
+                cachedBindingsEnabled: false,
+                committedExactTokensPerPass: nil,
+                acceptedFutureTokensPerPass: nil
+            )
+        }
+
+        try fullRuntime.advance(token: firstToken)
+        try draftRuntime.advance(token: firstToken)
+
+        while generatedTokens.count < effectiveMaxTokens, allTokens.count < config.maxSeq {
+            speculativePassCount += 1
+            let remainingTokenBudget = min(effectiveMaxTokens - generatedTokens.count, config.maxSeq - allTokens.count)
+            let draftCheckpoint = draftRuntime.captureCheckpoint()
+            let proposedToken0 = draftRuntime.selectGreedyToken()
+            try draftRuntime.advance(token: proposedToken0)
+
+            let exactToken0 = fullRuntime.selectGreedyToken()
+            var acceptedInPass = 0
+            var committedInPass = 0
+
+            if exactToken0 == proposedToken0 {
+                acceptedInPass += 1
+            } else {
+                draftRuntime.rollback(to: draftCheckpoint)
+            }
+
+            let firstRoundEmission = DispatchTime.now().uptimeNanoseconds
+            emit(exactToken0, at: firstRoundEmission)
+            committedInPass += 1
+            if let eosToken = config.eosToken, exactToken0 == eosToken {
+                committedExactTokensTotal += committedInPass
+                acceptedFutureTokensTotal += acceptedInPass
+                break
+            }
+            try fullRuntime.advance(token: exactToken0)
+            if exactToken0 != proposedToken0 {
+                try draftRuntime.advance(token: exactToken0)
+            }
+
+            if generatedTokens.count >= effectiveMaxTokens || allTokens.count >= config.maxSeq || remainingTokenBudget <= 1 {
+                committedExactTokensTotal += committedInPass
+                acceptedFutureTokensTotal += acceptedInPass
+                continue
+            }
+
+            let proposedToken1 = draftRuntime.selectGreedyToken()
+            let exactToken1 = fullRuntime.selectGreedyToken()
+            if exactToken1 == proposedToken1 {
+                acceptedInPass += 1
+            }
+            let secondRoundEmission = DispatchTime.now().uptimeNanoseconds
+            emit(exactToken1, at: secondRoundEmission)
+            committedInPass += 1
+            if let eosToken = config.eosToken, exactToken1 == eosToken {
+                committedExactTokensTotal += committedInPass
+                acceptedFutureTokensTotal += acceptedInPass
+                break
+            }
+            try fullRuntime.advance(token: exactToken1)
+            try draftRuntime.advance(token: exactToken1)
+
+            committedExactTokensTotal += committedInPass
+            acceptedFutureTokensTotal += acceptedInPass
+        }
+
+        let generationEnd = DispatchTime.now().uptimeNanoseconds
+        let generationTimeMs = Self.milliseconds(from: generationEnd - generationStart)
+        let tokensPerSecond = generatedTokens.isEmpty
+            ? 0
+            : Double(generatedTokens.count) / max(generationTimeMs / 1_000, 1e-9)
+        let committedExactTokensPerPass = speculativePassCount == 0
+            ? nil
+            : Double(committedExactTokensTotal) / Double(speculativePassCount)
+        let acceptedFutureTokensPerPass = speculativePassCount == 0
+            ? nil
+            : Double(acceptedFutureTokensTotal) / Double(speculativePassCount)
+
+        return GenerationResult(
+            text: tokenizer.decode(allTokens.map(Int.init)),
+            tokens: generatedTokens,
+            promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
+            tokensPerSecond: tokensPerSecond,
+            compileTimeMs: compileTimeMs,
+            firstTokenLatencyMs: firstTokenLatencyMs,
+            exactHeadBackend: "cpu_exact_two_token_draft",
+            cachedBindingsEnabled: false,
+            committedExactTokensPerPass: committedExactTokensPerPass,
+            acceptedFutureTokensPerPass: acceptedFutureTokensPerPass
+        )
     }
 
     private mutating func generateIncrementalExactCPULlama(
@@ -5338,7 +6128,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         var firstTokenLatencyMs = 0.0
         var firstTokenRecorded = false
         var generatedTokens: [TokenID] = []
+        var tokenLatenciesMs: [Double] = []
         generatedTokens.reserveCapacity(effectiveMaxTokens)
+        tokenLatenciesMs.reserveCapacity(effectiveMaxTokens)
         var rng = SystemRandomNumberGenerator()
 
         while generatedTokens.count < effectiveMaxTokens {
@@ -5370,6 +6162,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             allTokens.append(nextToken)
             let elapsedMs = Self.milliseconds(from: emissionNow - generationStart)
             let tokensPerSecond = Double(generatedTokens.count) / max(elapsedMs / 1_000, 1e-9)
+            tokenLatenciesMs.append(tokenLatencyMs)
             onStep?(
                 GenerationStep(
                     token: nextToken,
@@ -5400,6 +6193,7 @@ public struct RealModelInferenceEngine: ~Copyable {
             text: tokenizer.decode(allTokens.map(Int.init)),
             tokens: generatedTokens,
             promptTokens: promptTokens,
+            tokenLatenciesMs: tokenLatenciesMs,
             tokensPerSecond: tokensPerSecond,
             compileTimeMs: compileTimeMs,
             firstTokenLatencyMs: firstTokenLatencyMs,
@@ -6162,6 +6956,76 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
     }
 
+    private static func compileLlamaFactoredClassifier(
+        config: MultiModelConfig,
+        assets: LlamaTopLevelAssets,
+        spatial: Int
+    ) throws -> CompiledClassifier {
+        guard let factoredOutputHead = assets.factoredOutputHead else {
+            throw RealModelInferenceError.runtimeFailure("Factored llama classifier requested without factorized head weights")
+        }
+        guard config.dModel == ModelConfig.dim else {
+            throw RealModelInferenceError.runtimeFailure(
+                "Factored llama classifier currently requires dModel \(ModelConfig.dim), got \(config.dModel)"
+            )
+        }
+
+        let projColsPerGroup = config.dModel / factoredOutputHead.groups
+        let expColsPerGroup = factoredOutputHead.bottleneck / factoredOutputHead.groups
+        let generator = FactoredGenerationRMSNormClassifierGenerator(
+            vocabSize: config.vocab,
+            bottleneck: factoredOutputHead.bottleneck,
+            laneSpatial: spatial,
+            groups: factoredOutputHead.groups
+        )
+        let rmsBlob = assets.finalNormGamma.withUnsafeBufferPointer { ptr in
+            WeightBlob.build(from: ptr, rows: 1, cols: config.dModel)
+        }
+        let projBlob = buildGroupedWeightBlob(
+            from: factoredOutputHead.projection,
+            rows: factoredOutputHead.bottleneck,
+            colsPerGroup: projColsPerGroup,
+            groups: factoredOutputHead.groups
+        )
+        let expBlob = buildGroupedWeightBlob(
+            from: factoredOutputHead.expansion,
+            rows: config.vocab,
+            colsPerGroup: expColsPerGroup,
+            groups: factoredOutputHead.groups
+        )
+        let kernel: ANEKernel
+        do {
+            kernel = try ANEKernel(
+                milText: generator.milText,
+                weights: [
+                    (path: "@model_path/weights/rms_final.bin", data: rmsBlob),
+                    (path: "@model_path/weights/cls_proj.bin", data: projBlob),
+                    (path: "@model_path/weights/cls_expand.bin", data: expBlob),
+                ],
+                inputSizes: generator.inputByteSizes,
+                outputSizes: generator.outputByteSizes
+            )
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama factored classifier compilation failed: \(error)")
+        }
+
+        let inputSurface: IOSurfaceRef
+        let outputSurface: IOSurfaceRef
+        do {
+            inputSurface = try kernel.inputSurface(at: 0)
+            outputSurface = try kernel.outputSurface(at: 0)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Llama factored classifier surfaces unavailable: \(error)")
+        }
+
+        return CompiledClassifier(
+            kernel: kernel,
+            inputSurface: inputSurface,
+            outputSurface: outputSurface,
+            maxValueSurface: nil
+        )
+    }
+
     private static func buildLlamaHeadGraph(
         config: MultiModelConfig,
         assets: LlamaTopLevelAssets,
@@ -6544,6 +7408,22 @@ public struct RealModelInferenceEngine: ~Copyable {
         return values
     }
 
+    static func loadWeightTable(at path: String, allowedCounts: [Int]) throws -> [Float] {
+        let values: [Float]
+        do {
+            values = try BlobWeightLoader.load(from: path)
+        } catch {
+            throw RealModelInferenceError.runtimeFailure("Failed to load weight blob \(path): \(error)")
+        }
+        guard allowedCounts.contains(values.count) else {
+            let expected = allowedCounts.map(String.init).joined(separator: " or ")
+            throw RealModelInferenceError.runtimeFailure(
+                "Unexpected weight count for \(path): expected \(expected), got \(values.count)"
+            )
+        }
+        return values
+    }
+
     static func loadRawFP16WeightTableIfNoExactFloat32Sidecar(
         at path: String,
         expectedCount: Int
@@ -6675,9 +7555,58 @@ public struct RealModelInferenceEngine: ~Copyable {
         }
     }
 
+    private static func buildGroupedWeightBlob(
+        from weights: [Float],
+        rows: Int,
+        colsPerGroup: Int,
+        groups: Int
+    ) -> Data {
+        let compactCount = rows * colsPerGroup
+        let repacked: [Float] = weights.withUnsafeBufferPointer { buffer in
+            if groups == 1 || buffer.count == compactCount {
+                return Array(buffer)
+            }
+
+            let denseCols = colsPerGroup * groups
+            precondition(rows.isMultiple(of: groups))
+            precondition(buffer.count == rows * denseCols)
+
+            let rowsPerGroup = rows / groups
+            var compact = [Float](repeating: 0, count: compactCount)
+            for row in 0..<rows {
+                let group = row / rowsPerGroup
+                let srcStart = row * denseCols + group * colsPerGroup
+                let dstStart = row * colsPerGroup
+                for col in 0..<colsPerGroup {
+                    compact[dstStart + col] = buffer[srcStart + col]
+                }
+            }
+            return compact
+        }
+        return WeightBlob.build(from: repacked, rows: rows, cols: colsPerGroup)
+    }
+
     private static func fileExists(at path: String?) -> Bool {
         guard let path else { return false }
         return FileManager.default.fileExists(atPath: path)
+    }
+
+    private static func resolveBundleWeightReference(
+        _ reference: String,
+        weightDirURL: URL
+    ) throws -> String {
+        let normalized = reference.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !normalized.isEmpty else {
+            throw RealModelInferenceError.invalidConfig("Bundle output-head reference must not be empty")
+        }
+        let relative = normalized.hasPrefix("weights/")
+            ? String(normalized.dropFirst("weights/".count))
+            : normalized
+        let resolved = weightDirURL.appendingPathComponent(relative).standardizedFileURL.path
+        guard FileManager.default.fileExists(atPath: resolved) else {
+            throw RealModelInferenceError.missingPath(resolved)
+        }
+        return resolved
     }
 
     private static func compileBlobPath(actualPath: String, rootDir: URL) -> String {
@@ -7181,15 +8110,10 @@ public struct RealModelInferenceEngine: ~Copyable {
         do {
             try norm.kernel.eval()
             try classifier.kernel.eval()
-            let argmax = try SurfaceIO.argmaxFP16SpatialSliceWithHint(
-                from: classifier.outputSurface,
-                channelOffset: 0,
-                spatialIndex: 0,
-                spatial: headSpatial,
-                channels: vocab,
-                hintSurface: classifier.maxValueSurface,
-                hintSpatialIndex: 0,
-                hintSpatial: headSpatial
+            let argmax = try greedyArgmax(
+                classifier: classifier,
+                headSpatial: headSpatial,
+                vocab: vocab
             )
             guard let token = TokenID(exactly: argmax.index) else {
                 throw RealModelInferenceError.runtimeFailure(
@@ -7202,6 +8126,32 @@ public struct RealModelInferenceEngine: ~Copyable {
         } catch {
             throw RealModelInferenceError.runtimeFailure("Hybrid greedy ANE head evaluation failed: \(error)")
         }
+    }
+
+    private static func greedyArgmax(
+        classifier: borrowing CompiledClassifier,
+        headSpatial: Int,
+        vocab: Int
+    ) throws -> SurfaceIO.FP16ArgmaxResult {
+        if let maxValueSurface = classifier.maxValueSurface {
+            return try SurfaceIO.argmaxFP16SpatialSliceWithHint(
+                from: classifier.outputSurface,
+                channelOffset: 0,
+                spatialIndex: 0,
+                spatial: headSpatial,
+                channels: vocab,
+                hintSurface: maxValueSurface,
+                hintSpatialIndex: 0,
+                hintSpatial: headSpatial
+            )
+        }
+        return try SurfaceIO.argmaxFP16SpatialSlice(
+            from: classifier.outputSurface,
+            channelOffset: 0,
+            spatialIndex: 0,
+            spatial: headSpatial,
+            channels: vocab
+        )
     }
 
     private static func zeroSurface(_ surface: IOSurfaceRef) throws {
