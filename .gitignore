@@ -107,3 +107,8 @@ training/
 # Tooling version pins
 .swift-version
 _reference/
+
+# Python Envioronments
+.venv/
+
+gemma4/
