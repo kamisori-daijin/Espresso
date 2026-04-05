@@ -14,6 +14,8 @@ public struct MultiModelConfig: Sendable, Equatable {
     public let ropeTheta: Float
     public let eosToken: TokenID?
     public let architecture: Architecture
+    public let hiddenSizePerLayerInput: Int
+    public let vocabSizePerLayerInput: Int
 
     public var attentionDim: Int { nHead * headDim }
     public var kvDim: Int { nKVHead * headDim }
@@ -21,6 +23,7 @@ public struct MultiModelConfig: Sendable, Equatable {
     public enum Architecture: Sendable, Equatable {
         case gpt2
         case llama
+        case gemma4
     }
 
     public init(
@@ -36,7 +39,9 @@ public struct MultiModelConfig: Sendable, Equatable {
         normEps: Float,
         ropeTheta: Float = 10_000.0,
         eosToken: TokenID? = nil,
-        architecture: Architecture
+        architecture: Architecture,
+        hiddenSizePerLayerInput: Int = 0,
+        vocabSizePerLayerInput: Int = 0
     ) {
         self.name = name
         self.nLayer = nLayer
@@ -51,5 +56,7 @@ public struct MultiModelConfig: Sendable, Equatable {
         self.ropeTheta = ropeTheta
         self.eosToken = eosToken
         self.architecture = architecture
+        self.hiddenSizePerLayerInput = hiddenSizePerLayerInput
+        self.vocabSizePerLayerInput = vocabSizePerLayerInput
     }
 }

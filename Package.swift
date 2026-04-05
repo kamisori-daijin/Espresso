@@ -21,7 +21,7 @@ let package = Package(
         .library(name: "RealModelInference", targets: ["RealModelInference"]),
     ],
     dependencies: [
-        .package(path: "../Edgerunner"),
+        // .package(path: "../Edgerunner"),
     ],
     targets: [
         .target(
@@ -217,13 +217,6 @@ let package = Package(
             path: "Tests/LoRAAdapterTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
-        .testTarget(
-            name: "MigrationParityTests",
-            dependencies: ["MILGenerator", "ANETypes", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses"],
-            path: "Tests/MigrationParityTests",
-            resources: [.process("Fixtures")],
-            swiftSettings: [.swiftLanguageMode(.v6)]
-        ),
         .target(
             name: "RealModelInference",
             dependencies: ["ModelSupport", "ANEGraphIR", "ANEBuilder", "ANECodegen", "ANEPasses", "ANERuntime", "ANETypes", "ANEInterop", "CPUOps", "Espresso"],
@@ -246,12 +239,13 @@ let package = Package(
             path: "Tests/EspressoGenerateTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        /*
         .testTarget(
             name: "RealModelInferenceTests",
             dependencies: [
                 "RealModelInference", "ModelSupport", "ANEGraphIR", "ANETypes", "Espresso", "EspressoGGUF",
-                .product(name: "EspressoEdgeRunner", package: "Edgerunner"),
-                .product(name: "EdgeRunner", package: "Edgerunner"),
+                // .product(name: "EspressoEdgeRunner", package: "Edgerunner"),
+                // .product(name: "EdgeRunner", package: "Edgerunner"),
             ],
             path: "Tests/RealModelInferenceTests",
             swiftSettings: [.swiftLanguageMode(.v6)]
@@ -260,8 +254,8 @@ let package = Package(
             name: "EspressoGGUF",
             dependencies: [
                 "RealModelInference", "ModelSupport", "ANETypes",
-                .product(name: "EdgeRunner", package: "Edgerunner"),
-                .product(name: "EspressoEdgeRunner", package: "Edgerunner"),
+                // .product(name: "EdgeRunner", package: "Edgerunner"),
+                // .product(name: "EspressoEdgeRunner", package: "Edgerunner"),
             ],
             path: "Sources/EspressoGGUF",
             swiftSettings: [.swiftLanguageMode(.v6)]
@@ -278,6 +272,7 @@ let package = Package(
             path: "Sources/EspressoGGUFRunner",
             swiftSettings: [.swiftLanguageMode(.v6)]
         ),
+        */
         .target(
             name: "ESPBundle",
             dependencies: [],

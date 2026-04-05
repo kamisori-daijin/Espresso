@@ -109,7 +109,7 @@ public struct TransformerLayerGraphBuilder {
             )
             output = try! graph.add("\(prefix)_res2_out", x: residual1, y: ffn)
 
-        case .llama:
+        case .llama, .gemma4:
             let norm1 = try! graph.rmsNorm128(
                 "\(prefix)_rms1",
                 input: input,
@@ -118,7 +118,7 @@ public struct TransformerLayerGraphBuilder {
                 eps: config.normEps,
                 weightPath: paths.rmsAtt
             )
-            let q = try! graph.linear128(
+            var q = try! graph.linear128(
                 "\(prefix)_q",
                 input: norm1,
                 inDim: config.dModel,
@@ -127,11 +127,11 @@ public struct TransformerLayerGraphBuilder {
                 weightPath: paths.wq
             )
             // GQA is handled offline by repeating KV head blocks in the converter.
-            let k = try! graph.linear128(
+            var k = try! graph.linear128(
                 "\(prefix)_k",
                 input: norm1,
                 inDim: config.dModel,
-                outDim: config.dModel,
+                outDim: config.kvDim,
                 spatial: spatial,
                 weightPath: paths.wk
             )
@@ -139,10 +139,33 @@ public struct TransformerLayerGraphBuilder {
                 "\(prefix)_v",
                 input: norm1,
                 inDim: config.dModel,
-                outDim: config.dModel,
+                outDim: config.kvDim,
                 spatial: spatial,
                 weightPath: paths.wv
             )
+
+            if config.architecture == .gemma4 {
+                if let qNormPath = paths.qNorm {
+                    q = try! graph.rmsNorm128(
+                        "\(prefix)_q_norm",
+                        input: q,
+                        dim: config.dModel,
+                        spatial: spatial,
+                        eps: config.normEps,
+                        weightPath: qNormPath
+                    )
+                }
+                if let kNormPath = paths.kNorm {
+                    k = try! graph.rmsNorm128(
+                        "\(prefix)_k_norm",
+                        input: k,
+                        dim: config.kvDim,
+                        spatial: spatial,
+                        eps: config.normEps,
+                        weightPath: kNormPath
+                    )
+                }
+            }
             let attn = try! graph.causalAttention128(
                 "\(prefix)_attn",
                 q: q,
@@ -195,7 +218,7 @@ public struct TransformerLayerGraphBuilder {
         paths: LayerWeightPaths,
         spatial: Int
     ) -> ANEGraph {
-        precondition(config.architecture == .llama, "preRoPEForwardLayer only supports llama architecture")
+        precondition(config.architecture == .llama || config.architecture == .gemma4, "preRoPEForwardLayer only supports llama and gemma4 architecture")
         precondition(config.dModel == config.nHead * config.headDim, "dModel must equal nHead * headDim")
         precondition(
             isSupportedMaskBucket(spatial: spatial, maxSeq: config.maxSeq),
@@ -203,22 +226,40 @@ public struct TransformerLayerGraphBuilder {
         )
 
         var graph = ANEGraph()
-        let input = try! graph.input(
+        var currentInput = try! graph.input(
             "x",
             dtype: .fp16,
             shape: try! ANEShape(channels: config.dModel, spatial: spatial)
         )
         let prefix = "layer\(layer)"
 
+        // 1. Gemma 4 specific: Optional per-layer residual input.
+        if config.architecture == .gemma4, config.hiddenSizePerLayerInput > 0 {
+            let perLayerInput = try! graph.input(
+                "per_layer_input",
+                dtype: .fp16,
+                shape: try! ANEShape(channels: config.hiddenSizePerLayerInput, spatial: spatial)
+            )
+            let projected = try! graph.linear128(
+                "\(prefix)_per_layer_proj",
+                input: perLayerInput,
+                inDim: config.hiddenSizePerLayerInput,
+                outDim: config.dModel,
+                spatial: spatial,
+                weightPath: paths.perLayerInputProj!
+            )
+            currentInput = try! graph.add("\(prefix)_res_per_layer", x: currentInput, y: projected)
+        }
+
         let norm = try! graph.rmsNorm128(
             "\(prefix)_rms1",
-            input: input,
+            input: currentInput,
             dim: config.dModel,
             spatial: spatial,
             eps: config.normEps,
             weightPath: paths.rmsAtt
         )
-        let q = try! graph.linear128(
+        var q = try! graph.linear128(
             "\(prefix)_q",
             input: norm,
             inDim: config.dModel,
@@ -226,11 +267,11 @@ public struct TransformerLayerGraphBuilder {
             spatial: spatial,
             weightPath: paths.wq
         )
-        let k = try! graph.linear128(
+        var k = try! graph.linear128(
             "\(prefix)_k",
             input: norm,
             inDim: config.dModel,
-            outDim: config.dModel,
+            outDim: config.kvDim,
             spatial: spatial,
             weightPath: paths.wk
         )
@@ -238,10 +279,34 @@ public struct TransformerLayerGraphBuilder {
             "\(prefix)_v",
             input: norm,
             inDim: config.dModel,
-            outDim: config.dModel,
+            outDim: config.kvDim,
             spatial: spatial,
             weightPath: paths.wv
         )
+
+        // 2. Gemma 4 specific: Optional Q/K normalization.
+        if config.architecture == .gemma4 {
+            if let qNormPath = paths.qNorm {
+                q = try! graph.rmsNorm128(
+                    "\(prefix)_q_norm",
+                    input: q,
+                    dim: config.dModel,
+                    spatial: spatial,
+                    eps: config.normEps,
+                    weightPath: qNormPath
+                )
+            }
+            if let kNormPath = paths.kNorm {
+                k = try! graph.rmsNorm128(
+                    "\(prefix)_k_norm",
+                    input: k,
+                    dim: config.kvDim,
+                    spatial: spatial,
+                    eps: config.normEps,
+                    weightPath: kNormPath
+                )
+            }
+        }
 
         // Outputs in alphabetical order: k, q, v
         _ = try! graph.output(k, name: "k")
@@ -258,7 +323,7 @@ public struct TransformerLayerGraphBuilder {
         paths: LayerWeightPaths,
         spatial: Int
     ) -> ANEGraph {
-        precondition(config.architecture == .llama, "postRoPEForwardLayer only supports llama architecture")
+        precondition(config.architecture == .llama || config.architecture == .gemma4, "postRoPEForwardLayer only supports llama and gemma4 architecture")
         precondition(config.dModel == config.nHead * config.headDim, "dModel must equal nHead * headDim")
         precondition(
             isSupportedMaskBucket(spatial: spatial, maxSeq: config.maxSeq),

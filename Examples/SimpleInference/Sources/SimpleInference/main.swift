@@ -25,7 +25,7 @@ print("Weights: \(weightsDir)\n")
 
 do {
     var engine = try RealModelInferenceEngine.build(
-        config: ModelRegistry.gpt2_124m,
+        config: ModelRegistry.gemma4_e2b,
         weightDir: weightsDir,
         tokenizerDir: weightsDir
     )

@@ -106,6 +106,23 @@ public enum ModelRegistry {
         architecture: .llama
     )
 
+    /// Gemma 4 E2B — 30 layers, 8/4 heads, 2304 dim, 9216 hidden, 262k vocab.
+    public static let gemma4_e2b = MultiModelConfig(
+        name: "gemma4_e2b",
+        nLayer: 30,
+        nHead: 8,
+        nKVHead: 4,
+        dModel: 2_304,
+        headDim: 256,
+        hiddenDim: 9_216,
+        vocab: 262_144,
+        maxSeq: 2_048,
+        normEps: 1e-6,
+        architecture: .gemma4,
+        hiddenSizePerLayerInput: 256,
+        vocabSizePerLayerInput: 262_144
+    )
+
     public static let all: [String: MultiModelConfig] = [
         gpt2_124m.name: gpt2_124m,
         stories110m.name: stories110m,
@@ -114,6 +131,7 @@ public enum ModelRegistry {
         llama3_2_1b.name: llama3_2_1b,
         llama3_2_1b_ctx512.name: llama3_2_1b_ctx512,
         llama3_2_3b.name: llama3_2_3b,
+        gemma4_e2b.name: gemma4_e2b,
     ]
 
     public static func config(named name: String) -> MultiModelConfig? {

@@ -16,6 +16,7 @@ public struct LayerWeightPaths: Sendable, Equatable {
     public let w1: String
     public let w2: String
     public let w3: String?
+    public let perLayerInputProj: String?
     public let b1: String?
     public let b2: String?
 
@@ -50,6 +51,7 @@ public struct LayerWeightPaths: Sendable, Equatable {
                 w1: path("w1.bin"),
                 w2: path("w2.bin"),
                 w3: nil,
+                perLayerInputProj: nil,
                 b1: path("b1.bin"),
                 b2: path("b2.bin")
             )
@@ -70,6 +72,28 @@ public struct LayerWeightPaths: Sendable, Equatable {
                 w1: path("w1.bin"),
                 w2: path("w2.bin"),
                 w3: path("w3.bin"),
+                perLayerInputProj: nil,
+                b1: nil,
+                b2: nil
+            )
+        case .gemma4:
+            return LayerWeightPaths(
+                rmsAtt: path("rms_att.bin"),
+                qNorm: path("q_norm.bin"),
+                kNorm: path("k_norm.bin"),
+                wq: path("wq.bin"),
+                wk: path("wk.bin"),
+                wv: path("wv.bin"),
+                wo: path("wo.bin"),
+                bq: nil,
+                bk: nil,
+                bv: nil,
+                bo: nil,
+                rmsFfn: path("rms_ffn.bin"),
+                w1: path("w1.bin"),
+                w2: path("w2.bin"),
+                w3: path("w3.bin"),
+                perLayerInputProj: path("per_layer_input_proj.bin"),
                 b1: nil,
                 b2: nil
             )

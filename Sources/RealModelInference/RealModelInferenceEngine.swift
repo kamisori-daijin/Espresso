@@ -1444,8 +1444,9 @@ public struct RealModelInferenceEngine: ~Copyable {
         )
         let environment = ProcessInfo.processInfo.environment
 
-        if config.architecture == .llama {
+        if config.architecture == .llama || config.architecture == .gemma4 {
             if temperature == 0,
+               config.architecture == .llama, // Draft generation is currently llama-only
                let draft = try Self.resolveExactTwoTokenDraft(
                    config: config,
                    weightDirURL: weightDirURL,
@@ -7574,8 +7575,18 @@ public struct RealModelInferenceEngine: ~Copyable {
             } catch {
                 throw RealModelInferenceError.runtimeFailure("Failed to load GPT-2 tokenizer: \(error)")
             }
-        case .llama:
-            // Try SentencePiece first (Llama, Mistral)
+        case .llama, .gemma4:
+            // Try tokenizer.json first (modern HF format)
+            let tokenizerJSONURL = tokenizerDirURL.appendingPathComponent("tokenizer.json")
+            if FileManager.default.fileExists(atPath: tokenizerJSONURL.path) {
+                do {
+                    return .gpt2(try GPT2BPETokenizer(tokenizerJSONURL: tokenizerJSONURL))
+                } catch {
+                    throw RealModelInferenceError.runtimeFailure("Failed to load tokenizer.json: \(error)")
+                }
+            }
+
+            // Fallback to SentencePiece (.model or .bin)
             let spCandidates = ["tokenizer.model", "tokenizer.bin"]
             for candidate in spCandidates {
                 let url = tokenizerDirURL.appendingPathComponent(candidate)

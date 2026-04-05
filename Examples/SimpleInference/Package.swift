@@ -1,11 +1,11 @@
-// swift-tools-version: 6.0
+// swift-tools-version: 6.2
 import PackageDescription
 
 let package = Package(
     name: "SimpleInference",
-    platforms: [.macOS(.v15)],
+    platforms: [.macOS(.v26)],
     dependencies: [
-        .package(url: "https://github.com/christopherkarani/Espresso.git", branch: "main"),
+        .package(path: "../../"),
     ],
     targets: [
         .executableTarget(
