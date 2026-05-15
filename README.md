@@ -234,7 +234,7 @@ OBJC_CROSS_VALIDATION=1 ANE_HARDWARE_TESTS=1 swift test --filter CrossValidation
 >
 > **Everywhere else**: Internal tools, research, sideloaded apps, enterprise distribution — all fine.
 
-This project uses undocumented private Apple APIs discovered through runtime introspection. Results are hardware- and OS-dependent. Benchmarks run on a local artifact family built by this repo, not a pretrained production model. Not affiliated with or endorsed by Apple Inc.
+This project uses undocumented private Apple APIs discovered through runtime introspection. Results are hardware- and OS-dependent. Benchmarks run on a local artifact family built by this repo, not a pretrained production model. Not affiliated with or endorsed by Apple Inc. 
 
 ## Contributing
 
